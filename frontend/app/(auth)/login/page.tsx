@@ -54,7 +54,6 @@ export default function LoginPage() {
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-[#0a0a0a] px-4">
-        <div className="fixed top-0 left-0 w-full h-2 bg-red-600 z-[9999]">Tailwind Test</div>
       <div className="max-w-md w-full z-10">
         <div className="bg-surface border border-border shadow-2xl rounded-3xl p-10">
           <div className="text-center mb-8">
@@ -136,15 +135,6 @@ export default function LoginPage() {
               </div>
             )}
           </form>
-
-          <div className="mt-8 pt-6 border-t border-slate-700 text-center">
-            <p className="text-sm text-slate-400">
-              New to Trade Bot?{" "}
-              <a className="font-semibold text-[#00C853] hover:opacity-90 transition-colors" href="#">
-                Create an account
-              </a>
-            </p>
-          </div>
         </div>
       </div>
     </div>
