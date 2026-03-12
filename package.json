@@ -1,0 +1,14 @@
+{
+  "name": "trading-bot",
+  "private": true,
+  "workspaces": [
+    "backend",
+    "frontend",
+    "shared"
+  ],
+  "scripts": {
+    "dev:backend": "npm run dev --workspace backend",
+    "dev:frontend": "npm run dev --workspace frontend",
+    "build:shared": "npm run build --workspace shared"
+  }
+}
