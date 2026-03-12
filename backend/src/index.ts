@@ -40,7 +40,10 @@ function createApp(): express.Express {
   app.use(helmet());
   app.use(
     cors({
-      origin: process.env.FRONTEND_URL || "http://localhost:3000",
+      origin:[ 
+      "https://app.yaswanthnarisetty.com",
+      "http://localhost:3000",
+      ],
       credentials: true,
     })
   );
