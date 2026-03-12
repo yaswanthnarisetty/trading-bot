@@ -82,7 +82,6 @@ function computeProfitFactor(trades: OptionsPosition[]): number {
   const grossLosses = trades.reduce((s, t) => s + Math.abs(Math.min(0, t.realizedPnL ?? 0)), 0);
   return grossLosses === 0 ? (grossWins > 0 ? Infinity : 0) : grossWins / grossLosses;
 }
-signal
 
 function computeExpectancy(trades: OptionsPosition[]): number {
   if (trades.length === 0) return 0;
