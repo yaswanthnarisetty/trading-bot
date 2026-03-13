@@ -17,7 +17,7 @@ exports.primarySignalSchema = zod_1.z.object({
     ivContext: zod_1.z.enum(["selling_cheap", "selling_fair", "selling_expensive"]),
     confidence: zod_1.z.number().min(0).max(1),
     reasoning: zod_1.z.string().max(500),
-    keyFactors: zod_1.z.array(zod_1.z.string()).min(1).max(3),
+    keyFactors: zod_1.z.array(zod_1.z.string()).min(1).max(10),
     riskFlags: zod_1.z.array(zod_1.z.string()),
     suggestedEntry: zod_1.z.number().nullable(),
     suggestedSL: zod_1.z.number().nullable(),

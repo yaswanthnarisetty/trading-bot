@@ -28,6 +28,7 @@ import {
   isPreHolidayGapRisk,
   getISTDayOfWeek,
 } from "../utils/marketHours";
+import { logger } from "../utils/logger";
 import type { AssetKey } from "../config/assets";
 
 export interface RiskGuardInput {
@@ -127,14 +128,26 @@ export function evaluateRisk(input: RiskGuardInput): RiskGuardResult {
 
   // 1. Market closed
   if (!isMarketOpen()) {
+    logger.info("RiskGuard:block", { reason: "market_closed" });
     return { action: "BLOCK", reason: "market_closed" };
   }
 
   // 2. After cutoff — no new positions
   if (isAfterCutoff()) {
+    logger.info("RiskGuard:block", { reason: "no_new_positions_after_cutoff" });
     return { action: "BLOCK", reason: "no_new_positions_after_cutoff" };
   }
-  console.log(`RiskGuard: minutesSinceOpen=${input.minutesSinceOpen}, atr=${input.atr}, rsi=${input.rsi}, rsiSlope=${input.rsiSlope}, volumeRatio=${input.volumeRatio}, pcr=${input.pcr}, netCreditPts=${input.netCreditPts.toFixed(1)}`);
+  logger.debug("RiskGuard:input", {
+    minutesSinceOpen: input.minutesSinceOpen,
+    atr: input.atr,
+    rsi: input.rsi,
+    rsiSlope: input.rsiSlope,
+    volumeRatio: input.volumeRatio,
+    pcr: input.pcr,
+    netCreditPts: input.netCreditPts,
+    signalConfidence: input.signal.confidence,
+    signalStrategy: input.signal.strategy,
+  });
 
   // 3. Opening minutes block — first SKIP_OPEN_MINUTES after 9:15 IST market open.
   // Anchored to today's 9:15 AM IST (UTC+5:30 = 03:45:00 UTC), not session start time.
@@ -150,11 +163,13 @@ export function evaluateRisk(input: RiskGuardInput): RiskGuardResult {
   );
   const minutesSinceMarketOpen = (nowMs - marketOpenMs) / 60_000;
   if (minutesSinceMarketOpen < SKIP_OPEN_MINUTES) {
+    logger.info("RiskGuard:block", { reason: "opening_volatility", minutesSinceMarketOpen });
     return { action: "BLOCK", reason: "opening_volatility" };
   }
 
   // 4. ATR too high — underlying is whipsawing, credit spread edges erode
   if (input.atr !== null && input.atr > ATR_MAX_ENTRY) {
+    logger.info("RiskGuard:block", { reason: "high_volatility_atr", atr: input.atr });
     return { action: "BLOCK", reason: `high_volatility_atr:${input.atr.toFixed(1)}` };
   }
 
@@ -164,16 +179,19 @@ export function evaluateRisk(input: RiskGuardInput): RiskGuardResult {
 
   // 5. Tuesday after 13:00 — NIFTY weekly expiry gamma risk
   if (dow === 2 && hour >= 13) {
+    logger.info("RiskGuard:block", { reason: "expiry_afternoon_block", dayOfWeek: dow, hour });
     return { action: "BLOCK", reason: "expiry_afternoon_block" };
   }
 
   // 6. Friday after 14:00 — weekend gap risk
   if (isFridayGapRisk()) {
+    logger.info("RiskGuard:block", { reason: "friday_gap_risk" });
     return { action: "BLOCK", reason: "friday_gap_risk" };
   }
 
   // 7. Pre-holiday after 14:00 — gap risk
   if (isPreHolidayGapRisk()) {
+    logger.info("RiskGuard:block", { reason: "pre_holiday_gap_risk" });
     return { action: "BLOCK", reason: "pre_holiday_gap_risk" };
   }
 
@@ -183,11 +201,13 @@ export function evaluateRisk(input: RiskGuardInput): RiskGuardResult {
 
   // 9. Extreme IV spike
   if (input.ivRank > 85) {
+    logger.info("RiskGuard:block", { reason: "extreme_iv_spike", ivRank: input.ivRank });
     return { action: "BLOCK", reason: "extreme_iv_spike" };
   }
 
   // 10. Signal is HOLD
   if (input.signal.strategy === "HOLD") {
+    logger.info("RiskGuard:block", { reason: "signal_is_hold" });
     return { action: "BLOCK", reason: "signal_is_hold" };
   }
 
@@ -225,6 +245,7 @@ export function evaluateRisk(input: RiskGuardInput): RiskGuardResult {
 
   if (input.signal.confidence < confidenceThreshold) {
     const pct = (input.signal.confidence * 100).toFixed(1);
+    logger.info("RiskGuard:block", { reason: "confidence_below_threshold", confidence: input.signal.confidence, threshold: confidenceThreshold });
     return {
       action: "BLOCK",
       reason: `confidence_below_threshold:${pct}%`,
@@ -233,35 +254,43 @@ export function evaluateRisk(input: RiskGuardInput): RiskGuardResult {
 
   // 12. RSI entry zone — don't chase exhausted momentum
   if (isBear && input.rsi < RSI_ENTRY_MIN) {
+    logger.info("RiskGuard:block", { reason: "rsi_exhausted", rsi: input.rsi });
     return { action: "BLOCK", reason: `rsi_exhausted:${input.rsi.toFixed(1)}` };
   }
   if (isBull && input.rsi > RSI_ENTRY_MAX) {
+    logger.info("RiskGuard:block", { reason: "rsi_exhausted", rsi: input.rsi });
     return { action: "BLOCK", reason: `rsi_exhausted:${input.rsi.toFixed(1)}` };
   }
 
   // 13. RSI slope too weak — momentum must confirm direction
   if (input.rsiSlope !== null && Math.abs(input.rsiSlope) < RSI_SLOPE_MIN) {
+    logger.info("RiskGuard:block", { reason: "weak_momentum_slope", rsiSlope: input.rsiSlope });
     return { action: "BLOCK", reason: `weak_momentum_slope:${input.rsiSlope.toFixed(2)}` };
   }
 
   // 14. Volume too low — low participation = unreliable signal
   if (input.volumeRatio < VOLUME_RATIO_MIN) {
+    logger.info("RiskGuard:block", { reason: "low_volume", volumeRatio: input.volumeRatio });
     return { action: "BLOCK", reason: `low_volume:${input.volumeRatio.toFixed(2)}` };
   }
 
   // 15. PCR extremes — option chain already lopsided against the signal
   if (isBear && input.pcr > PCR_BEAR_MAX) {
+    logger.info("RiskGuard:block", { reason: "pcr_extreme", pcr: input.pcr });
     return { action: "BLOCK", reason: `pcr_extreme:${input.pcr.toFixed(2)}` };
   }
   if (isBull && input.pcr < PCR_BULL_MIN) {
+    logger.info("RiskGuard:block", { reason: "pcr_extreme", pcr: input.pcr });
     return { action: "BLOCK", reason: `pcr_extreme:${input.pcr.toFixed(2)}` };
   }
 
   // 16. LLM error flags
   if (input.signal.riskFlags.includes("parsing_error")) {
+    logger.info("RiskGuard:block", { reason: "llm_parsing_error" });
     return { action: "BLOCK", reason: "llm_parsing_error" };
   }
   if (input.signal.riskFlags.includes("llm_timeout")) {
+    logger.info("RiskGuard:block", { reason: "llm_timeout" });
     return { action: "BLOCK", reason: "llm_timeout" };
   }
 
@@ -270,6 +299,7 @@ export function evaluateRisk(input: RiskGuardInput): RiskGuardResult {
     (p) => p.strategy === input.signal.strategy
   );
   if (duplicate) {
+    logger.info("RiskGuard:block", { reason: "duplicate_strategy", strategy: input.signal.strategy });
     return {
       action: "BLOCK",
       reason: `duplicate_strategy:${input.signal.strategy}`,
@@ -285,6 +315,7 @@ export function evaluateRisk(input: RiskGuardInput): RiskGuardResult {
     return posDirection === signalDirection;
   });
   if (sameDirectionPos) {
+    logger.info("RiskGuard:block", { reason: "same_direction_open", direction: signalDirection, existingStrategy: sameDirectionPos.strategy });
     return {
       action: "BLOCK",
       reason: `same_direction_open:${signalDirection}:${sameDirectionPos.strategy}`,
@@ -294,6 +325,7 @@ export function evaluateRisk(input: RiskGuardInput): RiskGuardResult {
   // 19. Daily trade limit
   const maxDailyTrades = resolveNumberConfig("MAX_DAILY_TRADES", MAX_DAILY_TRADES);
   if (input.todayTradeCount >= maxDailyTrades) {
+    logger.info("RiskGuard:block", { reason: "daily_limit", todayTradeCount: input.todayTradeCount, maxDailyTrades });
     return {
       action: "BLOCK",
       reason: `daily_limit:${input.todayTradeCount}:${maxDailyTrades}`,
@@ -302,6 +334,7 @@ export function evaluateRisk(input: RiskGuardInput): RiskGuardResult {
 
   // 20. Max open positions
   if (input.openPositions >= maxPositions) {
+    logger.info("RiskGuard:block", { reason: "max_open_positions_reached", maxPositions });
     return {
       action: "BLOCK",
       reason: `max_open_positions_reached:${maxPositions}`,
@@ -311,6 +344,7 @@ export function evaluateRisk(input: RiskGuardInput): RiskGuardResult {
   // 21. Daily loss limit
   if (input.dailyLossPct <= -maxDailyLossPct) {
     const pct = input.dailyLossPct.toFixed(2);
+    logger.warn("RiskGuard:block", { reason: "daily_loss_limit_hit", dailyLossPct: input.dailyLossPct, maxDailyLossPct });
     return {
       action: "BLOCK",
       reason: `daily_loss_limit_hit:${pct}%`,
@@ -319,6 +353,7 @@ export function evaluateRisk(input: RiskGuardInput): RiskGuardResult {
 
   // 22. Minimum credit — spread must yield enough premium to be worthwhile
   if (input.netCreditPts > 0 && input.netCreditPts < MIN_CREDIT_PTS) {
+    logger.info("RiskGuard:block", { reason: "insufficient_credit", netCreditPts: input.netCreditPts });
     return {
       action: "BLOCK",
       reason: `insufficient_credit:${input.netCreditPts.toFixed(1)}pts`,
@@ -332,6 +367,7 @@ export function evaluateRisk(input: RiskGuardInput): RiskGuardResult {
 
     // 23. Compressed range — S/R band too tight to trade safely
     if (sr.rangeWidth !== null && sr.rangeWidth < SR_MIN_RANGE_PTS) {
+      logger.info("RiskGuard:block", { reason: "compressed_range", rangeWidth: sr.rangeWidth });
       return {
         action: "BLOCK",
         reason: `compressed_range:${sr.rangeWidth.toFixed(0)}pts`,
@@ -347,6 +383,7 @@ export function evaluateRisk(input: RiskGuardInput): RiskGuardResult {
       if (!input.signal.keyFactors.includes("near_key_sr_level")) {
         input.signal.keyFactors.push("near_key_sr_level");
       }
+      logger.debug("RiskGuard:adjust", { reason: "near_key_sr_level", newConfidence: input.signal.confidence });
     }
 
     // 25. Bear call — resistance too close to current spot
@@ -356,6 +393,7 @@ export function evaluateRisk(input: RiskGuardInput): RiskGuardResult {
       atr > 0 &&
       sr.spotToResistance < atr * SR_ATR_BUFFER
     ) {
+      logger.info("RiskGuard:block", { reason: "resistance_too_close", spotToResistance: sr.spotToResistance });
       return {
         action: "BLOCK",
         reason: `resistance_too_close:${sr.spotToResistance.toFixed(0)}pts`,
@@ -369,6 +407,7 @@ export function evaluateRisk(input: RiskGuardInput): RiskGuardResult {
       atr > 0 &&
       sr.spotToSupport < atr * SR_ATR_BUFFER
     ) {
+      logger.info("RiskGuard:block", { reason: "support_too_close", spotToSupport: sr.spotToSupport });
       return {
         action: "BLOCK",
         reason: `support_too_close:${sr.spotToSupport.toFixed(0)}pts`,
@@ -380,6 +419,7 @@ export function evaluateRisk(input: RiskGuardInput): RiskGuardResult {
   if (input.breakout && input.breakout.state !== "NONE") {
     // 27. BULLISH_BREAKOUT + BEAR_CALL_SPREAD — fighting the breakout direction
     if (input.breakout.state === "BULLISH_BREAKOUT" && isBear) {
+      logger.info("RiskGuard:block", { reason: "breakout_conflict", breakout: input.breakout.state, strategy: input.signal.strategy });
       return {
         action: "BLOCK",
         reason: `breakout_conflict:BULLISH_BREAKOUT_vs_BEAR:${input.breakout.breachSize?.toFixed(0) ?? "?"}pts`,
@@ -388,6 +428,7 @@ export function evaluateRisk(input: RiskGuardInput): RiskGuardResult {
 
     // 28. BEARISH_BREAKDOWN + BULL_PUT_SPREAD — fighting the breakdown direction
     if (input.breakout.state === "BEARISH_BREAKDOWN" && isBull) {
+      logger.info("RiskGuard:block", { reason: "breakout_conflict", breakout: input.breakout.state, strategy: input.signal.strategy });
       return {
         action: "BLOCK",
         reason: `breakout_conflict:BEARISH_BREAKDOWN_vs_BULL:${input.breakout.breachSize?.toFixed(0) ?? "?"}pts`,
@@ -395,5 +436,6 @@ export function evaluateRisk(input: RiskGuardInput): RiskGuardResult {
     }
   }
 
+  logger.info("RiskGuard:suggest", { strategy: input.signal.strategy, confidence: input.signal.confidence });
   return { action: "SUGGEST" };
 }
