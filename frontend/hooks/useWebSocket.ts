@@ -82,6 +82,7 @@ export function useWebSocket(): {
     (event: MessageEvent) => {
       try {
         const raw = JSON.parse(event.data as string);
+        console.log("WS RAW MESSAGE:", raw);
         const parsed = wsMessageSchema.safeParse(raw);
         if (!parsed.success) {
           // Invalid WS message is logged and discarded, never crashes the app.

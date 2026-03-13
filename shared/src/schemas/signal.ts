@@ -15,7 +15,7 @@ export const primarySignalSchema = z.object({
   ivContext: z.enum(["selling_cheap", "selling_fair", "selling_expensive"]),
   confidence: z.number().min(0).max(1),
   reasoning: z.string().max(500),
-  keyFactors: z.array(z.string()).min(1).max(3),
+  keyFactors: z.array(z.string()).min(1).max(10),
   riskFlags: z.array(z.string()),
   suggestedEntry: z.number().nullable(),
   suggestedSL: z.number().nullable(),
