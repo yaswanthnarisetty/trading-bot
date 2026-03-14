@@ -29,3 +29,20 @@ export const ALLOWED_ASSETS = {
 
 export type AssetKey = keyof typeof ALLOWED_ASSETS;
 
+/**
+ * CRYPTO_ASSETS — assets supported by the BTC engine.
+ * Isolated from ALLOWED_ASSETS; never mixed with index-option logic.
+ * basePrice is only used by the mock price generator.
+ */
+export const CRYPTO_ASSETS = {
+  BTCUSD: {
+    basePrice: 85000,
+    exchange: "DELTA",
+    productId: 84,
+    contractMultiplier: 1000
+  }
+}
+
+export type CryptoAssetKey = keyof typeof CRYPTO_ASSETS;
+
+

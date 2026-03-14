@@ -26,6 +26,12 @@ import {
   type OptionsPosition,
 } from "./schemas/trade";
 import {
+  cryptoPositionSchema,
+  cryptoSignalSchema,
+  type CryptoPosition,
+  type CryptoSignal,
+} from "./schemas/crypto";
+import {
   monitoringSessionSchema,
   type MonitoringSession,
 } from "./schemas/session";
@@ -69,6 +75,8 @@ export {
   tradeLegSchema,
   optionsPositionSchema,
   monitoringSessionSchema,
+  cryptoPositionSchema,
+  cryptoSignalSchema,
   wsMessageSchema,
   signalPayloadSchema,
   signalMessageSchema,
@@ -94,6 +102,8 @@ export type {
   TradeLeg,
   OptionsPosition,
   MonitoringSession,
+  CryptoPosition,
+  CryptoSignal,
   WSMessage,
   SignalPayload,
   SignalMessage,

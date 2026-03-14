@@ -14,6 +14,7 @@ function NavBar(): JSX.Element {
 
   const links = [
     { href: "/dashboard", label: "Dashboard" },
+    { href: "/btc", label: "BTC" },
     { href: "/performance", label: "Performance" },
     { href: "/backtest", label: "Backtest" },
     { href: "/settings", label: "Settings" },

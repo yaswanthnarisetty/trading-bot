@@ -1,6 +1,7 @@
 import { MonitoringSessionModel } from "../models/MonitoringSession";
 import { OptionsPositionModel } from "../models/OptionsPosition";
 import { SignalLogModel } from "../models/SignalLog";
+import { CryptoPositionModel } from "../models/CryptoPosition";
 import { logger } from "../utils/logger";
 
 /**
@@ -10,6 +11,7 @@ import { logger } from "../utils/logger";
  * SignalLog: 1 write per tick per session = highest write volume.
  * OptionsPosition: queried by session + status constantly.
  * MonitoringSession: queried by status and recency for dashboards.
+ * CryptoPosition: same query patterns as OptionsPosition.
  *
  * @returns A promise that resolves once all index creation promises complete.
  */
@@ -25,6 +27,8 @@ export async function createIndexes(): Promise<void> {
       }),
       MonitoringSessionModel.collection.createIndex({ status: 1 }),
       MonitoringSessionModel.collection.createIndex({ createdAt: -1 }),
+      CryptoPositionModel.collection.createIndex({ sessionId: 1, status: 1 }),
+      CryptoPositionModel.collection.createIndex({ sessionId: 1, entryTimestamp: -1 }),
     ]);
 
     logger.info("MongoDB indexes created");

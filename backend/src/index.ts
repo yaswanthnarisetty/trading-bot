@@ -15,6 +15,7 @@ import performanceRouter from "./routes/performance";
 import backtestRouter from "./routes/backtest";
 import kiteRouter from "./routes/kite";
 import authRouter from "./routes/auth.routes";
+import cryptoRouter from "./routes/crypto";
 import { WebSocketService } from "./services/WebSocketService";
 import { isMock, validateToken } from "./services/KiteService";
 import { MonitoringSessionModel } from "./models/MonitoringSession";
@@ -26,6 +27,7 @@ import {
 import {
   start as startPositionMonitor,
 } from "./services/PositionMonitorService";
+import { checkDeltaConnection } from "./services/DeltaService";
 
 
 /**
@@ -57,6 +59,7 @@ function createApp(): express.Express {
   app.use("/api/backtest", backtestRouter);
   app.use("/api/kite", kiteRouter);
   app.use("/api/auth", authRouter);
+  app.use("/api/crypto", cryptoRouter);
   
 
   app.use(errorHandler);
@@ -116,6 +119,12 @@ async function bootstrap(): Promise<void> {
       env: process.env.NODE_ENV || "development",
     });
   });
+
+  const deltaConnected = await checkDeltaConnection();
+
+  if (!deltaConnected) {
+    logger.warn("Delta trading disabled — API not reachable");
+  }
 
   // Validate Kite token on startup — non-blocking, server runs regardless of result.
   if (!isMock()) {

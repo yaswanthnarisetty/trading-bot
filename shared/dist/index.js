@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.heartbeatMessageSchema = exports.tickErrorMessageSchema = exports.tickSkippedMessageSchema = exports.sessionStoppedMessageSchema = exports.sessionStoppedPayloadSchema = exports.sessionStartedMessageSchema = exports.sessionStartedPayloadSchema = exports.positionUpdateMessageSchema = exports.positionUpdatePayloadSchema = exports.positionClosedMessageSchema = exports.positionOpenedMessageSchema = exports.signalMessageSchema = exports.signalPayloadSchema = exports.wsMessageSchema = exports.monitoringSessionSchema = exports.optionsPositionSchema = exports.tradeLegSchema = exports.verifierResultSchema = exports.primarySignalSchema = exports.expiryContextSchema = exports.indicatorSnapshotSchema = exports.greeksSnapshotSchema = void 0;
+exports.heartbeatMessageSchema = exports.tickErrorMessageSchema = exports.tickSkippedMessageSchema = exports.sessionStoppedMessageSchema = exports.sessionStoppedPayloadSchema = exports.sessionStartedMessageSchema = exports.sessionStartedPayloadSchema = exports.positionUpdateMessageSchema = exports.positionUpdatePayloadSchema = exports.positionClosedMessageSchema = exports.positionOpenedMessageSchema = exports.signalMessageSchema = exports.signalPayloadSchema = exports.wsMessageSchema = exports.cryptoSignalSchema = exports.cryptoPositionSchema = exports.monitoringSessionSchema = exports.optionsPositionSchema = exports.tradeLegSchema = exports.verifierResultSchema = exports.primarySignalSchema = exports.expiryContextSchema = exports.indicatorSnapshotSchema = exports.greeksSnapshotSchema = void 0;
 exports.parseWSMessage = parseWSMessage;
 const greeks_1 = require("./schemas/greeks");
 Object.defineProperty(exports, "greeksSnapshotSchema", { enumerable: true, get: function () { return greeks_1.greeksSnapshotSchema; } });
@@ -15,6 +15,9 @@ Object.defineProperty(exports, "verifierResultSchema", { enumerable: true, get: 
 const trade_1 = require("./schemas/trade");
 Object.defineProperty(exports, "tradeLegSchema", { enumerable: true, get: function () { return trade_1.tradeLegSchema; } });
 Object.defineProperty(exports, "optionsPositionSchema", { enumerable: true, get: function () { return trade_1.optionsPositionSchema; } });
+const crypto_1 = require("./schemas/crypto");
+Object.defineProperty(exports, "cryptoPositionSchema", { enumerable: true, get: function () { return crypto_1.cryptoPositionSchema; } });
+Object.defineProperty(exports, "cryptoSignalSchema", { enumerable: true, get: function () { return crypto_1.cryptoSignalSchema; } });
 const session_1 = require("./schemas/session");
 Object.defineProperty(exports, "monitoringSessionSchema", { enumerable: true, get: function () { return session_1.monitoringSessionSchema; } });
 const websocket_1 = require("./schemas/websocket");

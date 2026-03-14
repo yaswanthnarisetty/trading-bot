@@ -217,6 +217,7 @@ export declare const signalPayloadSchema: z.ZodObject<{
     sessionId: string;
     asset: string;
     dataMode: "LIVE" | "MOCK";
+    timestamp: number;
     paperPnL: number;
     ltp: number;
     signal: {
@@ -286,13 +287,13 @@ export declare const signalPayloadSchema: z.ZodObject<{
         thetaRisk: "high" | "medium" | "low";
     };
     openPositions: number;
-    timestamp: number;
     srContext?: unknown;
     breakoutResult?: unknown;
 }, {
     sessionId: string;
     asset: string;
     dataMode: "LIVE" | "MOCK";
+    timestamp: number;
     paperPnL: number;
     ltp: number;
     signal: {
@@ -362,7 +363,6 @@ export declare const signalPayloadSchema: z.ZodObject<{
         thetaRisk: "high" | "medium" | "low";
     };
     openPositions: number;
-    timestamp: number;
     srContext?: unknown;
     breakoutResult?: unknown;
 }>;
@@ -581,6 +581,7 @@ export declare const signalMessageSchema: z.ZodObject<{
         sessionId: string;
         asset: string;
         dataMode: "LIVE" | "MOCK";
+        timestamp: number;
         paperPnL: number;
         ltp: number;
         signal: {
@@ -650,13 +651,13 @@ export declare const signalMessageSchema: z.ZodObject<{
             thetaRisk: "high" | "medium" | "low";
         };
         openPositions: number;
-        timestamp: number;
         srContext?: unknown;
         breakoutResult?: unknown;
     }, {
         sessionId: string;
         asset: string;
         dataMode: "LIVE" | "MOCK";
+        timestamp: number;
         paperPnL: number;
         ltp: number;
         signal: {
@@ -726,7 +727,6 @@ export declare const signalMessageSchema: z.ZodObject<{
             thetaRisk: "high" | "medium" | "low";
         };
         openPositions: number;
-        timestamp: number;
         srContext?: unknown;
         breakoutResult?: unknown;
     }>;
@@ -736,6 +736,7 @@ export declare const signalMessageSchema: z.ZodObject<{
         sessionId: string;
         asset: string;
         dataMode: "LIVE" | "MOCK";
+        timestamp: number;
         paperPnL: number;
         ltp: number;
         signal: {
@@ -805,7 +806,6 @@ export declare const signalMessageSchema: z.ZodObject<{
             thetaRisk: "high" | "medium" | "low";
         };
         openPositions: number;
-        timestamp: number;
         srContext?: unknown;
         breakoutResult?: unknown;
     };
@@ -815,6 +815,7 @@ export declare const signalMessageSchema: z.ZodObject<{
         sessionId: string;
         asset: string;
         dataMode: "LIVE" | "MOCK";
+        timestamp: number;
         paperPnL: number;
         ltp: number;
         signal: {
@@ -884,7 +885,6 @@ export declare const signalMessageSchema: z.ZodObject<{
             thetaRisk: "high" | "medium" | "low";
         };
         openPositions: number;
-        timestamp: number;
         srContext?: unknown;
         breakoutResult?: unknown;
     };
@@ -1680,6 +1680,7 @@ export declare const wsMessageSchema: z.ZodDiscriminatedUnion<"type", [z.ZodObje
         sessionId: string;
         asset: string;
         dataMode: "LIVE" | "MOCK";
+        timestamp: number;
         paperPnL: number;
         ltp: number;
         signal: {
@@ -1749,13 +1750,13 @@ export declare const wsMessageSchema: z.ZodDiscriminatedUnion<"type", [z.ZodObje
             thetaRisk: "high" | "medium" | "low";
         };
         openPositions: number;
-        timestamp: number;
         srContext?: unknown;
         breakoutResult?: unknown;
     }, {
         sessionId: string;
         asset: string;
         dataMode: "LIVE" | "MOCK";
+        timestamp: number;
         paperPnL: number;
         ltp: number;
         signal: {
@@ -1825,7 +1826,6 @@ export declare const wsMessageSchema: z.ZodDiscriminatedUnion<"type", [z.ZodObje
             thetaRisk: "high" | "medium" | "low";
         };
         openPositions: number;
-        timestamp: number;
         srContext?: unknown;
         breakoutResult?: unknown;
     }>;
@@ -1835,6 +1835,7 @@ export declare const wsMessageSchema: z.ZodDiscriminatedUnion<"type", [z.ZodObje
         sessionId: string;
         asset: string;
         dataMode: "LIVE" | "MOCK";
+        timestamp: number;
         paperPnL: number;
         ltp: number;
         signal: {
@@ -1904,7 +1905,6 @@ export declare const wsMessageSchema: z.ZodDiscriminatedUnion<"type", [z.ZodObje
             thetaRisk: "high" | "medium" | "low";
         };
         openPositions: number;
-        timestamp: number;
         srContext?: unknown;
         breakoutResult?: unknown;
     };
@@ -1914,6 +1914,7 @@ export declare const wsMessageSchema: z.ZodDiscriminatedUnion<"type", [z.ZodObje
         sessionId: string;
         asset: string;
         dataMode: "LIVE" | "MOCK";
+        timestamp: number;
         paperPnL: number;
         ltp: number;
         signal: {
@@ -1983,7 +1984,6 @@ export declare const wsMessageSchema: z.ZodDiscriminatedUnion<"type", [z.ZodObje
             thetaRisk: "high" | "medium" | "low";
         };
         openPositions: number;
-        timestamp: number;
         srContext?: unknown;
         breakoutResult?: unknown;
     };

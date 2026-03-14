@@ -114,3 +114,22 @@ export const MAX_OI_BUFFER = 75;          // pts buffer beyond max OI strike (in
 export const BREAKOUT_ATR_MULTIPLIER = 0.3; // minimum breach size as fraction of ATR
 export const BREAKOUT_VOLUME_RATIO = 1.3;   // volume must be 30% above 20-bar avg to confirm
 export const BREAKOUT_EXPIRY_CANDLES = 6;   // breakout state expires after 6 × 5min bars (30 min)
+
+// ─── Crypto / BTC Engine ──────────────────────────────────────────────────────
+// These constants are ONLY consumed by the crypto engine services.
+// The options engine does not read any CRYPTO_* constant.
+export const CRYPTO_RISK_PER_TRADE_PCT   = 2;      // 2% of BTC paper capital per trade
+export const CRYPTO_STOP_LOSS_PCT        = 0.02;   // 2% stop loss from entry
+export const CRYPTO_TAKE_PROFIT_PCT      = 0.04;   // 4% take profit (2:1 R:R)
+export const CRYPTO_MAX_DAILY_LOSS_PCT   = 5;      // halt if daily loss exceeds 5% of capital
+export const CRYPTO_MAX_POSITIONS        = 3;      // max concurrent open BTC positions
+export const CRYPTO_MONITOR_INTERVAL_MS  = 10_000; // 10 s SL/TP check interval (24/7)
+export const CRYPTO_TICK_INTERVAL_MS     = 60_000; // 1 min signal evaluation interval
+export const CRYPTO_MIN_CONFIDENCE       = 0.60;   // minimum signal confidence to open
+export const CRYPTO_SIGNAL_LOOKBACK_BARS = 50;     // candles required for indicator warmup
+export const CRYPTO_EMA_FAST             = 9;
+export const CRYPTO_EMA_MID              = 21;
+export const CRYPTO_EMA_SLOW             = 50;
+export const CRYPTO_RSI_PERIOD           = 14;
+export const CRYPTO_ATR_PERIOD           = 14;
+export const CRYPTO_VOLUME_RATIO_MIN     = 1.2;    // volume must be 20% above average
