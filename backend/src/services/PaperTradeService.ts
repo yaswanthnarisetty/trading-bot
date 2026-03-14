@@ -306,6 +306,9 @@ export async function closePosition(
       });
     }
   }
+  // Must mark subdocument array as modified so Mongoose flushes the leg
+  // mutations to MongoDB — without this, updates to nested objects are silently dropped.
+  positionDoc.markModified("legs");
 
   // ── Fall back to estimated PnL if real LTPs unavailable ──────────────────────
   if (exitPremiumSource === "ESTIMATED") {
@@ -322,6 +325,37 @@ export async function closePosition(
       realizedPnL = positionDoc.maxProfit;
     } else {
       realizedPnL = 0;
+    }
+
+    // ── Derive estimated leg exit premiums from the decided realizedPnL ────────
+    // We attribute all PnL to the sell leg (the net-credit leg of the spread),
+    // treating the buy-leg protection cost as a constant at the estimated path.
+    // Formula: sellExit = sellEntry − (pnlPerUnit)  where pnlPerUnit = realizedPnL / (lots × lotSize)
+    const _sellLeg = positionDoc.legs[0];
+    const _buyLeg  = positionDoc.legs[1];
+    if (_sellLeg && _buyLeg) {
+      const lots    = _sellLeg.lots;
+      const lotSize = _sellLeg.lotSize;
+      const units   = lots * lotSize;
+      // Avoid division-by-zero for degenerate lot configs
+      const pnlPerUnit = units > 0 ? realizedPnL / units : 0;
+      // Sell leg exit premium: entryPremium minus the per-unit gain (seller earns when premium decays)
+      const estimatedSellExit = parseFloat(Math.max(0, _sellLeg.entryPremium - pnlPerUnit).toFixed(2));
+      // Buy leg: protective leg, assume it expired worthless or at entry value in estimated mode
+      const estimatedBuyExit  = _buyLeg.entryPremium;
+
+      _sellLeg.exitPremium = estimatedSellExit;
+      _sellLeg.legPnL      = parseFloat(((_sellLeg.entryPremium - estimatedSellExit) * units).toFixed(2));
+      _buyLeg.exitPremium  = estimatedBuyExit;
+      _buyLeg.legPnL       = 0; // buy leg cost is a wash in estimated mode
+
+      logger.info("📊 Estimated exit premiums derived from realizedPnL", {
+        positionId,
+        realizedPnL,
+        estimatedSellExit,
+        estimatedBuyExit,
+        sellLegPnL: _sellLeg.legPnL,
+      });
     }
   }
 
@@ -390,8 +424,18 @@ export async function getPositionHistory(
 }
 
 /**
- * Estimates current unrealized P&L of a credit spread from underlying movement.
- * For MVP-1, this uses a simple linear approximation around the entry price.
+ * Estimates current unrealized P&L of a credit spread using actual option premiums.
+ *
+ * For a credit spread, the theoretical PnL at any point is:
+ *   PnL = (entryCredit − currentExitCost) × lots × lotSize
+ *
+ * We estimate `currentExitCost` (the cost to close the spread right now) by
+ * scaling the entry credit proportionally to how far the underlying has moved
+ * relative to the width of the spread. This is more accurate than a raw
+ * spot-delta heuristic because it anchors to the actual premiums received.
+ *
+ * When leg premium data is unavailable, falls back to the original linear
+ * approximation for safety.
  *
  * @param position - The open options position to value.
  * @param currentLTP - Current underlying last traded price.
@@ -401,20 +445,48 @@ export function calculateCurrentPnL(
   position: OptionsPosition,
   currentLTP: number
 ): number {
+  const sellLeg = position.legs[0];
+  const buyLeg  = position.legs[1];
+
+  // ── Premium-based estimate (preferred) ────────────────────────────────────
+  if (sellLeg && buyLeg && sellLeg.entryPremium > 0) {
+    const lots    = sellLeg.lots;
+    const lotSize = sellLeg.lotSize;
+
+    const entryCredit = sellLeg.entryPremium - buyLeg.entryPremium;
+
+    // Direction: BULL_PUT_SPREAD profits when spot rises (OTM put decays).
+    // BEAR_CALL_SPREAD profits when spot falls (OTM call decays).
+    const direction = position.strategy === "BULL_PUT_SPREAD" ? 1 : -1;
+    const spotMove  = (currentLTP - position.entrySpot) * direction;
+
+    // Spread width gives us the natural range for the exit cost.
+    // When spotMove ≥ spreadWidth → position is fully profitable (exitCost ≈ 0).
+    // When spotMove ≤ −spreadWidth → position is at max loss (exitCost ≈ spreadWidth).
+    const spreadWidth = Math.abs(
+      position.legs[0]!.strike - position.legs[1]!.strike
+    );
+
+    // Normalise spot move into [-1, 1] range relative to spread width.
+    const norm = spreadWidth > 0
+      ? Math.max(-1, Math.min(1, spotMove / spreadWidth))
+      : 0;
+
+    // Estimated exit cost: full entryCredit when flat → 0 when fully profitable.
+    // Use a linear interpolation: exitCost = entryCredit × (1 − norm)  clamped to [0, spreadWidth].
+    const estimatedExitCost = Math.max(0, Math.min(spreadWidth, entryCredit * (1 - norm)));
+
+    const pnl = (entryCredit - estimatedExitCost) * lots * lotSize;
+    return parseFloat(Math.max(-position.maxLoss, Math.min(position.maxProfit, pnl)).toFixed(2));
+  }
+
+  // ── Fallback: original spot-delta heuristic ────────────────────────────────
   const direction =
     position.strategy === "BULL_PUT_SPREAD" ? 1 : -1;
-
   const move = (currentLTP - position.entrySpot) * direction;
-  const sensitivity = 0.3; // heuristic delta for spread exposure
-
-  const gross =
-    move *
-    sensitivity *
-    position.legs[0]!.lotSize *
-    position.legs[0]!.lots;
-
-  const capped = Math.max(-position.maxLoss, Math.min(position.maxProfit, gross));
-  return capped;
+  const sensitivity = 0.3;
+  const gross = move * sensitivity * (sellLeg?.lotSize ?? 0) * (sellLeg?.lots ?? 0);
+  return Math.max(-position.maxLoss, Math.min(position.maxProfit, gross));
 }
 
 /**
