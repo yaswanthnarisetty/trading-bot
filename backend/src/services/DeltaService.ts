@@ -95,16 +95,12 @@ export async function getDeltaPrice(asset: CryptoAssetKey): Promise<number> {
 
   } catch (err) {
 
-    logger.warn("getDeltaPrice failed — using mock fallback", {
+    logger.warn("getDeltaPrice failed — using base price fallback", {
       asset,
       message: err instanceof Error ? err.message : String(err),
     });
 
-    const base = CRYPTO_ASSETS[asset].basePrice;
-
-    return parseFloat(
-      (base * (1 + (Math.random() - 0.5) * 0.01)).toFixed(2)
-    );
+    return CRYPTO_ASSETS[asset].basePrice;
   }
 }
 
@@ -145,7 +141,7 @@ export async function getDeltaCandles(
 
     const end = Math.floor(Date.now() / 1000);
 
-    const start = end - resolutionSeconds*60 * limit;
+    const start = end - resolutionSeconds * limit;
 
     const url =
       `${DELTA_BASE_URL}/v2/history/candles` +
@@ -195,11 +191,12 @@ export async function getDeltaCandles(
 export async function placeOrder(
   side: "buy" | "sell",
   size: number,
-  asset: CryptoAssetKey
+  asset: CryptoAssetKey,
+  reduceOnly = false
 ): Promise<{ orderId: string; status: string }> {
 
   if (isDeltaMock()) {
-    logger.info("📋 (Mock) Delta order skipped", { side, size, asset });
+    logger.info("📋 (Mock) Delta order skipped", { side, size, asset, reduceOnly });
     return { orderId: `mock-${Date.now()}`, status: "filled" };
   }
 
@@ -209,17 +206,19 @@ export async function placeOrder(
   const contractSize = Math.max(1, Math.floor(size * multiplier));
 
   try {
-    // 1. Set leverage and margin mode for the product
-    const levPath = `/v2/products/${productId}/orders/leverage`;
-    const levBody = JSON.stringify({ margin_type: "isolated", leverage: "5" });
-    const levRes = await fetch(`${DELTA_BASE_URL}${levPath}`, {
-      method: "POST",
-      headers: authHeaders("POST", levPath, levBody),
-      body: levBody,
-    });
-    if (!levRes.ok) {
-      const errText = await levRes.text();
-      logger.warn(`Failed to set leverage: ${levRes.status} ${errText}`);
+    // 1. Set leverage and margin mode (only needed for opening orders)
+    if (!reduceOnly) {
+      const levPath = `/v2/products/${productId}/orders/leverage`;
+      const levBody = JSON.stringify({ margin_type: "isolated", leverage: "5" });
+      const levRes = await fetch(`${DELTA_BASE_URL}${levPath}`, {
+        method: "POST",
+        headers: authHeaders("POST", levPath, levBody),
+        body: levBody,
+      });
+      if (!levRes.ok) {
+        const errText = await levRes.text();
+        logger.warn(`Failed to set leverage: ${levRes.status} ${errText}`);
+      }
     }
 
     // 2. Place the order
@@ -229,7 +228,9 @@ export async function placeOrder(
       size: contractSize,
       side,
       order_type: "market_order",
-      time_in_force: "gtc"
+      time_in_force: "gtc",
+      // reduce_only ensures close orders never flip into a new opposite position
+      ...(reduceOnly ? { reduce_only: true } : {}),
     });
 
     const res = await fetch(`${DELTA_BASE_URL}${orderPath}`, {

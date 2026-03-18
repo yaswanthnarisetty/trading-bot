@@ -6,7 +6,7 @@ import {
 } from "express";
 import { v4 as uuidv4 } from "uuid";
 import { authMiddleware } from "./auth.middleware";
-import { getDeltaPrice } from "../services/DeltaService";
+import { getDeltaPrice, isDeltaMock, checkDeltaConnection } from "../services/DeltaService";
 import {
   closeCryptoPosition,
   getCryptoPositionHistory,
@@ -19,6 +19,8 @@ import {
   forceCloseAllCryptoPositions,
 } from "../services/CryptoMonitorService";
 import { CryptoPositionModel } from "../models/CryptoPosition";
+import { CryptoSignalLogModel } from "../models/CryptoSignalLog";
+import { CryptoSessionModel } from "../models/CryptoSession";
 import { logger } from "../utils/logger";
 import type { CryptoPosition } from "@trading-bot/shared";
 
@@ -35,6 +37,56 @@ interface CryptoSession {
 let activeCryptoSession: CryptoSession | null = null;
 
 const router = Router();
+
+// ─── Status ───────────────────────────────────────────────────────────────────
+
+/**
+ * GET /api/crypto/status
+ * Returns Delta Exchange connection status, data mode, and masked API key.
+ *
+ * Response mirrors the shape of GET /api/kite/status:
+ *   connected   — whether the Delta API is reachable (false in mock mode)
+ *   dataMode    — "LIVE" when key is set and API reachable, "MOCK" otherwise
+ *   apiKey      — masked to last 4 chars e.g. "***fre0", or "not set"
+ *   environment — "TESTNET" or "MAINNET" based on the configured base URL
+ *   message     — human-readable status string
+ */
+async function handleDeltaStatus(
+  _req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
+  try {
+    const apiKey = process.env.DELTA_API_KEY ?? "";
+    const maskedApiKey =
+      apiKey.length > 4 ? `***${apiKey.slice(-4)}` : apiKey ? "****" : "not set";
+
+    const mock = isDeltaMock();
+    let connected = false;
+
+    if (!mock) {
+      connected = await checkDeltaConnection();
+    }
+
+    const dataMode: "LIVE" | "MOCK" = !mock && connected ? "LIVE" : "MOCK";
+
+    const message = mock
+      ? "No API key configured — running in mock mode"
+      : connected
+        ? "Delta Exchange API connected"
+        : "Delta Exchange API unreachable — check credentials";
+
+    res.json({
+      connected,
+      dataMode,
+      apiKey: maskedApiKey,
+      environment: "TESTNET",
+      message,
+    });
+  } catch (error) {
+    next(error);
+  }
+}
 
 // ─── Session ──────────────────────────────────────────────────────────────────
 
@@ -65,6 +117,9 @@ async function handleStartCryptoSession(
       status: "RUNNING",
     };
 
+    // Persist so it survives a server restart
+    await CryptoSessionModel.create(activeCryptoSession);
+
     startCryptoEngine(sessionId, capital);
 
     logger.info("BTC session started", { sessionId, capital });
@@ -89,10 +144,17 @@ async function handleStopCryptoSession(
       return;
     }
 
-    stopCryptoEngine();
+    await stopCryptoEngine();
     await forceCloseAllCryptoPositions(activeCryptoSession.sessionId);
 
     activeCryptoSession.status = "STOPPED";
+
+    // Persist stopped status
+    await CryptoSessionModel.updateOne(
+      { sessionId: activeCryptoSession.sessionId },
+      { $set: { status: "STOPPED" } }
+    ).exec();
+
     logger.info("BTC session stopped", { sessionId: activeCryptoSession.sessionId });
     res.json(activeCryptoSession);
   } catch (error) {
@@ -103,12 +165,50 @@ async function handleStopCryptoSession(
 /**
  * GET /api/crypto/session/active
  * Returns the currently running BTC session or null.
+ * Falls back to MongoDB when the in-memory variable is missing (e.g. after a server restart)
+ * and re-attaches the engine so position monitoring + signals resume automatically.
  */
-function handleGetActiveCryptoSession(
+async function handleGetActiveCryptoSession(
   _req: Request,
-  res: Response
-): void {
-  res.json(activeCryptoSession?.status === "RUNNING" ? activeCryptoSession : null);
+  res: Response,
+  next: NextFunction
+): Promise<void> {
+  try {
+    // Fast path: in-memory session already present
+    if (activeCryptoSession?.status === "RUNNING") {
+      res.json(activeCryptoSession);
+      return;
+    }
+
+    // Slow path: look up the last RUNNING session in DB (covers server restarts)
+    const doc = await CryptoSessionModel.findOne({ status: "RUNNING" })
+      .sort({ startTime: -1 })
+      .lean()
+      .exec();
+
+    if (!doc) {
+      res.json(null);
+      return;
+    }
+
+    // Restore in-memory session and re-attach the engine
+    activeCryptoSession = {
+      sessionId: doc.sessionId,
+      asset:     doc.asset,
+      capital:   doc.capital,
+      startTime: doc.startTime,
+      status:    "RUNNING",
+    };
+
+    startCryptoEngine(activeCryptoSession.sessionId, activeCryptoSession.capital);
+    logger.info("BTC session restored from DB after server restart", {
+      sessionId: activeCryptoSession.sessionId,
+    });
+
+    res.json(activeCryptoSession);
+  } catch (error) {
+    next(error);
+  }
 }
 
 // ─── Price ────────────────────────────────────────────────────────────────────
@@ -276,7 +376,45 @@ async function handleGetCryptoDailyPnl(
   }
 }
 
+// ─── Signal History ───────────────────────────────────────────────────────────
+
+/**
+ * GET /api/crypto/signals/:sessionId
+ * Returns the most recent evaluated signals for a session, newest first.
+ * Used by the BTC page on mount to restore signal history after a page refresh.
+ *
+ * Query params:
+ *   limit  — max results, capped at 50 (default 20)
+ *   offset — pagination offset (default 0)
+ */
+async function handleGetCryptoSignals(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
+  try {
+    const { sessionId } = req.params;
+    const limit  = Math.min(Number(req.query.limit  ?? 20) || 20, 50);
+    const offset = Number(req.query.offset ?? 0) || 0;
+
+    const [signals, total] = await Promise.all([
+      CryptoSignalLogModel.find({ sessionId })
+        .sort({ timestamp: -1 })
+        .skip(offset)
+        .limit(limit)
+        .lean()
+        .exec(),
+      CryptoSignalLogModel.countDocuments({ sessionId }).exec(),
+    ]);
+
+    res.json({ signals, total });
+  } catch (error) {
+    next(error);
+  }
+}
+
 // ─── Router ───────────────────────────────────────────────────────────────────
+router.get("/status",          authMiddleware, handleDeltaStatus);
 router.post("/session/start",  authMiddleware, handleStartCryptoSession);
 router.post("/session/stop",   authMiddleware, handleStopCryptoSession);
 router.get("/session/active",  authMiddleware, handleGetActiveCryptoSession);
@@ -284,7 +422,8 @@ router.get("/price",           authMiddleware, handleGetBtcPrice);
 router.get("/positions/:sessionId/open", authMiddleware, handleGetOpenCryptoPositions);
 router.get("/positions/:sessionId",      authMiddleware, handleGetCryptoPositions);
 router.patch("/positions/:positionId/close", authMiddleware, handleManualCloseCryptoPosition);
-router.get("/history",         authMiddleware, handleGetCryptoHistory);
-router.get("/pnl/:sessionId",  authMiddleware, handleGetCryptoDailyPnl);
+router.get("/history",                    authMiddleware, handleGetCryptoHistory);
+router.get("/pnl/:sessionId",             authMiddleware, handleGetCryptoDailyPnl);
+router.get("/signals/:sessionId",         authMiddleware, handleGetCryptoSignals);
 
 export default router;

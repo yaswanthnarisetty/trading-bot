@@ -91,6 +91,24 @@ export default function BtcPage() {
     } catch { /* non-blocking */ }
   }, []);
 
+  // ── Fetch persisted signal history for a session ──────────────────────────
+  const fetchSignals = useCallback(async (sessionId: string) => {
+    try {
+      const res = await fetch(`${API}/api/crypto/signals/${sessionId}?limit=20`, {
+        headers: authHeader() as any,
+      });
+      const data = await res.json();
+      const rows: any[] = Array.isArray(data.signals) ? data.signals : [];
+      // Convert DB docs to the same shape the WebSocket handler produces
+      setSignals(
+        rows.map((s) => ({
+          ...s,
+          _tsDisplay: new Date(s.timestamp).toLocaleTimeString(),
+        }))
+      );
+    } catch { /* non-blocking */ }
+  }, []);
+
   // ── Initialise ────────────────────────────────────────────────────────────
   useEffect(() => {
     void (async () => {
@@ -100,6 +118,13 @@ export default function BtcPage() {
       setLoading(false);
     })();
   }, [fetchSession, fetchPrice]);
+
+  // ── Load persisted signal history once session is known ───────────────────
+  useEffect(() => {
+    if (session?.sessionId) {
+      void fetchSignals(session.sessionId);
+    }
+  }, [session?.sessionId, fetchSignals]);
 
   // ── Poll positions + price every 10 s when session is active ─────────────
   useEffect(() => {
@@ -163,7 +188,12 @@ export default function BtcPage() {
       `?sessionId=${session.sessionId}&token=${token}`;
     const ws = new WebSocket(wsUrl);
 
-    ws.onopen = () => setWsConnected(true);
+    ws.onopen = () => {
+      setWsConnected(true);
+      // Re-fetch signals from DB on every WS open so any signal that fired
+      // during the connection window (before this socket was ready) isn't lost.
+      void fetchSignals(session.sessionId);
+    };
     ws.onclose = () => setWsConnected(false);
 
     ws.onmessage = (evt) => {
@@ -183,9 +213,14 @@ export default function BtcPage() {
           setPrice(msg.payload.currentLTP);
         }
         if (msg.type === "SIGNAL") {
-          setSignals((prev) =>
-            [{ ...msg.payload, _tsDisplay: new Date().toLocaleTimeString() }, ...prev].slice(0, 20)
-          );
+          setSignals((prev) => {
+            const incoming = { ...msg.payload, _tsDisplay: new Date().toLocaleTimeString() };
+            // Deduplicate by timestamp — avoids double-entry when the DB fetch
+            // and the live WebSocket event both arrive for the same signal
+            const ts = msg.payload.timestamp as string | undefined;
+            if (ts && prev.some((s: any) => s.timestamp === ts)) return prev;
+            return [incoming, ...prev].slice(0, 20);
+          });
         }
       } catch {
         /* ignore malformed */
@@ -195,7 +230,7 @@ export default function BtcPage() {
     return () => {
       ws.close();
     };
-  }, [session?.sessionId, fetchPositions]);
+  }, [session?.sessionId, fetchPositions, fetchSignals]);
 
   // ── WS for real-time position + signal updates ────────────────────────────
   useEffect(() => {
@@ -347,7 +382,7 @@ export default function BtcPage() {
 
       {/* Signal history + positions */}
       <section className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-        <BtcSignalHistory signals={signals} />
+        <BtcSignalHistory signals={signals} isRunning={isRunning} />
         <BtcPositionsTable
           positions={positions}
           currentPrice={price}

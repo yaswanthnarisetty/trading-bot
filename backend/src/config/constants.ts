@@ -118,9 +118,15 @@ export const BREAKOUT_EXPIRY_CANDLES = 6;   // breakout state expires after 6 ×
 // ─── Crypto / BTC Engine ──────────────────────────────────────────────────────
 // These constants are ONLY consumed by the crypto engine services.
 // The options engine does not read any CRYPTO_* constant.
-export const CRYPTO_RISK_PER_TRADE_PCT   = 2;      // 2% of BTC paper capital per trade
-export const CRYPTO_STOP_LOSS_PCT        = 0.02;   // 2% stop loss from entry
-export const CRYPTO_TAKE_PROFIT_PCT      = 0.04;   // 4% take profit (2:1 R:R)
+export const CRYPTO_RISK_PER_TRADE_PCT   = 2;      // 2% of capital risked per trade (hard dollar cap)
+// ATR-based SL/TP — adapts to actual market volatility instead of fixed % of price.
+// SL = 1.5 × ATR from entry,  TP = 3.0 × ATR  →  2:1 reward-to-risk.
+// Example at ATR=$111: SL=$166 away, TP=$333 away (vs old 2%=$1478 / 4%=$2957).
+export const CRYPTO_SL_ATR_MULT          = 1.5;    // stop loss distance = ATR × this
+export const CRYPTO_TP_ATR_MULT          = 3.0;    // take profit distance = ATR × this (2:1 R:R)
+// Fallback when ATR is unavailable (indicator warmup period only)
+export const CRYPTO_SL_FALLBACK_PCT      = 0.005;  // 0.5% of price — tighter than old 2%
+export const CRYPTO_TP_FALLBACK_PCT      = 0.010;  // 1.0% of price — tighter than old 4%
 export const CRYPTO_MAX_DAILY_LOSS_PCT   = 5;      // halt if daily loss exceeds 5% of capital
 export const CRYPTO_MAX_POSITIONS        = 3;      // max concurrent open BTC positions
 export const CRYPTO_MONITOR_INTERVAL_MS  = 10_000; // 10 s SL/TP check interval (24/7)

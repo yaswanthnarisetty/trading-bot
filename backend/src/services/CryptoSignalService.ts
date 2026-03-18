@@ -189,7 +189,7 @@ export async function evaluateCryptoSignal(
     reason,
   };
 
-  logger.debug("Crypto signal evaluated", {
+  logger.info("📊 Crypto signal evaluated", {
     asset,
     side,
     confidence,
@@ -197,6 +197,9 @@ export async function evaluateCryptoSignal(
     ema9,
     ema21,
     ema50,
+    atr,
+    volumeRatio,
+    reason,
   });
 
   return signal;

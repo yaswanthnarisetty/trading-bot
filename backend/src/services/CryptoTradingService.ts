@@ -3,8 +3,10 @@ import type { CryptoPosition } from "@trading-bot/shared";
 import { CryptoPositionModel } from "../models/CryptoPosition";
 import {
   CRYPTO_RISK_PER_TRADE_PCT,
-  CRYPTO_STOP_LOSS_PCT,
-  CRYPTO_TAKE_PROFIT_PCT,
+  CRYPTO_SL_ATR_MULT,
+  CRYPTO_TP_ATR_MULT,
+  CRYPTO_SL_FALLBACK_PCT,
+  CRYPTO_TP_FALLBACK_PCT,
 } from "../config/constants";
 import { isDeltaMock, placeOrder } from "./DeltaService";
 import { logger } from "../utils/logger";
@@ -37,40 +39,58 @@ export function calculateCryptoPnL(
 
 /**
  * Opens a new paper/live BTC perpetual position.
- * Sizes the position as CRYPTO_RISK_PER_TRADE_PCT % of available capital, then
- * computes fixed-percent SL and TP levels from the entry price.
  *
- * @param sessionId - Active BTC session identifier
- * @param side      - "LONG" or "SHORT"
+ * Position sizing: risk-based (not fixed-leverage).
+ *   riskAmount  = capital × CRYPTO_RISK_PER_TRADE_PCT%       (e.g. $2 on $100 capital)
+ *   slDistance  = atr × CRYPTO_SL_ATR_MULT                   (e.g. 1.5 × $111 = $166)
+ *   size (BTC)  = riskAmount / slDistance                     (e.g. $2 / $166 = 0.012 BTC)
+ *
+ * SL/TP levels: ATR-based (adapts to current volatility).
+ *   SL = entry ∓ (atr × CRYPTO_SL_ATR_MULT)                  (1.5 ATR from entry)
+ *   TP = entry ± (atr × CRYPTO_TP_ATR_MULT)                  (3.0 ATR → 2:1 R:R)
+ *
+ * Fallback (ATR = 0 during indicator warmup):
+ *   Uses CRYPTO_SL_FALLBACK_PCT / CRYPTO_TP_FALLBACK_PCT of entry price.
+ *
+ * @param sessionId  - Active BTC session identifier
+ * @param side       - "LONG" or "SHORT"
  * @param entryPrice - Current BTC price at entry
- * @param capital    - Available paper/live capital in USD
+ * @param capital    - Paper/live capital in USD
+ * @param atr        - ATR(14) from signal evaluation; 0 during warmup
  * @returns The persisted CryptoPosition document
  */
 export async function openCryptoPosition(
   sessionId: string,
   side: "LONG" | "SHORT",
   entryPrice: number,
-  capital: number
+  capital: number,
+  atr: number
 ): Promise<CryptoPosition> {
-  // Using 5x leverage on available capital.
-  // Delta API handles the margin organically based on the contract size you buy.
-  // We want the total notional size of the position to be `capital * 5`.
-  // We reserve 5% of capital to cover the exchange trading commissions and slippage.
-  const leverage = 5;
-  const usableCapital = capital * 0.95;
-  const notionalTargetUsd = usableCapital * leverage;
-  const size = parseFloat((notionalTargetUsd / entryPrice).toFixed(6));
+  // ── SL / TP distances ────────────────────────────────────────────────────
+  const slDistance = atr > 0
+    ? parseFloat((atr * CRYPTO_SL_ATR_MULT).toFixed(2))
+    : parseFloat((entryPrice * CRYPTO_SL_FALLBACK_PCT).toFixed(2));
 
-  // SL and TP are percentage-based from entry
-  const stopLoss   =
+  const tpDistance = atr > 0
+    ? parseFloat((atr * CRYPTO_TP_ATR_MULT).toFixed(2))
+    : parseFloat((entryPrice * CRYPTO_TP_FALLBACK_PCT).toFixed(2));
+
+  // ── Risk-based position size ─────────────────────────────────────────────
+  // Dollar amount we're willing to lose = capital × risk%
+  // Size in BTC = riskAmount / slDistance  (so loss at SL = exactly riskAmount)
+  const riskAmount = capital * (CRYPTO_RISK_PER_TRADE_PCT / 100);
+  const size = parseFloat((riskAmount / slDistance).toFixed(6));
+
+  // ── SL / TP price levels ──────────────────────────────────────────────────
+  const stopLoss =
     side === "LONG"
-      ? parseFloat((entryPrice * (1 - CRYPTO_STOP_LOSS_PCT)).toFixed(2))
-      : parseFloat((entryPrice * (1 + CRYPTO_STOP_LOSS_PCT)).toFixed(2));
+      ? parseFloat((entryPrice - slDistance).toFixed(2))
+      : parseFloat((entryPrice + slDistance).toFixed(2));
 
   const takeProfit =
     side === "LONG"
-      ? parseFloat((entryPrice * (1 + CRYPTO_TAKE_PROFIT_PCT)).toFixed(2))
-      : parseFloat((entryPrice * (1 - CRYPTO_TAKE_PROFIT_PCT)).toFixed(2));
+      ? parseFloat((entryPrice + tpDistance).toFixed(2))
+      : parseFloat((entryPrice - tpDistance).toFixed(2));
 
   const dataMode = isDeltaMock() ? "MOCK" : "LIVE";
   const positionId = uuidv4();
@@ -108,8 +128,12 @@ export async function openCryptoPosition(
     side,
     entryPrice,
     size,
+    slDistance,
+    tpDistance,
     stopLoss,
     takeProfit,
+    riskAmount,
+    atr,
     dataMode,
   });
 
@@ -137,10 +161,22 @@ export async function closeCryptoPosition(
   const position = doc.toObject() as CryptoPosition;
   const realizedPnL = calculateCryptoPnL(position, exitPrice);
 
-  // In LIVE mode, send the closing order (no-op in mock)
+  // In LIVE mode, send the closing order with reduce_only=true so it can never
+  // accidentally open a new opposite-direction position on Delta.
+  // If the exchange order fails (network error, already closed on exchange, etc.)
+  // we log a warning but still mark the DB record as CLOSED — the DB must stay
+  // consistent with the session state regardless of exchange-side outcome.
   if (!isDeltaMock()) {
     const closeSide = position.side === "LONG" ? "sell" : "buy";
-    await placeOrder(closeSide, position.size, "BTCUSD");
+    try {
+      await placeOrder(closeSide, position.size, "BTCUSD", true);
+    } catch (exchangeErr) {
+      logger.warn("Exchange close order failed — marking DB as CLOSED anyway", {
+        positionId,
+        exitReason,
+        message: exchangeErr instanceof Error ? exchangeErr.message : String(exchangeErr),
+      });
+    }
   }
 
   (doc as any).status         = "CLOSED";

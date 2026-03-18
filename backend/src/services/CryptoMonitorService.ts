@@ -1,6 +1,8 @@
 import type { CryptoPosition } from "@trading-bot/shared";
 import { CryptoPositionModel } from "../models/CryptoPosition";
+import { CryptoSignalLogModel } from "../models/CryptoSignalLog";
 import { getDeltaPrice } from "./DeltaService";
+import { isDeltaMock } from "./DeltaService";
 import {
   calculateCryptoPnL,
   closeCryptoPosition,
@@ -20,6 +22,8 @@ import { logger } from "../utils/logger";
 
 let monitorInterval: NodeJS.Timeout | null = null;
 let signalInterval:  NodeJS.Timeout | null = null;
+/** Prevents overlapping signal ticks — mirrors KiteService SignalLoopService pattern. */
+let isTickRunning = false;
 
 // ─── Lifecycle ────────────────────────────────────────────────────────────────
 
@@ -66,11 +70,27 @@ export function startCryptoEngine(sessionId: string, capital: number): void {
 
 /**
  * Stops both the monitor and signal loop.
- * Called on session stop or server shutdown.
+ * Waits for any in-flight signal tick to finish before returning so that
+ * forceCloseAllCryptoPositions sees a fully consistent DB state.
+ * Timeout: 30 s — after that the tick is considered stale and we proceed.
  */
-export function stopCryptoEngine(): void {
+export async function stopCryptoEngine(): Promise<void> {
   if (monitorInterval) { clearInterval(monitorInterval); monitorInterval = null; }
   if (signalInterval)  { clearInterval(signalInterval);  signalInterval  = null; }
+
+  // Wait for a running signal tick to finish (race-condition guard)
+  if (isTickRunning) {
+    logger.info("⏳ Waiting for in-flight signal tick to finish before closing positions…");
+    const deadline = Date.now() + 30_000;
+    while (isTickRunning && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    if (isTickRunning) {
+      logger.warn("Signal tick did not finish within 30 s — proceeding with force-close anyway");
+    }
+  }
+
+  isTickRunning = false;
   logger.info("🛑 Crypto engine stopped");
 }
 
@@ -191,11 +211,21 @@ export async function forceCloseAllCryptoPositions(
 // ─── Signal Loop ─────────────────────────────────────────────────────────────
 
 /**
- * Evaluates entry signals and opens a position if conditions are met.
- * Guards:
- *   - max open positions not exceeded
- *   - daily loss limit not hit
- *   - signal confidence above CRYPTO_MIN_CONFIDENCE
+ * Evaluates entry signals and opens a position if all risk guards pass.
+ *
+ * Mirrors KiteService SignalLoopService pattern:
+ *   1. Concurrency guard — skip if previous tick still running
+ *   2. Always evaluate signal first (so WebSocket always gets a SIGNAL event)
+ *   3. Run risk guards in priority order, collecting riskAction + blockReason
+ *   4. Emit SIGNAL with riskAction + blockReason so UI shows why blocked
+ *   5. Only open position when riskAction = "SUGGEST"
+ *
+ * Risk guards (in order):
+ *   1. MAX_POSITIONS      — open positions ≥ CRYPTO_MAX_POSITIONS
+ *   2. DAILY_LOSS_LIMIT   — today's realized PnL ≤ -(capital × CRYPTO_MAX_DAILY_LOSS_PCT%)
+ *   3. SAME_DIRECTION_OPEN — an open position in the same direction already exists
+ *   4. HOLD               — signal side is HOLD (no EMA/RSI alignment)
+ *   5. LOW_CONFIDENCE     — signal confidence < CRYPTO_MIN_CONFIDENCE
  *
  * @param sessionId - Active BTC session identifier
  * @param capital   - Available capital for position sizing
@@ -204,50 +234,126 @@ async function runCryptoSignalTick(
   sessionId: string,
   capital: number
 ): Promise<void> {
-  // Guard: max positions
-  const openPositions = await getOpenCryptoPositions(sessionId);
-  if (openPositions.length >= CRYPTO_MAX_POSITIONS) {
-    logger.debug("Crypto signal tick: max positions reached", {
+  // Concurrency guard — skip if previous tick still processing
+  if (isTickRunning) {
+    logger.debug("Crypto signal tick: previous tick still running, skipping", { sessionId });
+    return;
+  }
+  isTickRunning = true;
+
+  try {
+    // Always evaluate the signal first so the WebSocket always fires
+    const signal = await evaluateCryptoSignal("BTCUSD");
+
+    // ── Risk guards ────────────────────────────────────────────────────────
+    let riskAction: "SUGGEST" | "BLOCK" = "SUGGEST";
+    let blockReason: string | undefined;
+
+    const openPositions = await getOpenCryptoPositions(sessionId);
+
+    // Guard 1: max concurrent positions
+    if (openPositions.length >= CRYPTO_MAX_POSITIONS) {
+      riskAction  = "BLOCK";
+      blockReason = `MAX_POSITIONS: ${openPositions.length}/${CRYPTO_MAX_POSITIONS} open`;
+    }
+
+    // Guard 2: daily loss limit
+    if (riskAction === "SUGGEST") {
+      const dailyPnL = await getCryptoDailyPnL(sessionId);
+      const maxDailyLoss = -(capital * (CRYPTO_MAX_DAILY_LOSS_PCT / 100));
+      if (dailyPnL <= maxDailyLoss) {
+        riskAction  = "BLOCK";
+        blockReason = `DAILY_LOSS_LIMIT: dailyPnL=${dailyPnL.toFixed(2)} ≤ limit=${maxDailyLoss.toFixed(2)}`;
+      }
+    }
+
+    // Guard 3: same-direction position already open (mirrors Kite SAME_DIRECTION_OPEN rule)
+    if (riskAction === "SUGGEST" && signal.side !== "HOLD") {
+      const sameDir = openPositions.find((p) => p.side === signal.side);
+      if (sameDir) {
+        riskAction  = "BLOCK";
+        blockReason = `SAME_DIRECTION_OPEN: ${signal.side} position already open`;
+      }
+    }
+
+    // Guard 4 + 5: signal not actionable (HOLD or low confidence)
+    if (riskAction === "SUGGEST" && !isActionableSignal(signal)) {
+      riskAction  = "BLOCK";
+      blockReason = signal.side === "HOLD"
+        ? `HOLD: ${signal.reason}`
+        : `LOW_CONFIDENCE: ${signal.confidence} < ${CRYPTO_MAX_DAILY_LOSS_PCT}`;
+    }
+
+    // ── Persist signal to DB so page refresh restores history ─────────────
+    try {
+      await CryptoSignalLogModel.create({
+        sessionId,
+        asset:       signal.asset,
+        side:        signal.side,
+        confidence:  signal.confidence,
+        rsi:         signal.rsi,
+        ema9:        signal.ema9,
+        ema21:       signal.ema21,
+        ema50:       signal.ema50,
+        atr:         signal.atr,
+        volumeRatio: signal.volumeRatio,
+        reason:      signal.reason,
+        riskAction,
+        blockReason:  blockReason ?? null,
+        dataMode:     isDeltaMock() ? "MOCK" : "LIVE",
+        timestamp:    new Date(signal.timestamp),
+      });
+    } catch (dbErr) {
+      logger.warn("Failed to persist crypto signal log", {
+        message: dbErr instanceof Error ? dbErr.message : String(dbErr),
+      });
+    }
+
+    // ── Always emit SIGNAL with risk context ──────────────────────────────
+    WebSocketService.emit(sessionId, {
+      type: "SIGNAL",
+      payload: { ...signal, riskAction, blockReason },
+    } as any);
+
+    if (riskAction === "BLOCK") {
+      logger.info("🚫 Crypto signal blocked", {
+        sessionId,
+        side: signal.side,
+        confidence: signal.confidence,
+        rsi: signal.rsi,
+        volumeRatio: signal.volumeRatio,
+        blockReason,
+      });
+      return;
+    }
+
+    // ── Open position ─────────────────────────────────────────────────────
+    logger.info("✅ Crypto signal actionable — opening position", {
       sessionId,
-      count: openPositions.length,
+      side: signal.side,
+      confidence: signal.confidence,
+      rsi: signal.rsi,
+      ema9: signal.ema9,
+      ema21: signal.ema21,
+      ema50: signal.ema50,
+      volumeRatio: signal.volumeRatio,
     });
-    return;
-  }
 
-  // Guard: daily loss limit
-  const dailyPnL = await getCryptoDailyPnL(sessionId);
-  const maxDailyLoss = -(capital * (CRYPTO_MAX_DAILY_LOSS_PCT / 100));
-  if (dailyPnL <= maxDailyLoss) {
-    logger.warn("⛔ Crypto daily loss limit hit — halting entries", {
+    const currentPrice = await getDeltaPrice("BTCUSD");
+    const position = await openCryptoPosition(
       sessionId,
-      dailyPnL,
-      maxDailyLoss,
-    });
-    return;
+      signal.side as "LONG" | "SHORT",
+      currentPrice,
+      capital,
+      signal.atr
+    );
+
+    WebSocketService.emit(sessionId, {
+      type: "POSITION_OPENED",
+      payload: position,
+    } as any);
+
+  } finally {
+    isTickRunning = false;
   }
-
-  const signal = await evaluateCryptoSignal("BTCUSD");
-
-  WebSocketService.emit(sessionId, {
-    type: "SIGNAL",  // reuse SIGNAL slot for crypto signal events
-    payload: signal,
-  } as any);
-
-  if (!isActionableSignal(signal)) {
-    logger.debug("Crypto signal: HOLD", { sessionId, reason: signal.reason });
-    return;
-  }
-
-  const currentPrice = await getDeltaPrice("BTCUSD");
-  const position = await openCryptoPosition(
-    sessionId,
-    signal.side as "LONG" | "SHORT",
-    currentPrice,
-    capital
-  );
-
-  WebSocketService.emit(sessionId, {
-    type: "POSITION_OPENED",  // mapped from CRYPTO_POSITION_OPENED
-    payload: position,
-  } as any);
 }
