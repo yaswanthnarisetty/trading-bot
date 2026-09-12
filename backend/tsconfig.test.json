@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "noEmit": true,
+    "types": ["node"]
+  },
+  "include": ["src/domain/**/*.ts", "src/db/execution*.ts", "src/models/**/*.ts", "tests/**/*.ts"]
+}

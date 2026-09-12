@@ -7,6 +7,7 @@ const zod_1 = require("zod");
  * This tracks lifecycle, performance, and configuration for a given trading session.
  */
 exports.monitoringSessionSchema = zod_1.z.object({
+    executionMode: zod_1.z.literal("LEGACY_PAPER").optional(),
     sessionId: zod_1.z.string(),
     asset: zod_1.z.string(),
     startTime: zod_1.z.string(),

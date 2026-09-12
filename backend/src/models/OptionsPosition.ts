@@ -32,6 +32,7 @@ const TradeLegSubSchema = new Schema(
 const OptionsPositionSchema = new Schema(
   {
     positionId: { type: String, required: true },
+    executionMode: { type: String, enum: ["LEGACY_PAPER"], default: "LEGACY_PAPER", immutable: true },
     sessionId: { type: String, required: true },
     asset: { type: String, required: true },
     strategy: {
@@ -99,4 +100,3 @@ export const OptionsPositionModel = model<OptionsPositionDocument>(
   "OptionsPosition",
   OptionsPositionSchema
 );
-

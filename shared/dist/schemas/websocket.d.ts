@@ -893,6 +893,7 @@ export type SignalMessage = z.infer<typeof signalMessageSchema>;
 export declare const positionOpenedMessageSchema: z.ZodObject<{
     type: z.ZodLiteral<"POSITION_OPENED">;
     payload: z.ZodObject<{
+        executionMode: z.ZodOptional<z.ZodLiteral<"LEGACY_PAPER">>;
         positionId: z.ZodString;
         sessionId: z.ZodString;
         asset: z.ZodString;
@@ -976,6 +977,7 @@ export declare const positionOpenedMessageSchema: z.ZodObject<{
         exitReason: "SL_HIT" | "TARGET_HIT" | "NEAR_EXPIRY" | "EOD_CLOSE" | "EOD_FORCED_CLOSE" | "TIME_EXIT" | "SESSION_STOP" | "MANUAL" | "DIRECTIONAL_STOP" | null;
         realizedPnL: number | null;
         dataMode: "LIVE" | "MOCK";
+        executionMode?: "LEGACY_PAPER" | undefined;
         entryATR?: number | null | undefined;
         premiumSource?: "KITE_LTP" | "BLACK_SCHOLES" | "BLACK_SCHOLES_FALLBACK" | undefined;
         requiredMargin?: number | undefined;
@@ -1010,6 +1012,7 @@ export declare const positionOpenedMessageSchema: z.ZodObject<{
         exitReason: "SL_HIT" | "TARGET_HIT" | "NEAR_EXPIRY" | "EOD_CLOSE" | "EOD_FORCED_CLOSE" | "TIME_EXIT" | "SESSION_STOP" | "MANUAL" | "DIRECTIONAL_STOP" | null;
         realizedPnL: number | null;
         dataMode: "LIVE" | "MOCK";
+        executionMode?: "LEGACY_PAPER" | undefined;
         entryATR?: number | null | undefined;
         premiumSource?: "KITE_LTP" | "BLACK_SCHOLES" | "BLACK_SCHOLES_FALLBACK" | undefined;
         requiredMargin?: number | undefined;
@@ -1047,6 +1050,7 @@ export declare const positionOpenedMessageSchema: z.ZodObject<{
         exitReason: "SL_HIT" | "TARGET_HIT" | "NEAR_EXPIRY" | "EOD_CLOSE" | "EOD_FORCED_CLOSE" | "TIME_EXIT" | "SESSION_STOP" | "MANUAL" | "DIRECTIONAL_STOP" | null;
         realizedPnL: number | null;
         dataMode: "LIVE" | "MOCK";
+        executionMode?: "LEGACY_PAPER" | undefined;
         entryATR?: number | null | undefined;
         premiumSource?: "KITE_LTP" | "BLACK_SCHOLES" | "BLACK_SCHOLES_FALLBACK" | undefined;
         requiredMargin?: number | undefined;
@@ -1084,6 +1088,7 @@ export declare const positionOpenedMessageSchema: z.ZodObject<{
         exitReason: "SL_HIT" | "TARGET_HIT" | "NEAR_EXPIRY" | "EOD_CLOSE" | "EOD_FORCED_CLOSE" | "TIME_EXIT" | "SESSION_STOP" | "MANUAL" | "DIRECTIONAL_STOP" | null;
         realizedPnL: number | null;
         dataMode: "LIVE" | "MOCK";
+        executionMode?: "LEGACY_PAPER" | undefined;
         entryATR?: number | null | undefined;
         premiumSource?: "KITE_LTP" | "BLACK_SCHOLES" | "BLACK_SCHOLES_FALLBACK" | undefined;
         requiredMargin?: number | undefined;
@@ -1094,6 +1099,7 @@ export type PositionOpenedMessage = z.infer<typeof positionOpenedMessageSchema>;
 export declare const positionClosedMessageSchema: z.ZodObject<{
     type: z.ZodLiteral<"POSITION_CLOSED">;
     payload: z.ZodObject<{
+        executionMode: z.ZodOptional<z.ZodLiteral<"LEGACY_PAPER">>;
         positionId: z.ZodString;
         sessionId: z.ZodString;
         asset: z.ZodString;
@@ -1177,6 +1183,7 @@ export declare const positionClosedMessageSchema: z.ZodObject<{
         exitReason: "SL_HIT" | "TARGET_HIT" | "NEAR_EXPIRY" | "EOD_CLOSE" | "EOD_FORCED_CLOSE" | "TIME_EXIT" | "SESSION_STOP" | "MANUAL" | "DIRECTIONAL_STOP" | null;
         realizedPnL: number | null;
         dataMode: "LIVE" | "MOCK";
+        executionMode?: "LEGACY_PAPER" | undefined;
         entryATR?: number | null | undefined;
         premiumSource?: "KITE_LTP" | "BLACK_SCHOLES" | "BLACK_SCHOLES_FALLBACK" | undefined;
         requiredMargin?: number | undefined;
@@ -1211,6 +1218,7 @@ export declare const positionClosedMessageSchema: z.ZodObject<{
         exitReason: "SL_HIT" | "TARGET_HIT" | "NEAR_EXPIRY" | "EOD_CLOSE" | "EOD_FORCED_CLOSE" | "TIME_EXIT" | "SESSION_STOP" | "MANUAL" | "DIRECTIONAL_STOP" | null;
         realizedPnL: number | null;
         dataMode: "LIVE" | "MOCK";
+        executionMode?: "LEGACY_PAPER" | undefined;
         entryATR?: number | null | undefined;
         premiumSource?: "KITE_LTP" | "BLACK_SCHOLES" | "BLACK_SCHOLES_FALLBACK" | undefined;
         requiredMargin?: number | undefined;
@@ -1248,6 +1256,7 @@ export declare const positionClosedMessageSchema: z.ZodObject<{
         exitReason: "SL_HIT" | "TARGET_HIT" | "NEAR_EXPIRY" | "EOD_CLOSE" | "EOD_FORCED_CLOSE" | "TIME_EXIT" | "SESSION_STOP" | "MANUAL" | "DIRECTIONAL_STOP" | null;
         realizedPnL: number | null;
         dataMode: "LIVE" | "MOCK";
+        executionMode?: "LEGACY_PAPER" | undefined;
         entryATR?: number | null | undefined;
         premiumSource?: "KITE_LTP" | "BLACK_SCHOLES" | "BLACK_SCHOLES_FALLBACK" | undefined;
         requiredMargin?: number | undefined;
@@ -1285,6 +1294,7 @@ export declare const positionClosedMessageSchema: z.ZodObject<{
         exitReason: "SL_HIT" | "TARGET_HIT" | "NEAR_EXPIRY" | "EOD_CLOSE" | "EOD_FORCED_CLOSE" | "TIME_EXIT" | "SESSION_STOP" | "MANUAL" | "DIRECTIONAL_STOP" | null;
         realizedPnL: number | null;
         dataMode: "LIVE" | "MOCK";
+        executionMode?: "LEGACY_PAPER" | undefined;
         entryATR?: number | null | undefined;
         premiumSource?: "KITE_LTP" | "BLACK_SCHOLES" | "BLACK_SCHOLES_FALLBACK" | undefined;
         requiredMargin?: number | undefined;
@@ -1433,12 +1443,12 @@ export declare const tickSkippedMessageSchema: z.ZodObject<{
     timestamp: z.ZodNumber;
 }, "strip", z.ZodTypeAny, {
     type: "TICK_SKIPPED";
-    timestamp: number;
     reason: string;
+    timestamp: number;
 }, {
     type: "TICK_SKIPPED";
-    timestamp: number;
     reason: string;
+    timestamp: number;
 }>;
 export type TickSkippedMessage = z.infer<typeof tickSkippedMessageSchema>;
 export declare const tickErrorMessageSchema: z.ZodObject<{
@@ -1990,6 +2000,7 @@ export declare const wsMessageSchema: z.ZodDiscriminatedUnion<"type", [z.ZodObje
 }>, z.ZodObject<{
     type: z.ZodLiteral<"POSITION_OPENED">;
     payload: z.ZodObject<{
+        executionMode: z.ZodOptional<z.ZodLiteral<"LEGACY_PAPER">>;
         positionId: z.ZodString;
         sessionId: z.ZodString;
         asset: z.ZodString;
@@ -2073,6 +2084,7 @@ export declare const wsMessageSchema: z.ZodDiscriminatedUnion<"type", [z.ZodObje
         exitReason: "SL_HIT" | "TARGET_HIT" | "NEAR_EXPIRY" | "EOD_CLOSE" | "EOD_FORCED_CLOSE" | "TIME_EXIT" | "SESSION_STOP" | "MANUAL" | "DIRECTIONAL_STOP" | null;
         realizedPnL: number | null;
         dataMode: "LIVE" | "MOCK";
+        executionMode?: "LEGACY_PAPER" | undefined;
         entryATR?: number | null | undefined;
         premiumSource?: "KITE_LTP" | "BLACK_SCHOLES" | "BLACK_SCHOLES_FALLBACK" | undefined;
         requiredMargin?: number | undefined;
@@ -2107,6 +2119,7 @@ export declare const wsMessageSchema: z.ZodDiscriminatedUnion<"type", [z.ZodObje
         exitReason: "SL_HIT" | "TARGET_HIT" | "NEAR_EXPIRY" | "EOD_CLOSE" | "EOD_FORCED_CLOSE" | "TIME_EXIT" | "SESSION_STOP" | "MANUAL" | "DIRECTIONAL_STOP" | null;
         realizedPnL: number | null;
         dataMode: "LIVE" | "MOCK";
+        executionMode?: "LEGACY_PAPER" | undefined;
         entryATR?: number | null | undefined;
         premiumSource?: "KITE_LTP" | "BLACK_SCHOLES" | "BLACK_SCHOLES_FALLBACK" | undefined;
         requiredMargin?: number | undefined;
@@ -2144,6 +2157,7 @@ export declare const wsMessageSchema: z.ZodDiscriminatedUnion<"type", [z.ZodObje
         exitReason: "SL_HIT" | "TARGET_HIT" | "NEAR_EXPIRY" | "EOD_CLOSE" | "EOD_FORCED_CLOSE" | "TIME_EXIT" | "SESSION_STOP" | "MANUAL" | "DIRECTIONAL_STOP" | null;
         realizedPnL: number | null;
         dataMode: "LIVE" | "MOCK";
+        executionMode?: "LEGACY_PAPER" | undefined;
         entryATR?: number | null | undefined;
         premiumSource?: "KITE_LTP" | "BLACK_SCHOLES" | "BLACK_SCHOLES_FALLBACK" | undefined;
         requiredMargin?: number | undefined;
@@ -2181,6 +2195,7 @@ export declare const wsMessageSchema: z.ZodDiscriminatedUnion<"type", [z.ZodObje
         exitReason: "SL_HIT" | "TARGET_HIT" | "NEAR_EXPIRY" | "EOD_CLOSE" | "EOD_FORCED_CLOSE" | "TIME_EXIT" | "SESSION_STOP" | "MANUAL" | "DIRECTIONAL_STOP" | null;
         realizedPnL: number | null;
         dataMode: "LIVE" | "MOCK";
+        executionMode?: "LEGACY_PAPER" | undefined;
         entryATR?: number | null | undefined;
         premiumSource?: "KITE_LTP" | "BLACK_SCHOLES" | "BLACK_SCHOLES_FALLBACK" | undefined;
         requiredMargin?: number | undefined;
@@ -2189,6 +2204,7 @@ export declare const wsMessageSchema: z.ZodDiscriminatedUnion<"type", [z.ZodObje
 }>, z.ZodObject<{
     type: z.ZodLiteral<"POSITION_CLOSED">;
     payload: z.ZodObject<{
+        executionMode: z.ZodOptional<z.ZodLiteral<"LEGACY_PAPER">>;
         positionId: z.ZodString;
         sessionId: z.ZodString;
         asset: z.ZodString;
@@ -2272,6 +2288,7 @@ export declare const wsMessageSchema: z.ZodDiscriminatedUnion<"type", [z.ZodObje
         exitReason: "SL_HIT" | "TARGET_HIT" | "NEAR_EXPIRY" | "EOD_CLOSE" | "EOD_FORCED_CLOSE" | "TIME_EXIT" | "SESSION_STOP" | "MANUAL" | "DIRECTIONAL_STOP" | null;
         realizedPnL: number | null;
         dataMode: "LIVE" | "MOCK";
+        executionMode?: "LEGACY_PAPER" | undefined;
         entryATR?: number | null | undefined;
         premiumSource?: "KITE_LTP" | "BLACK_SCHOLES" | "BLACK_SCHOLES_FALLBACK" | undefined;
         requiredMargin?: number | undefined;
@@ -2306,6 +2323,7 @@ export declare const wsMessageSchema: z.ZodDiscriminatedUnion<"type", [z.ZodObje
         exitReason: "SL_HIT" | "TARGET_HIT" | "NEAR_EXPIRY" | "EOD_CLOSE" | "EOD_FORCED_CLOSE" | "TIME_EXIT" | "SESSION_STOP" | "MANUAL" | "DIRECTIONAL_STOP" | null;
         realizedPnL: number | null;
         dataMode: "LIVE" | "MOCK";
+        executionMode?: "LEGACY_PAPER" | undefined;
         entryATR?: number | null | undefined;
         premiumSource?: "KITE_LTP" | "BLACK_SCHOLES" | "BLACK_SCHOLES_FALLBACK" | undefined;
         requiredMargin?: number | undefined;
@@ -2343,6 +2361,7 @@ export declare const wsMessageSchema: z.ZodDiscriminatedUnion<"type", [z.ZodObje
         exitReason: "SL_HIT" | "TARGET_HIT" | "NEAR_EXPIRY" | "EOD_CLOSE" | "EOD_FORCED_CLOSE" | "TIME_EXIT" | "SESSION_STOP" | "MANUAL" | "DIRECTIONAL_STOP" | null;
         realizedPnL: number | null;
         dataMode: "LIVE" | "MOCK";
+        executionMode?: "LEGACY_PAPER" | undefined;
         entryATR?: number | null | undefined;
         premiumSource?: "KITE_LTP" | "BLACK_SCHOLES" | "BLACK_SCHOLES_FALLBACK" | undefined;
         requiredMargin?: number | undefined;
@@ -2380,6 +2399,7 @@ export declare const wsMessageSchema: z.ZodDiscriminatedUnion<"type", [z.ZodObje
         exitReason: "SL_HIT" | "TARGET_HIT" | "NEAR_EXPIRY" | "EOD_CLOSE" | "EOD_FORCED_CLOSE" | "TIME_EXIT" | "SESSION_STOP" | "MANUAL" | "DIRECTIONAL_STOP" | null;
         realizedPnL: number | null;
         dataMode: "LIVE" | "MOCK";
+        executionMode?: "LEGACY_PAPER" | undefined;
         entryATR?: number | null | undefined;
         premiumSource?: "KITE_LTP" | "BLACK_SCHOLES" | "BLACK_SCHOLES_FALLBACK" | undefined;
         requiredMargin?: number | undefined;
@@ -2478,12 +2498,12 @@ export declare const wsMessageSchema: z.ZodDiscriminatedUnion<"type", [z.ZodObje
     timestamp: z.ZodNumber;
 }, "strip", z.ZodTypeAny, {
     type: "TICK_SKIPPED";
-    timestamp: number;
     reason: string;
+    timestamp: number;
 }, {
     type: "TICK_SKIPPED";
-    timestamp: number;
     reason: string;
+    timestamp: number;
 }>, z.ZodObject<{
     type: z.ZodLiteral<"TICK_ERROR">;
     error: z.ZodString;

@@ -23,6 +23,7 @@ export type TradeLeg = z.infer<typeof tradeLegSchema>;
  * This captures lifecycle, risk, and performance metrics for backtesting and monitoring.
  */
 export const optionsPositionSchema = z.object({
+  executionMode: z.literal("LEGACY_PAPER").optional(),
   positionId: z.string(),
   sessionId: z.string(),
   asset: z.string(),
@@ -73,4 +74,3 @@ export const optionsPositionSchema = z.object({
 });
 
 export type OptionsPosition = z.infer<typeof optionsPositionSchema>;
-

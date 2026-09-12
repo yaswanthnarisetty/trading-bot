@@ -16,6 +16,7 @@ export interface MonitoringSessionDocument
 const MonitoringSessionSchema = new Schema(
   {
     sessionId: { type: String, required: true },
+    executionMode: { type: String, enum: ["LEGACY_PAPER"], default: "LEGACY_PAPER", immutable: true },
     asset: { type: String, required: true },
     startTime: { type: String, required: true },
     stopTime: { type: String, default: null },
@@ -44,4 +45,3 @@ export const MonitoringSessionModel = model<MonitoringSessionDocument>(
   "MonitoringSession",
   MonitoringSessionSchema
 );
-

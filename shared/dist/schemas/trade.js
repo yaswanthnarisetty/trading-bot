@@ -22,6 +22,7 @@ exports.tradeLegSchema = zod_1.z.object({
  * This captures lifecycle, risk, and performance metrics for backtesting and monitoring.
  */
 exports.optionsPositionSchema = zod_1.z.object({
+    executionMode: zod_1.z.literal("LEGACY_PAPER").optional(),
     positionId: zod_1.z.string(),
     sessionId: zod_1.z.string(),
     asset: zod_1.z.string(),

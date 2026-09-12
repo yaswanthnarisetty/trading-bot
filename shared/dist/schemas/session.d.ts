@@ -4,6 +4,7 @@ import { z } from "zod";
  * This tracks lifecycle, performance, and configuration for a given trading session.
  */
 export declare const monitoringSessionSchema: z.ZodObject<{
+    executionMode: z.ZodOptional<z.ZodLiteral<"LEGACY_PAPER">>;
     sessionId: z.ZodString;
     asset: z.ZodString;
     startTime: z.ZodString;
@@ -29,6 +30,7 @@ export declare const monitoringSessionSchema: z.ZodObject<{
     paperPnL: number;
     paperCapital: number;
     ticksSkipped: number;
+    executionMode?: "LEGACY_PAPER" | undefined;
 }, {
     status: "RUNNING" | "STOPPED" | "CRASHED";
     sessionId: string;
@@ -42,6 +44,7 @@ export declare const monitoringSessionSchema: z.ZodObject<{
     paperPnL: number;
     paperCapital: number;
     ticksSkipped: number;
+    executionMode?: "LEGACY_PAPER" | undefined;
 }>;
 export type MonitoringSession = z.infer<typeof monitoringSessionSchema>;
 //# sourceMappingURL=session.d.ts.map

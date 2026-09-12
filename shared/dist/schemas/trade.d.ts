@@ -40,6 +40,7 @@ export type TradeLeg = z.infer<typeof tradeLegSchema>;
  * This captures lifecycle, risk, and performance metrics for backtesting and monitoring.
  */
 export declare const optionsPositionSchema: z.ZodObject<{
+    executionMode: z.ZodOptional<z.ZodLiteral<"LEGACY_PAPER">>;
     positionId: z.ZodString;
     sessionId: z.ZodString;
     asset: z.ZodString;
@@ -139,6 +140,7 @@ export declare const optionsPositionSchema: z.ZodObject<{
     exitReason: "SL_HIT" | "TARGET_HIT" | "NEAR_EXPIRY" | "EOD_CLOSE" | "EOD_FORCED_CLOSE" | "TIME_EXIT" | "SESSION_STOP" | "MANUAL" | "DIRECTIONAL_STOP" | null;
     realizedPnL: number | null;
     dataMode: "LIVE" | "MOCK";
+    executionMode?: "LEGACY_PAPER" | undefined;
     entryATR?: number | null | undefined;
     premiumSource?: "KITE_LTP" | "BLACK_SCHOLES" | "BLACK_SCHOLES_FALLBACK" | undefined;
     requiredMargin?: number | undefined;
@@ -173,6 +175,7 @@ export declare const optionsPositionSchema: z.ZodObject<{
     exitReason: "SL_HIT" | "TARGET_HIT" | "NEAR_EXPIRY" | "EOD_CLOSE" | "EOD_FORCED_CLOSE" | "TIME_EXIT" | "SESSION_STOP" | "MANUAL" | "DIRECTIONAL_STOP" | null;
     realizedPnL: number | null;
     dataMode: "LIVE" | "MOCK";
+    executionMode?: "LEGACY_PAPER" | undefined;
     entryATR?: number | null | undefined;
     premiumSource?: "KITE_LTP" | "BLACK_SCHOLES" | "BLACK_SCHOLES_FALLBACK" | undefined;
     requiredMargin?: number | undefined;

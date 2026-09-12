@@ -1,4 +1,5 @@
 import crypto from "crypto";
+import { rejectDeltaExecution } from "../domain/ExecutionSafety";
 import type { CryptoAssetKey } from "../config/assets";
 import { CRYPTO_ASSETS } from "../config/assets";
 import { logger } from "../utils/logger";
@@ -194,72 +195,8 @@ export async function placeOrder(
   asset: CryptoAssetKey,
   reduceOnly = false
 ): Promise<{ orderId: string; status: string }> {
-
-  if (isDeltaMock()) {
-    logger.info("📋 (Mock) Delta order skipped", { side, size, asset, reduceOnly });
-    return { orderId: `mock-${Date.now()}`, status: "filled" };
-  }
-
-  const productId = CRYPTO_ASSETS[asset].productId;
-  // Convert physical BTC size to an integer number of contracts
-  const multiplier = (CRYPTO_ASSETS[asset] as any).contractMultiplier || 1;
-  const contractSize = Math.max(1, Math.floor(size * multiplier));
-
-  try {
-    // 1. Set leverage and margin mode (only needed for opening orders)
-    if (!reduceOnly) {
-      const levPath = `/v2/products/${productId}/orders/leverage`;
-      const levBody = JSON.stringify({ margin_type: "isolated", leverage: "5" });
-      const levRes = await fetch(`${DELTA_BASE_URL}${levPath}`, {
-        method: "POST",
-        headers: authHeaders("POST", levPath, levBody),
-        body: levBody,
-      });
-      if (!levRes.ok) {
-        const errText = await levRes.text();
-        logger.warn(`Failed to set leverage: ${levRes.status} ${errText}`);
-      }
-    }
-
-    // 2. Place the order
-    const orderPath = "/v2/orders";
-    const orderBody = JSON.stringify({
-      product_id: productId,
-      size: contractSize,
-      side,
-      order_type: "market_order",
-      time_in_force: "gtc",
-      // reduce_only ensures close orders never flip into a new opposite position
-      ...(reduceOnly ? { reduce_only: true } : {}),
-    });
-
-    const res = await fetch(`${DELTA_BASE_URL}${orderPath}`, {
-      method: "POST",
-      headers: authHeaders("POST", orderPath, orderBody),
-      body: orderBody,
-    });
-
-    if (!res.ok) {
-      const errText = await res.text();
-      throw new Error(`Delta place order error: ${res.status} ${errText}`);
-    }
-
-    const json: any = await res.json();
-    return {
-      orderId: String(json.result?.id ?? "unknown"),
-      status: json.result?.state ?? "unknown",
-    };
-  } catch (err) {
-    logger.error("placeOrder failed", {
-      asset,
-      side,
-      message: err instanceof Error ? err.message : String(err),
-    });
-    throw err;
-  }
+  return rejectDeltaExecution();
 }
-
-
 
 // delta api connection check
 export async function checkDeltaConnection(): Promise<boolean> {

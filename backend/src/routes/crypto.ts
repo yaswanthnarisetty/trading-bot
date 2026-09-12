@@ -37,6 +37,15 @@ interface CryptoSession {
 let activeCryptoSession: CryptoSession | null = null;
 
 const router = Router();
+// Only these GET routes are allowed through to side-effect-free read handlers.
+export const cryptoReadPaths = ["/status", "/price", "/history", "/positions/:sessionId/open", "/positions/:sessionId", "/pnl/:sessionId", "/signals/:sessionId"] as const;
+export function cryptoRequestAllowed(method: string, path: string): boolean {
+  return method === "GET" && cryptoReadPaths.some(route => new RegExp("^" + route.replace(/:[^/]+/g, "[^/]+") + "/?$").test(path));
+}
+router.use((req, res, next) => {
+  if (cryptoRequestAllowed(req.method, req.path)) { next(); return; }
+  res.status(503).json({ error: "BTC/Delta execution is disabled", code: "DELTA_EXECUTION_DISABLED" });
+});
 
 // ─── Status ───────────────────────────────────────────────────────────────────
 

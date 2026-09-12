@@ -12,6 +12,7 @@ import type {
  * This captures each tick's analytical context and decisions for later audit and backtesting.
  */
 export interface SignalLogDocument extends Document {
+  executionMode: "LEGACY_PAPER";
   sessionId: string;
   asset: string;
   ltp?: number;
@@ -29,6 +30,7 @@ export interface SignalLogDocument extends Document {
 const SignalLogSchema = new Schema<SignalLogDocument>(
   {
     sessionId: { type: String, required: true, index: true },
+    executionMode: { type: String, enum: ["LEGACY_PAPER"], default: "LEGACY_PAPER", immutable: true },
     asset: { type: String, required: true },
     ltp: { type: Number },
     signal: { type: Schema.Types.Mixed, required: true },
@@ -57,4 +59,3 @@ export const SignalLogModel = model<SignalLogDocument>(
   "SignalLog",
   SignalLogSchema
 );
-

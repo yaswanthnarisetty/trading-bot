@@ -1,3 +1,4 @@
+import { denyCryptoExecution } from "../domain/ExecutionSafety";
 import type { CryptoPosition } from "@trading-bot/shared";
 import { CryptoPositionModel } from "../models/CryptoPosition";
 import { CryptoSignalLogModel } from "../models/CryptoSignalLog";
@@ -37,6 +38,7 @@ let isTickRunning = false;
  * @param capital     - Paper / live capital available
  */
 export function startCryptoEngine(sessionId: string, capital: number): void {
+  denyCryptoExecution();
   if (monitorInterval || signalInterval) {
     logger.warn("Crypto engine already running — skipping duplicate start", { sessionId });
     return;
@@ -107,6 +109,7 @@ export async function stopCryptoEngine(): Promise<void> {
  * @param sessionId - Active BTC session identifier
  */
 export async function checkCryptoPositions(sessionId: string): Promise<void> {
+  denyCryptoExecution();
   const openDocs = await CryptoPositionModel.find({
     sessionId,
     status: "OPEN",
@@ -178,6 +181,7 @@ export async function checkCryptoPositions(sessionId: string): Promise<void> {
 export async function forceCloseAllCryptoPositions(
   sessionId: string
 ): Promise<void> {
+  denyCryptoExecution();
   const positions = await getOpenCryptoPositions(sessionId);
   if (positions.length === 0) return;
 
@@ -234,6 +238,7 @@ async function runCryptoSignalTick(
   sessionId: string,
   capital: number
 ): Promise<void> {
+  denyCryptoExecution();
   // Concurrency guard — skip if previous tick still processing
   if (isTickRunning) {
     logger.debug("Crypto signal tick: previous tick still running, skipping", { sessionId });

@@ -27,7 +27,6 @@ import {
 import {
   start as startPositionMonitor,
 } from "./services/PositionMonitorService";
-import { checkDeltaConnection } from "./services/DeltaService";
 
 
 /**
@@ -119,12 +118,6 @@ async function bootstrap(): Promise<void> {
       env: process.env.NODE_ENV || "development",
     });
   });
-
-  const deltaConnected = await checkDeltaConnection();
-
-  if (!deltaConnected) {
-    logger.warn("Delta trading disabled — API not reachable");
-  }
 
   // Validate Kite token on startup — non-blocking, server runs regardless of result.
   if (!isMock()) {

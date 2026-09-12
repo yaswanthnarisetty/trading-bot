@@ -5,6 +5,7 @@ import { z } from "zod";
  * This tracks lifecycle, performance, and configuration for a given trading session.
  */
 export const monitoringSessionSchema = z.object({
+  executionMode: z.literal("LEGACY_PAPER").optional(),
   sessionId: z.string(),
   asset: z.string(),
   startTime: z.string(),
@@ -20,4 +21,3 @@ export const monitoringSessionSchema = z.object({
 });
 
 export type MonitoringSession = z.infer<typeof monitoringSessionSchema>;
-

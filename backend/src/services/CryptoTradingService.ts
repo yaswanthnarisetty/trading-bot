@@ -1,3 +1,4 @@
+import { denyCryptoExecution } from "../domain/ExecutionSafety";
 import { v4 as uuidv4 } from "uuid";
 import type { CryptoPosition } from "@trading-bot/shared";
 import { CryptoPositionModel } from "../models/CryptoPosition";
@@ -66,6 +67,7 @@ export async function openCryptoPosition(
   capital: number,
   atr: number
 ): Promise<CryptoPosition> {
+  denyCryptoExecution();
   // ── SL / TP distances ────────────────────────────────────────────────────
   const slDistance = atr > 0
     ? parseFloat((atr * CRYPTO_SL_ATR_MULT).toFixed(2))
@@ -154,6 +156,7 @@ export async function closeCryptoPosition(
   exitPrice: number,
   exitReason: CryptoPosition["exitReason"]
 ): Promise<CryptoPosition> {
+  denyCryptoExecution();
   const doc = await CryptoPositionModel.findOne({ positionId });
   if (!doc) throw new Error(`Crypto position not found: ${positionId}`);
   if ((doc as any).status !== "OPEN") throw new Error(`Position already closed: ${positionId}`);
