@@ -140,6 +140,55 @@ test("no phase can jump to FILLED using an observation instead of fills", () => 
   assert.equal(transitionOrder(working(), { type: "APPLY_FILL", fill: fill("overflow", 11) }).ok, false);
 });
 
+test("fill-derived phase is independent of the last broker status identity", () => {
+  let state = value(transitionOrder(working(), { type: "APPLY_FILL", fill: fill() }));
+  const snapshot = { type: "BROKER_OBSERVED" as const, phase: "ACKNOWLEDGED" as const,
+    cumulativeFilledUnits: 5, observationVersion: 2, evidenceRef: "partial-snapshot" };
+  state = value(transitionOrder(state, snapshot));
+  assert.equal(state.phase, "PARTIALLY_FILLED");
+  assert.deepEqual(value(transitionOrder(state, snapshot)), state);
+  state = value(transitionOrder(state, { type: "APPLY_FILL", fill: fill("rest", 5) }));
+  assert.deepEqual(value(transitionOrder(state, snapshot)), state);
+  assert.equal(state.phase, "FILLED"); assert.equal(state.filledUnits, 10);
+  const changed = transitionOrder(state, { ...snapshot, cumulativeFilledUnits: 10 });
+  assert.equal(changed.ok, false); if (!changed.ok) assert.equal(changed.error.code, "DUPLICATE_CONFLICT");
+});
+
+test("partial/full status snapshots cannot manufacture fills or regress a terminal order", () => {
+  const base = working();
+  for (const phase of ["PARTIALLY_FILLED", "FILLED"] as const) {
+    for (const units of [0, 5, 10]) {
+      assert.equal(transitionOrder(base, { type: "BROKER_OBSERVED", phase, cumulativeFilledUnits: units,
+        observationVersion: 2, evidenceRef: "no-trades" }).ok, false);
+    }
+  }
+  const full = value(transitionOrder(base, { type: "APPLY_FILL", fill: fill("full", 10) }));
+  const event = { type: "BROKER_OBSERVED" as const, phase: "FILLED" as const,
+    cumulativeFilledUnits: 10, observationVersion: 2, evidenceRef: "terminal-snapshot" };
+  const confirmed = value(transitionOrder(full, event));
+  assert.equal(confirmed.phase, "FILLED"); assert.equal(confirmed.lastObservationVersion, 2);
+  assert.deepEqual(confirmed.fills, full.fills);
+  assert.deepEqual(value(transitionOrder(confirmed, event)), confirmed);
+  const newer = value(transitionOrder(confirmed, { ...event, observationVersion: 3, evidenceRef: "newer-terminal" }));
+  assert.equal(newer.lastObservationVersion, 3); assert.equal(newer.filledUnits, 10);
+  for (const phase of ["ACKNOWLEDGED", "PARTIALLY_FILLED", "CANCELLED", "REJECTED"] as const) {
+    assert.equal(transitionOrder(newer, { ...event, phase, observationVersion: 4 }).ok, false);
+  }
+  const stale = transitionOrder(newer, event);
+  assert.equal(stale.ok, false); if (!stale.ok) assert.equal(stale.error.code, "OBSERVATION_REGRESSION");
+});
+
+test("snapshot replay without its restored evidence fails closed; version zero remains reserved", () => {
+  const applied = working();
+  const event = { type: "BROKER_OBSERVED" as const, phase: "ACKNOWLEDGED" as const,
+    cumulativeFilledUnits: 0, observationVersion: 1, evidenceRef: "broker-read" };
+  const missing = transitionOrder({ ...applied, lastObservation: undefined }, event);
+  assert.equal(missing.ok, false); if (!missing.ok) assert.equal(missing.error.code, "EVIDENCE_REQUIRED");
+  assert.deepEqual(value(transitionOrder(structuredClone(applied), event)), applied);
+  assert.equal(transitionOrder(submitting(), { ...event, observationVersion: 0 }).ok, false);
+  assert.equal(transitionOrder({ ...applied, lastObservation: { phase: "ACKNOWLEDGED", cumulativeFilledUnits: 1, evidenceRef: "fabricated" } }, event).ok, false);
+});
+
 test("position lifecycle is independent per leg and close requests converge (INV-014/016/018)", () => {
   const initial = positionState();
   const hedge = fill("hedge-filled", 10);

@@ -17,6 +17,12 @@ export interface SubmissionAuthorization extends ExecutionScope {
   committed: true;
   expiresAtMs: number;
 }
+export type BrokerObservationPhase = "SUBMITTED" | "ACKNOWLEDGED" | "PARTIALLY_FILLED" | "FILLED" | "CANCELLED" | "REJECTED";
+export interface BrokerStatusEvidence {
+  readonly phase: BrokerObservationPhase;
+  readonly cumulativeFilledUnits: number;
+  readonly evidenceRef: string;
+}
 export interface OrderState extends ExecutionScope {
   positionId: string;
   intentId: string;
@@ -29,6 +35,10 @@ export interface OrderState extends ExecutionScope {
   quantityUnits: number;
   filledUnits: number;
   lastObservationVersion: number;
+  /** Identity of the last consumed snapshot, independent of subsequent fill-derived phase.
+   * A reader restoring this reducer state must restore this evidence with its version.
+   */
+  lastObservation?: BrokerStatusEvidence;
   /** Pure reducer input assembled from the fill ledger; not an embedded Mongo fill collection. */
   fills: readonly FillEvidence[];
   authorization?: SubmissionAuthorization;
@@ -36,7 +46,7 @@ export interface OrderState extends ExecutionScope {
 export type OrderEvent =
   | { type: "AUTHORIZE"; authorization: SubmissionAuthorization }
   | { type: "CLAIM_SUBMISSION"; nowMs: number; executionEpoch: number; policyVersion: number }
-  | { type: "BROKER_OBSERVED"; phase: "SUBMITTED" | "ACKNOWLEDGED" | "CANCELLED" | "REJECTED";
+  | { type: "BROKER_OBSERVED"; phase: BrokerObservationPhase;
       cumulativeFilledUnits: number; observationVersion: number; evidenceRef: string }
   | { type: "APPLY_FILL"; fill: FillEvidence }
   | { type: "PROVE_NOT_SENT"; evidenceRef: string; senderQuiesced: true }
@@ -64,6 +74,7 @@ export function transitionKnowledge(from: KnowledgeState, to: KnowledgeState, ev
 const sent = ["SUBMITTING", "SUBMITTED", "ACKNOWLEDGED", "PARTIALLY_FILLED"] as const;
 const isSent = (phase: OrderPhase) => (sent as readonly OrderPhase[]).includes(phase);
 const integer = (n: number) => Number.isSafeInteger(n) && n >= 0;
+const observationPhases: readonly BrokerObservationPhase[] = ["SUBMITTED", "ACKNOWLEDGED", "PARTIALLY_FILLED", "FILLED", "CANCELLED", "REJECTED"];
 
 function validAuthorization(state: OrderState, auth: SubmissionAuthorization): boolean {
   return sameExecutionChain(state, auth) && auth.orderId === state.orderId && auth.intentId === state.intentId && auth.committed === true
@@ -78,6 +89,9 @@ export function transitionOrder(state: OrderState, event: OrderEvent): Result<Or
     || !knowledgeStateSchema.safeParse(state.knowledge).success || !cancellationStateSchema.safeParse(state.cancellation).success
     || !integer(state.quantityUnits) || state.quantityUnits === 0 || !integer(state.filledUnits)
     || state.filledUnits > state.quantityUnits || !integer(state.lastObservationVersion)
+    || (state.lastObservation !== undefined && (state.lastObservationVersion === 0
+      || !observationPhases.includes(state.lastObservation.phase) || !state.lastObservation.evidenceRef?.trim()
+      || !integer(state.lastObservation.cumulativeFilledUnits) || state.lastObservation.cumulativeFilledUnits > state.filledUnits))
     || state.fills.some(f => !ownsFill(state, f))
     || new Set(state.fills.map(f => f.fillId)).size !== state.fills.length
     || state.fills.reduce((n, f) => n + f.quantityUnits, 0) !== state.filledUnits
@@ -99,23 +113,34 @@ export function transitionOrder(state: OrderState, event: OrderEvent): Result<Or
       }
       return success({ ...state, phase: "SUBMITTING" });
     case "BROKER_OBSERVED": {
-      if (!["SUBMITTED", "ACKNOWLEDGED", "CANCELLED", "REJECTED"].includes(event.phase)) return illegal();
+      if (!observationPhases.includes(event.phase)) return illegal();
       if (!event.evidenceRef?.trim()) return failure("EVIDENCE_REQUIRED", "Broker observation requires evidence");
-      if (!integer(event.observationVersion) || !integer(event.cumulativeFilledUnits)) return failure("INVALID_STATE", "Invalid broker observation");
-      if (event.observationVersion < state.lastObservationVersion || event.cumulativeFilledUnits < state.filledUnits) {
+      if (!integer(event.observationVersion) || event.observationVersion === 0 || !integer(event.cumulativeFilledUnits)) return failure("INVALID_STATE", "Invalid broker observation");
+      if (event.observationVersion < state.lastObservationVersion) {
         return failure("OBSERVATION_REGRESSION", "An older observation cannot erase confirmed evidence");
       }
+      if (event.observationVersion === state.lastObservationVersion) {
+        const previous = state.lastObservation;
+        if (!previous) return failure("EVIDENCE_REQUIRED", "Restore the last snapshot evidence before replaying its version");
+        return previous.phase === event.phase && previous.cumulativeFilledUnits === event.cumulativeFilledUnits
+          && previous.evidenceRef === event.evidenceRef ? success(state) : failure("DUPLICATE_CONFLICT", "Conflicting observation version");
+      }
+      if (event.cumulativeFilledUnits < state.filledUnits) return failure("OBSERVATION_REGRESSION", "Observation cannot erase confirmed fills");
       if (event.cumulativeFilledUnits !== state.filledUnits) return failure("EVIDENCE_REQUIRED", "Ingest missing fills before applying this observation");
+      // Status can confirm a fill-derived phase, but cannot create execution quantity.
+      if (event.phase === "FILLED" && state.phase !== "FILLED") return illegal();
+      if (event.phase === "PARTIALLY_FILLED" && state.phase !== "PARTIALLY_FILLED") return illegal();
+      const lastObservation: BrokerStatusEvidence = { phase: event.phase,
+        cumulativeFilledUnits: event.cumulativeFilledUnits, evidenceRef: event.evidenceRef };
       if (!isSent(state.phase) && !["FILLED", "CANCELLED", "REJECTED"].includes(state.phase)) return illegal();
       if (["FILLED", "CANCELLED", "REJECTED"].includes(state.phase)) {
         if (event.phase !== state.phase) return illegal();
-        return success({ ...state, lastObservationVersion: event.observationVersion });
+        return success({ ...state, lastObservationVersion: event.observationVersion, lastObservation });
       }
-      if (event.observationVersion === state.lastObservationVersion && event.phase !== state.phase) return failure("DUPLICATE_CONFLICT", "Conflicting observation version");
       // Late HTTP acceptance/acknowledgement cannot regress a partially filled order.
       const phase = state.phase === "PARTIALLY_FILLED" && ["SUBMITTED", "ACKNOWLEDGED"].includes(event.phase)
         ? state.phase : state.phase === "ACKNOWLEDGED" && event.phase === "SUBMITTED" ? state.phase : event.phase;
-      return success({ ...state, phase, lastObservationVersion: event.observationVersion,
+      return success({ ...state, phase, lastObservationVersion: event.observationVersion, lastObservation,
         cancellation: phase === "CANCELLED" ? "CONFIRMED" : state.cancellation });
     }
     case "APPLY_FILL": {
