@@ -7,6 +7,8 @@ import { z } from "zod";
 import { executionScopeSchema } from "@trading-bot/shared";
 import { requireExecutionTransaction } from "./executionReadiness";
 import { assertExecutionIndexes } from "./executionIndexes";
+import { brokerOrderRequestSchema } from "../brokers/BrokerAdapter";
+import { submissionFingerprint, validateSubmissionEvidence } from "../brokers/submissionEvidence";
 
 type RecordData = Record<string, unknown>;
 const text = (r: RecordData, key: string): string => z.string().trim().min(1).parse(r[key]);
@@ -75,6 +77,11 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
     await intentFor(data.intentId);
   } else if (name === "execution_orders") {
     const { position } = await checkOrder(data);
+    if (data.submissionAuthorization) {
+      const authorization = z.record(z.unknown()).parse(data.submissionAuthorization);
+      const reservation = await find("execution_reservations", "reservationId", authorization.reservationId);
+      equal(reservation.intentId, data.intentId, "authorization reservation → intent");
+    }
     if (["CLOSED", "ABORTED"].includes(text(position, "lifecycle")) &&
       (doc.isNew || !["FILLED", "CANCELLED", "REJECTED", "NOT_SENT"].includes(text(data, "phase")))) {
       throw new Error("TERMINAL_POSITION: cannot add or reactivate an order");
@@ -83,6 +90,19 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
       const claim = z.record(z.unknown()).parse(data.submissionClaim);
       const reservation = await find("execution_reservations", "reservationId", claim.reservationId);
       equal(reservation.intentId, data.intentId, "reservation → order intent");
+      if (claim.request) {
+        const request = brokerOrderRequestSchema.parse(claim.request);
+        for (const key of ["accountId", "executionMode", "orderId", "intentId", "positionId", "legId", "contractKey", "side", "quantityUnits", "limitPriceMinor"] as const)
+          equal(request[key], data[key], `durable request → order ${key}`);
+        const authorization = z.record(z.unknown()).parse(data.submissionAuthorization);
+        equal(request.product, authorization.product, "durable product");
+        equal(request.claimId, claim.claimId, "durable claim identity");
+        equal(claim.reservationId, authorization.reservationId, "authorized reservation");
+        equal(request.orderType, "LIMIT", "Phase 2B2 order type");
+        equal(submissionFingerprint(request), data.requestFingerprint, "authorized fingerprint");
+        equal(claim.requestFingerprint, data.requestFingerprint, "claimed fingerprint");
+        if (data.submissionOutcome) validateSubmissionEvidence(request, data.submissionOutcome);
+      }
     }
     const fills = await db.collection("execution_fills").find({ ...scope, orderId: data.orderId }, { session }).toArray();
     checkFillTotals(data, fills, "filledUnits");

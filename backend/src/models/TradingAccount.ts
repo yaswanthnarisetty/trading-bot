@@ -5,8 +5,8 @@ export const TradingAccountSchema = executionSchema({
   broker: { type: String, enum: ["PAPER", "KITE", "LEGACY"], required: true, immutable: true },
   brokerAccountRef: idField(),
   currency: { type: String, enum: ["INR"], required: true, immutable: true },
-  admissionStatus: { type: String, enum: ["DISABLED", "RECOVERING", "HALTED"], required: true, default: "DISABLED" },
-  // There is deliberately no READY state or credential field in Phase 2A.
+  admissionStatus: { type: String, enum: ["DISABLED", "RECOVERING", "HALTED", "PAPER_READY"], required: true, default: "DISABLED" },
+  // Explicit opt-in for isolated PAPER submission only; no LIVE readiness or credentials.
   policyVersion: unitsField(), executionEpoch: unitsField(),
   reservedMarginMinor: moneyField(), reservedExposureMinor: moneyField(),
   committedExposureMinor: moneyField(), realizedPnlMinor: moneyField(true),
@@ -15,6 +15,8 @@ export const TradingAccountSchema = executionSchema({
 TradingAccountSchema.index({ accountId: 1 }, { unique: true });
 TradingAccountSchema.index({ broker: 1, brokerAccountRef: 1, executionMode: 1 }, { unique: true });
 TradingAccountSchema.pre("validate", function () {
+  if (this.get("admissionStatus") === "PAPER_READY" && this.get("executionMode") !== "PAPER")
+    this.invalidate("admissionStatus", "PAPER_READY cannot enable another execution mode");
   const expected = this.get("executionMode") === "LIVE" ? "KITE" : this.get("executionMode") === "PAPER" ? "PAPER" : "LEGACY";
   if (this.get("broker") !== expected) this.invalidate("broker", "Broker does not belong to this execution mode");
 });
