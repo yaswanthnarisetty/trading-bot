@@ -9,6 +9,7 @@ import { requireExecutionTransaction } from "./executionReadiness";
 import { assertExecutionIndexes } from "./executionIndexes";
 import { brokerOrderRequestSchema } from "../brokers/BrokerAdapter";
 import { submissionFingerprint, validateSubmissionEvidence } from "../brokers/submissionEvidence";
+import { fillAccounting, type AccountingFill } from "../domain/fillAccounting";
 
 type RecordData = Record<string, unknown>;
 const text = (r: RecordData, key: string): string => z.string().trim().min(1).parse(r[key]);
@@ -150,6 +151,15 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
       const entry = fills.filter(f => f.legId === leg.legId && f.intentId === data.entryIntentId);
       const exit = fills.filter(f => f.legId === leg.legId && f.intentId !== data.entryIntentId);
       equal(units(leg, "entryFilledUnits"), sum(entry), "position entry fills"); equal(units(leg, "exitFilledUnits"), sum(exit), "position exit fills");
+      const previousLeg = previous && rows(previous, "legs").find(l => l.legId === leg.legId);
+      if (previousLeg?.closeHoldIntentId !== undefined && previous?.activeCloseIntentId === data.activeCloseIntentId) {
+        equal(leg.closeHoldIntentId, previousLeg.closeHoldIntentId, "active close hold owner cannot be cleared or replaced");
+      }
+      if (leg.entryNotionalMinor !== undefined || leg.netQuantityUnits !== undefined || previousLeg?.entryNotionalMinor !== undefined) {
+        const accounting = fillAccounting([...entry, ...exit] as unknown as AccountingFill[], text(data, "entryIntentId"));
+        equal(leg.entryNotionalMinor, accounting.entryNotionalMinor, "position entry notional");
+        equal(leg.netQuantityUnits, accounting.netQuantityUnits, "position signed quantity");
+      }
     }
     if (["CLOSED", "ABORTED"].includes(text(data, "lifecycle"))) {
       const unresolved = await db.collection("execution_orders").countDocuments({ ...scope, positionId: data.positionId,

@@ -14,7 +14,7 @@ export const paperOrderObservationSchema = z.object({ ...identity,
   filledUnits: quantityUnitsSchema, remainingUnits: quantityUnitsSchema.nullable(), cancellation: z.enum(["NONE", "REQUESTED", "CONFIRMED"]),
   brokerTimestamp: z.string().datetime().nullable(), receivedAt: z.string().datetime(),
   observationVersion: quantityUnitsSchema.refine(n => n > 0), evidence }).strict();
-const trade = z.object({ ...identity, brokerTradeKey: identifierSchema, intentId: identifierSchema, positionId: identifierSchema,
+export const paperTradeObservationSchema = z.object({ ...identity, brokerTradeKey: identifierSchema, intentId: identifierSchema, positionId: identifierSchema,
   legId: identifierSchema, contractKey: identifierSchema, side: z.enum(["BUY", "SELL"]), quantityUnits: quantityUnitsSchema.refine(n => n > 0),
   priceMinor: nonnegativeMoneyMinorSchema, executedAt: z.string().datetime(), receivedAt: z.string().datetime(), evidence }).strict();
 export const paperSubmissionOutcomeSchema = z.discriminatedUnion("kind", [
@@ -23,7 +23,7 @@ export const paperSubmissionOutcomeSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("AMBIGUOUS"), boundary: z.literal("MAY_HAVE_BEEN_ACCEPTED"), evidence }).strict(),
 ]);
 export const submissionEvidenceSchema = z.object({ outcome: paperSubmissionOutcomeSchema,
-  observedOrder: paperOrderObservationSchema.optional(), trades: z.array(trade), evidenceComplete: z.boolean(),
+  observedOrder: paperOrderObservationSchema.optional(), trades: z.array(paperTradeObservationSchema), evidenceComplete: z.boolean(),
   pendingFillProcessing: z.boolean() }).strict();
 export type SubmissionEvidence = z.infer<typeof submissionEvidenceSchema>;
 

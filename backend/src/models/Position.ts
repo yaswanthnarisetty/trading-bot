@@ -8,6 +8,12 @@ const PositionLegSchema = new Schema({
   entrySide: { type: String, enum: ["BUY", "SELL"], required: true, immutable: true },
   targetUnits: { ...unitsField(true), immutable: true }, entryFilledUnits: unitsField(), exitFilledUnits: unitsField(),
   closeHeldUnits: unitsField(), realizedPnlMinor: moneyField(true),
+  // Retain ownership at zero so an exhausted hold cannot become an unheld legacy close.
+  closeHoldIntentId: { ...idField(), required: false, immutable: false },
+  // Optional for pre-2B3 ledger compatibility; once attached, the write boundary
+  // requires both projections on every save and proves them against actual Fills.
+  entryNotionalMinor: { ...moneyField(), required: false },
+  netQuantityUnits: { ...unitsField(), min: Number.MIN_SAFE_INTEGER, required: false },
 }, { _id: false, strict: "throw" });
 export const PositionSchema = executionSchema({
   positionId: idField(), entryIntentId: idField(), strategyInstanceId: idField(), sessionId: idField(),
