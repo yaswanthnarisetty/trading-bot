@@ -79,7 +79,8 @@ export class OrderManager {
         || authorization.policyVersion !== account.get("policyVersion") || authorization.executionEpoch !== account.get("executionEpoch")
         || intent.get("policyVersion") !== account.get("policyVersion") || reservation.get("policyVersion") !== account.get("policyVersion")
         || authorization.reservedQuantityUnits < order.get("quantityUnits") || !reservation.get("instrumentKeys").includes(order.get("contractKey"))
-        || (reservation.get("remainingMarginMinor") === 0 && reservation.get("remainingExposureMinor") === 0)) throw new Error("AUTHORIZATION_NOT_CURRENT");
+        || (reservation.get("remainingMarginMinor") === 0 && reservation.get("remainingExposureMinor") === 0
+          && reservation.get("kind") !== "CLOSE_QUANTITY")) throw new Error("AUTHORIZATION_NOT_CURRENT");
       const request = brokerOrderRequestSchema.parse({ ...this.scope, orderId, claimId, intentId: order.get("intentId"),
         positionId: order.get("positionId"), legId: order.get("legId"), contractKey: order.get("contractKey"), side: order.get("side"),
         quantityUnits: order.get("quantityUnits"), orderType: "LIMIT", limitPriceMinor: order.get("limitPriceMinor"), product: authorization.product });

@@ -75,13 +75,45 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
       }
     }
   } else if (name === "execution_reservations") {
-    await intentFor(data.intentId);
+    const intent = await intentFor(data.intentId);
+    if (data.kind === "CLOSE_QUANTITY") {
+      equal(intent.purpose, "CLOSE", "quantity reservation purpose");
+      const position = await positionFor(intent.positionId);
+      equal(position.activeCloseIntentId, intent.intentId, "quantity reservation active close");
+      equal(position.closeGeneration, intent.closeGeneration, "quantity reservation generation");
+      for (const field of ["initialMarginMinor", "remainingMarginMinor", "initialExposureMinor", "remainingExposureMinor", "positionSlots"])
+        equal(data[field], 0, "close authorization has no monetary hold or position slot");
+      for (const target of rows(intent, "targetLegs")) {
+        const leg = rows(position, "legs").find(l => l.legId === target.legId);
+        if (!leg) throw new Error("CLOSE_HOLD_OWNERSHIP_MISMATCH");
+        equal(leg.closeHoldIntentId, intent.intentId, "quantity reservation leg owner");
+        if (doc.isNew) equal(leg.closeHeldUnits, target.targetUnits, "new close quantity reservation");
+      }
+    }
   } else if (name === "execution_orders") {
-    const { position } = await checkOrder(data);
+    const { position, intent } = await checkOrder(data);
     if (data.submissionAuthorization) {
       const authorization = z.record(z.unknown()).parse(data.submissionAuthorization);
       const reservation = await find("execution_reservations", "reservationId", authorization.reservationId);
       equal(reservation.intentId, data.intentId, "authorization reservation → intent");
+      if (reservation.kind === "CLOSE_QUANTITY") {
+        equal(intent.purpose, "CLOSE", "quantity-authorized child purpose");
+        equal(position.activeCloseIntentId, intent.intentId, "quantity-authorized child active close");
+        equal(position.closeGeneration, intent.closeGeneration, "quantity-authorized child generation");
+        const plan = z.object({ policy: z.literal("POSITION_LIMIT_V1"), closeGeneration: z.number().int().nonnegative(),
+          dependsOnLegIds: z.array(z.string().min(1)) }).strict().parse(data.closePlan);
+        equal(plan.closeGeneration, intent.closeGeneration, "close child generation");
+        const leg = rows(position, "legs").find(l => l.legId === data.legId);
+        if (!leg) throw new Error("CLOSE_HOLD_OWNERSHIP_MISMATCH");
+        equal(leg.closeHoldIntentId, intent.intentId, "close child hold owner");
+        const dependencies = leg.entrySide === "BUY" ? rows(position, "legs").filter(l => l.entrySide === "SELL").map(l => text(l, "legId")).sort() : [];
+        equal(JSON.stringify([...plan.dependsOnLegIds].sort()), JSON.stringify(dependencies), "short-first dependency set");
+        if (dependencies.length && !["PLANNED", "NOT_SENT"].includes(text(data, "phase"))) throw new Error("CLOSE_DEPENDENCY_NOT_AUTHORIZED");
+        const siblings = await db.collection(name).find({ ...scope, intentId: data.intentId, legId: data.legId,
+          orderId: { $ne: data.orderId } }, { session }).toArray();
+        const outstanding = [...siblings, data].reduce((total, child) => total + BigInt(units(child, "quantityUnits")) - BigInt(units(child, "filledUnits")), 0n);
+        if (outstanding > BigInt(units(leg, "closeHeldUnits"))) throw new Error("CLOSE_HOLD_EXCEEDED: outstanding children exceed owned hold");
+      }
     }
     if (["CLOSED", "ABORTED"].includes(text(position, "lifecycle")) &&
       (doc.isNew || !["FILLED", "CANCELLED", "REJECTED", "NOT_SENT"].includes(text(data, "phase")))) {

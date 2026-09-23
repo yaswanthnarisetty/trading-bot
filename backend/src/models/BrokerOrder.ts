@@ -32,10 +32,15 @@ export const BrokerOrderSchema = executionSchema({
   submissionAuthorization: { type: AuthorizationSchema, immutable: true },
   submissionClaim: { type: ClaimSchema },
   submissionOutcome: { type: Schema.Types.Mixed },
+  closePlan: { type: new Schema({
+    policy: { type: String, enum: ["POSITION_LIMIT_V1"], required: true },
+    closeGeneration: unitsField(),
+    dependsOnLegIds: { type: [String], required: true },
+  }, { _id: false, strict: "throw" }), immutable: true },
   executionEvidenceRefs: { type: [String], default: [] },
 }, "execution_orders");
 identityIndexes(BrokerOrderSchema, "orderId");
-writeOnceFields(BrokerOrderSchema, ["brokerOrderId", "submissionClaim", "submissionOutcome"]);
+writeOnceFields(BrokerOrderSchema, ["brokerOrderId", "submissionClaim", "submissionOutcome", "closePlan"]);
 monotonicFields(BrokerOrderSchema, ["filledUnits", "lastObservationVersion"]);
 BrokerOrderSchema.index({ intentId: 1, legId: 1, sliceId: 1, generation: 1 }, { unique: true });
 // Not verified from broker contract: namespace must encode verified ID scope before live ingestion.
@@ -53,6 +58,12 @@ BrokerOrderSchema.pre("validate", function () {
   const request = this.get("submissionClaim.request");
   if (request !== undefined && !brokerOrderRequestSchema.safeParse(request).success) this.invalidate("submissionClaim", "Invalid durable request");
   const phase = this.get("phase");
+  if (this.get("closePlan") && !(Number(this.get("limitPriceMinor")) > 0))
+    this.invalidate("limitPriceMinor", "Close LIMIT price must be positive");
+  // Phase 2B4 deliberately has no dependent-child activation operation.
+  const dependencies = this.get("closePlan.dependsOnLegIds");
+  if (Array.isArray(dependencies) && dependencies.length && (typeof phase !== "string" || !["PLANNED", "NOT_SENT"].includes(phase)))
+    this.invalidate("phase", "CLOSE_DEPENDENCY_NOT_AUTHORIZED: hedge removal remains PLANNED");
   if (typeof phase === "string" && ["SUBMITTING", "SUBMITTED", "ACKNOWLEDGED", "PARTIALLY_FILLED", "FILLED"].includes(phase) && !this.get("submissionClaim")) {
     this.invalidate("submissionClaim", "Sent order requires durable authorization metadata");
   }

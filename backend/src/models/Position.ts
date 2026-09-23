@@ -15,6 +15,14 @@ const PositionLegSchema = new Schema({
   entryNotionalMinor: { ...moneyField(), required: false },
   netQuantityUnits: { ...unitsField(), min: Number.MIN_SAFE_INTEGER, required: false },
 }, { _id: false, strict: "throw" });
+const ClosePolicySchema = new Schema({
+  kind: { type: String, enum: ["POSITION_LIMIT_V1"], required: true },
+  policyVersion: unitsField(), product: { ...idField(), immutable: false },
+  expiresAt: { type: Date, required: true },
+  legLimits: { type: [new Schema({ legId: { ...idField(), immutable: false }, limitPriceMinor: { ...moneyField(), min: 1 } }, { _id: false, strict: "throw" })],
+    required: true, validate: { validator: (legs: { legId: string }[]) => legs.length > 0 && new Set(legs.map(l => l.legId)).size === legs.length,
+      message: "Distinct persisted close leg limits required" } },
+}, { _id: false, strict: "throw" });
 export const PositionSchema = executionSchema({
   positionId: idField(), entryIntentId: idField(), strategyInstanceId: idField(), sessionId: idField(),
   lifecycle: { type: String, enum: positionLifecycleSchema.options, required: true },
@@ -24,6 +32,8 @@ export const PositionSchema = executionSchema({
   executionEvidenceRefs: { type: [String], default: [] },
   closureEvidenceRefs: { type: [String], default: [] },
   potentiallyExecutingOrderCount: unitsField(),
+  // Trusted persisted configuration, never supplied to requestClose. Children snapshot it immutably.
+  closePolicy: { type: ClosePolicySchema },
 }, "execution_positions");
 identityIndexes(PositionSchema, "positionId");
 PositionSchema.index({ accountId: 1, entryIntentId: 1 }, { unique: true });
