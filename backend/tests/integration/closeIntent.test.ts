@@ -9,6 +9,7 @@ import { PaperBrokerAdapter, type PaperScenario } from "../../src/brokers/PaperB
 import type { BrokerOrderRequest } from "../../src/brokers/BrokerAdapter";
 import { submissionFingerprint } from "../../src/brokers/submissionEvidence";
 import * as f from "../fixtures";
+import { restoreHistoricalEntryClaim, recordHistoricalEntryOutcome } from "../historicalEntryFixture";
 
 const uri = process.env.EXECUTION_TEST_MONGO_URI;
 if (!uri || !new URL(uri).pathname.startsWith("/phase2a_test_")) throw new Error("NOT RUN: isolated real Mongo required");
@@ -60,7 +61,10 @@ async function seed(options: { side?: "BUY" | "SELL"; spread?: boolean; units?: 
     const broker = paper({ submission: "ACCEPTED", initialFills: filled ? [{ quantityUnits: filled, priceMinor: 1000 }] : [],
       steps: filled < orderUnits ? [{ kind: "FILL", quantityUnits: orderUnits - filled, priceMinor: 1000 }] : [] });
     const orderId = `entry-${suffix}-${leg.legId}`;
-    assert.equal((await manager(broker).submit(orderId)).status, "PERSISTED");
+    // Zero-money authorization still exercises the real pre-dispatch rejection.
+    const opening = options.zeroMoney ? await manager(broker).submit(orderId)
+      : await recordHistoricalEntryOutcome(connection, f.scope, broker, clock, orderId);
+    assert.equal(opening.status, "PERSISTED");
     await processor().processRetained(orderId);
     brokers.set(leg.legId, broker);
   }
@@ -101,7 +105,7 @@ async function cancelledRemainder(complete = true) {
   const orderId = await remainder();
   const broker = paper({ submission: "ACCEPTED", steps: [{ kind: "CONFIRM_CANCEL" }] });
   // Existing finality fixture, using actual simulator evidence. No cancellation service is introduced.
-  const claimed = await (manager(broker) as unknown as { claim(id: string): Promise<{ request: BrokerOrderRequest }> }).claim(orderId);
+  const claimed = await restoreHistoricalEntryClaim(connection, f.scope, broker, clock, orderId);
   const outcome = await broker.submitOrder(claimed.request); assert.equal(outcome.kind, "ACCEPTED");
   const observed = await broker.getOrder({ ...f.scope, orderId }); assert.ok(observed);
   await broker.cancelOrder(observed); const final = await broker.advance({ ...f.scope, orderId });
@@ -223,7 +227,7 @@ test("real late opening fill increases exposure without consuming close holds or
   await seed({ orderUnits: 4 }); const close = await service().requestClose("position-1", "close-command");
   // New external entry work AFTER planning represents a later inconsistency, not permission to resize.
   const orderId = await remainder(); const broker = paper({ submission: "ACCEPTED", initialFills: [{ quantityUnits: 6, priceMinor: 1000 }] });
-  await manager(broker).submit(orderId); await processor().processRetained(orderId);
+  await recordHistoricalEntryOutcome(connection, f.scope, broker, clock, orderId); await processor().processRetained(orderId);
   assert.equal((await position()).get("legs.0.netQuantityUnits"), 10); assert.equal((await position()).get("legs.0.closeHeldUnits"), 4);
   assert.equal((await position()).get("integrity"), "RECONCILIATION_REQUIRED");
   const before = await snapshot();
@@ -363,8 +367,8 @@ test("real close child economics remain fixed after persisted policy changes", a
 for (const phase of ["PLANNED", "READY", "SUBMITTING", "SUBMITTED", "ACKNOWLEDGED"] as const)
   test(`real ${phase} ENTRY remainder blocks new close with no committed side effects`, async () => {
     await seed({ orderUnits: 4 }); const orderId = await remainder(phase === "PLANNED" ? phase : "READY");
-    if (phase === "SUBMITTING") await (manager(paper()) as unknown as { claim(id: string): Promise<unknown> }).claim(orderId);
-    if (["SUBMITTED", "ACKNOWLEDGED"].includes(phase)) await manager(paper({ submission: "ACCEPTED", delayedAcknowledgement: phase === "SUBMITTED" })).submit(orderId);
+    if (phase === "SUBMITTING") await restoreHistoricalEntryClaim(connection, f.scope, paper(), clock, orderId);
+    if (["SUBMITTED", "ACKNOWLEDGED"].includes(phase)) await recordHistoricalEntryOutcome(connection, f.scope, paper({ submission: "ACCEPTED", delayedAcknowledgement: phase === "SUBMITTED" }), clock, orderId);
     assert.equal((await models.BrokerOrder.findOne({ orderId }).orFail()).get("phase"), phase);
     await assertBlocked(orderId, 6);
   });
@@ -382,7 +386,7 @@ for (const phase of ["REJECTED", "CANCELLED", "NOT_SENT"] as const)
     await seed({ orderUnits: 4 });
     if (phase === "CANCELLED") await cancelledRemainder();
     else { const orderId = await remainder(phase === "NOT_SENT" ? phase : "READY");
-      if (phase === "REJECTED") await manager(paper({ submission: "REJECTED" })).submit(orderId); }
+      if (phase === "REJECTED") await recordHistoricalEntryOutcome(connection, f.scope, paper({ submission: "REJECTED" }), clock, orderId); }
     const close = await service().requestClose("position-1", "terminal-entry-close");
     assert.equal(close.status, "CREATED"); assert.equal((await position()).get("legs.0.closeHeldUnits"), 4);
     assert.equal((await models.BrokerOrder.findOne({ orderId: close.orderIds[0] }).orFail()).get("quantityUnits"), 4);
@@ -419,7 +423,7 @@ for (const legId of ["hedge", "short"]) test(`real unresolved ${legId} ENTRY leg
 
 test("real new UNKNOWN entry after close creation reuses the existing workflow unchanged", async () => {
   await seed({ orderUnits: 4 }); const close = await service().requestClose("position-1", "first-close");
-  const orderId = await remainder(); await manager(paper({ submission: "AMBIGUOUS" })).submit(orderId);
+  const orderId = await remainder(); await recordHistoricalEntryOutcome(connection, f.scope, paper({ submission: "AMBIGUOUS" }), clock, orderId);
   const before = await snapshot(), again = await service().requestClose("position-1", "again");
   assert.equal(again.intentId, close.intentId); assert.deepEqual(again.orderIds, close.orderIds); assert.deepEqual(await snapshot(), before);
 });
@@ -496,7 +500,7 @@ test("real REJECTED phase without conclusive rejection evidence blocks", async (
 });
 
 test("real UNKNOWN rejection cannot authorize close", async () => {
-  await seed({ orderUnits: 4 }); const orderId = await remainder(); await manager(paper({ submission: "REJECTED" })).submit(orderId);
+  await seed({ orderUnits: 4 }); const orderId = await remainder(); await recordHistoricalEntryOutcome(connection, f.scope, paper({ submission: "REJECTED" }), clock, orderId);
   await tx(async session => { const child = await models.BrokerOrder.findOne({ orderId }).session(session).orFail();
     child.set("knowledge", "UNKNOWN"); await child.save({ session }); });
   await assertBlocked(orderId, 6);

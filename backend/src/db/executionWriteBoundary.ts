@@ -11,6 +11,7 @@ import { brokerOrderRequestSchema } from "../brokers/BrokerAdapter";
 import { submissionFingerprint, validateSubmissionEvidence } from "../brokers/submissionEvidence";
 import { fillAccounting, type AccountingFill } from "../domain/fillAccounting";
 import { dependenciesAreSafe, verifyCloseLedger } from "../domain/closeWorkflowEvidence";
+import { entryRiskPolicySchema, riskAssert, verifyEntryReservation } from "../domain/entryRisk";
 
 type RecordData = Record<string, unknown>;
 const text = (r: RecordData, key: string): string => z.string().trim().min(1).parse(r[key]);
@@ -96,6 +97,33 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
     }
   } else if (name === "execution_reservations") {
     const intent = await intentFor(data.intentId);
+    if (data.kind === "ENTRY_RISK") {
+      const admission = z.record(z.unknown()).parse(data.entryAdmission);
+      const position = await positionFor(admission.positionId);
+      checkIntentPosition(intent, position);
+      equal(data.strategyInstanceId, position.strategyInstanceId, "entry reservation strategy");
+      equal(scope.executionMode, "PAPER", "entry reservation mode");
+      const { requirement, admission: snapshot } = verifyEntryReservation(data, intent, text(position, "positionId"));
+      if (doc.isNew) {
+        const policy = entryRiskPolicySchema.safeParse(account.entryRiskPolicy);
+        riskAssert(policy.success && policy.data.policyVersion === account.policyVersion, "RISK_POLICY_REQUIRED");
+        riskAssert(account.admissionStatus === "PAPER_READY" && account.broker === "PAPER", "ACCOUNT_NOT_READY");
+        equal(snapshot.policyVersion, account.policyVersion, "entry admission policy");
+        equal(snapshot.executionEpoch, account.executionEpoch, "entry admission epoch");
+        equal(intent.policyVersion, account.policyVersion, "entry intent policy");
+        riskAssert(account.committedExposureMinor === 0, "UNSUPPORTED_ACCOUNT_EXPOSURE");
+        const retained = await db.collection(name).find({ ...scope, kind: { $ne: "CLOSE_QUANTITY" } }, { session }).toArray();
+        riskAssert(retained.every(hold => hold.kind === "ENTRY_RISK" && hold.state === "HELD"), "UNSUPPORTED_ACCOUNT_EXPOSURE");
+        const totalRisk = retained.reduce((total, hold) => total + BigInt(units(hold, "remainingExposureMinor")), BigInt(requirement.requiredRiskMinor));
+        const totalMargin = retained.reduce((total, hold) => total + BigInt(units(hold, "remainingMarginMinor")), BigInt(requirement.requiredRiskMinor));
+        const totalSlots = retained.reduce((total, hold) => total + BigInt(units(hold, "positionSlots")), 1n);
+        riskAssert(BigInt(units(account, "reservedExposureMinor")) === totalRisk && BigInt(units(account, "reservedMarginMinor")) === totalMargin
+          && BigInt(units(account, "positionSlots")) === totalSlots, "RISK_PROJECTION_MISMATCH");
+        riskAssert(requirement.requiredRiskMinor <= policy.data.maxRiskPerEntryMinor, "RISK_PER_TRADE_EXCEEDED");
+        riskAssert(totalRisk <= BigInt(policy.data.maxReservedRiskMinor), "RISK_CAPACITY_EXCEEDED");
+        riskAssert(totalSlots <= BigInt(policy.data.maxPositionSlots), "POSITION_LIMIT_EXCEEDED");
+      }
+    }
     if (data.kind === "CLOSE_QUANTITY") {
       equal(intent.purpose, "CLOSE", "quantity reservation purpose");
       const position = await positionFor(intent.positionId);
@@ -113,10 +141,49 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
   } else if (name === "execution_orders") {
     const { position, intent } = await checkOrder(data);
     const previous = await db.collection(name).findOne({ ...scope, orderId: data.orderId }, { session });
+    // The persisted physical claim separates new dispatch from already-sent truth.
+    // Missing optional economics must never select a weaker admission path.
+    const initialEntryClaim = scope.executionMode === "PAPER" && intent.purpose === "ENTRY"
+      && Boolean(data.submissionClaim) && !previous?.submissionClaim;
+    if (initialEntryClaim) {
+      equal(previous?.phase, "READY", "ENTRY admission requires an existing READY child");
+      if (!data.submissionAuthorization) throw new Error("ENTRY_ADMISSION_REQUIRED");
+    }
     if (data.submissionAuthorization) {
       const authorization = z.record(z.unknown()).parse(data.submissionAuthorization);
       const reservation = await find("execution_reservations", "reservationId", authorization.reservationId);
       equal(reservation.intentId, data.intentId, "authorization reservation → intent");
+      if (initialEntryClaim) equal(reservation.kind, "ENTRY_RISK", "ENTRY admission reservation kind");
+      if (reservation.kind === "ENTRY_RISK") {
+        const { requirement, admission } = verifyEntryReservation(reservation, intent, text(position, "positionId"));
+        const leg = requirement.legs.find(leg => leg.legId === data.legId);
+        if (!leg) throw new Error("LEDGER_RELATIONSHIP_MISMATCH: entry admission leg");
+        equal(data.generation, admission.generation, "entry generation"); equal(data.sliceId, "entry", "entry physical child");
+        equal(data.quantityUnits, leg.quantityUnits, "entry authorized quantity"); equal(data.limitPriceMinor, leg.limitPriceMinor, "entry authorized limit");
+        equal(authorization.reservedQuantityUnits, leg.quantityUnits, "entry reserved quantity");
+        equal(authorization.policyVersion, admission.policyVersion, "entry policy snapshot");
+        equal(authorization.executionEpoch, admission.executionEpoch, "entry epoch snapshot");
+        equal(authorization.product, requirement.product, "entry product");
+        equal((authorization.expiresAt as Date).getTime(), Math.min(requirement.expiresAt.getTime(), (intent.deadline as Date).getTime()), "entry authorization expiry");
+        // An initial claim must be backed by the atomically published admission.
+        // Once claimed, evidence ingestion never repeats pre-dispatch admission.
+        if (initialEntryClaim) {
+          const retained = await db.collection("execution_reservations").find({ ...scope, kind: { $ne: "CLOSE_QUANTITY" } }, { session }).toArray();
+          riskAssert(retained.every(hold => hold.kind === "ENTRY_RISK" && hold.state === "HELD"), "RISK_PROJECTION_MISMATCH");
+          for (const [counter, field] of [["reservedExposureMinor", "remainingExposureMinor"], ["reservedMarginMinor", "remainingMarginMinor"], ["positionSlots", "positionSlots"]]) {
+            const total = retained.reduce((sum, hold) => sum + BigInt(units(hold, field)), 0n);
+            riskAssert(BigInt(units(account, counter)) === total, "RISK_PROJECTION_MISMATCH");
+          }
+          const event = await find("execution_events", "eventId", `${reservation.reservationId}:RISK_RESERVED`);
+          equal(event.eventType, "RISK_RESERVED", "entry admission event"); equal(event.aggregateId, intent.intentId, "entry admission intent");
+          equal(event.aggregateType, "OrderIntent", "entry admission aggregate");
+          const payload = z.record(z.unknown()).parse(event.payload);
+          equal(payload.kind, "RISK", "entry admission payload");
+          equal(payload.reservationId, reservation.reservationId, "entry admission reservation");
+          equal(payload.exposureMinor, requirement.requiredRiskMinor, "entry admission risk");
+          equal(payload.marginMinor, requirement.requiredRiskMinor, "entry admission margin");
+        }
+      }
       if (reservation.kind === "CLOSE_QUANTITY") {
         equal(intent.purpose, "CLOSE", "quantity-authorized child purpose");
         equal(position.activeCloseIntentId, intent.intentId, "quantity-authorized child active close");

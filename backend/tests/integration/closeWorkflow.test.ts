@@ -9,6 +9,7 @@ import { PaperBrokerAdapter, type PaperScenario } from "../../src/brokers/PaperB
 import type { BrokerOrderRequest } from "../../src/brokers/BrokerAdapter";
 import { submissionFingerprint } from "../../src/brokers/submissionEvidence";
 import * as f from "../fixtures";
+import { restoreHistoricalEntryClaim, recordHistoricalEntryOutcome } from "../historicalEntryFixture";
 
 const uri = process.env.EXECUTION_TEST_MONGO_URI;
 if (!uri || !new URL(uri).pathname.startsWith("/phase2a_test_")) throw new Error("NOT RUN: isolated real Mongo required");
@@ -60,7 +61,7 @@ async function seed(options: { side?: "BUY" | "SELL"; spread?: boolean; units?: 
     const broker = paper({ submission: "ACCEPTED", initialFills: filled ? [{ quantityUnits: filled, priceMinor: 1000 }] : [],
       steps: filled < orderUnits ? [{ kind: "FILL", quantityUnits: orderUnits - filled, priceMinor: 1000 }] : [] });
     const orderId = `entry-${suffix}-${leg.legId}`;
-    assert.equal((await manager(broker).submit(orderId)).status, "PERSISTED");
+    assert.equal((await recordHistoricalEntryOutcome(connection, f.scope, broker, clock, orderId)).status, "PERSISTED");
     await processor().processRetained(orderId);
     brokers.set(leg.legId, broker);
   }
@@ -173,8 +174,8 @@ for (const phase of ["READY", "SUBMITTING", "ACKNOWLEDGED", "UNKNOWN"] as const)
  test(`real unresolved short ENTRY ${phase} blocks hedge removal`, async () => {
   const { shortId, hedgeId } = await planned(true, 14); await execute(shortId!);
   const orderId = await extraEntry("short");
-  if (phase === "SUBMITTING") await (manager(paper()) as unknown as { claim(id: string): Promise<unknown> }).claim(orderId);
-  if (phase === "ACKNOWLEDGED" || phase === "UNKNOWN") await manager(paper({ submission: phase === "UNKNOWN" ? "AMBIGUOUS" : "ACCEPTED" })).submit(orderId);
+  if (phase === "SUBMITTING") await restoreHistoricalEntryClaim(connection, f.scope, paper(), clock, orderId);
+  if (phase === "ACKNOWLEDGED" || phase === "UNKNOWN") await recordHistoricalEntryOutcome(connection, f.scope, paper({ submission: phase === "UNKNOWN" ? "AMBIGUOUS" : "ACCEPTED" }), clock, orderId);
   const result = await workflow().advance("position-1"); assert.deepEqual(result.promotedOrderIds, []); assert.ok(result.blockingOrderIds.includes(orderId));
   assert.equal((await models.BrokerOrder.findOne({ orderId: hedgeId }).orFail()).get("phase"), "PLANNED");
  });
@@ -207,7 +208,7 @@ test("real UNKNOWN full short-close remains unresolved and cannot activate hedge
 for (const unknown of [false, true]) test(`real all flat with unresolved ENTRY unknown=${unknown} retains active reservation`, async () => {
   const { close, hedgeId } = await planned(false, 14); await execute(hedgeId);
   const extra = await extraEntry("hedge");
-  if (unknown) await manager(paper({ submission: "AMBIGUOUS" })).submit(extra);
+  if (unknown) await recordHistoricalEntryOutcome(connection, f.scope, paper({ submission: "AMBIGUOUS" }), clock, extra);
   assert.equal((await workflow().advance("position-1")).status, "BLOCKED");
   assert.equal((await position()).get("lifecycle"), "PARTIALLY_CLOSING"); assert.equal((await position()).get("activeCloseIntentId"), close.intentId);
   assert.equal((await models.OrderIntent.findOne({ intentId: close.intentId }).orFail()).get("state"), "EXECUTING");

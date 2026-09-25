@@ -42,8 +42,12 @@ test("real unique physical child", async () => {
 async function fillSetup() {
   await transaction(async session => {
     await new models.RiskReservation(f.reservation()).save({ session });
-    await new models.BrokerOrder({ ...f.brokerOrder(), phase: "SUBMITTED", brokerOrderId: "broker-order-1",
-      submissionClaim: { claimId: "claim-1", reservationId: "reservation-1", evidenceRef: "claim-proof", policyVersion: 1, executionEpoch: 1, claimedAt: f.now, expiresAt: f.now } }).save({ session });
+    await new models.BrokerOrder(f.brokerOrder()).save({ session });
+    // Restore historical already-dispatched evidence, never authorize a new ENTRY.
+    await connection.db!.collection("execution_orders").updateOne({ orderId: "order-1" }, { $set: {
+      phase: "SUBMITTED", brokerOrderId: "broker-order-1",
+      submissionClaim: { claimId: "claim-1", reservationId: "reservation-1", evidenceRef: "claim-proof", policyVersion: 1, executionEpoch: 1, claimedAt: f.now, expiresAt: f.now },
+    } }, { session });
   });
 }
 test("real Fill broker identity uniqueness and evidence-derived aggregate writes", async () => {

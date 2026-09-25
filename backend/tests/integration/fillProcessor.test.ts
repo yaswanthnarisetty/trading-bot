@@ -10,6 +10,7 @@ import { submissionFingerprint } from "../../src/brokers/submissionEvidence";
 import { transitionOrder, type OrderState } from "../../src/domain/OrderStateMachine";
 import type { FillEvidence } from "../../src/domain/execution";
 import * as f from "../fixtures";
+import { restoreHistoricalEntryClaim, recordHistoricalEntryOutcome } from "../historicalEntryFixture";
 
 const uri = process.env.EXECUTION_TEST_MONGO_URI;
 if (!uri || !new URL(uri).pathname.startsWith("/phase2a_test_")) throw new Error("NOT RUN: isolated real Mongo required");
@@ -56,7 +57,12 @@ async function seed(quantity = 10, spread = false, side: "BUY" | "SELL" = "BUY",
 }
 async function submit(plan: PaperScenario, orderId = "order-1") {
   const paper = broker(plan);
-  assert.equal((await new OrderManager(connection, f.scope, paper, clock).submit(orderId)).status, "PERSISTED");
+  const child = await models.BrokerOrder.findOne({ orderId }).orFail();
+  const intent = await models.OrderIntent.findOne({ intentId: child.get("intentId") }).orFail();
+  const result = intent.get("purpose") === "ENTRY"
+    ? await recordHistoricalEntryOutcome(connection, f.scope, paper, clock, orderId)
+    : await new OrderManager(connection, f.scope, paper, clock).submit(orderId);
+  assert.equal(result.status, "PERSISTED");
   return { paper, trades: await paper.getTrades(f.scope) };
 }
 async function setup(fills = [{ quantityUnits: 4, priceMinor: 990 }], quantity = 10) {
@@ -145,8 +151,7 @@ test("real SUBMITTING UNKNOWN order accepts proven fills without resolving uncer
 
 test("real trade before persisted receipt attaches broker identity atomically", async () => {
   await seed(); const paper = broker({ submission: "ACCEPTED", initialFills: [{ quantityUnits: 4, priceMinor: 990 }] });
-  const manager = new OrderManager(connection, f.scope, paper, clock) as unknown as { claim(id: string): Promise<{ request: BrokerOrderRequest }> };
-  const { request } = await manager.claim("order-1"); await paper.submitOrder(request);
+  const { request } = await restoreHistoricalEntryClaim(connection, f.scope, paper, clock, "order-1"); await paper.submitOrder(request);
   const [trade] = await paper.getTrades(f.scope); assert.equal((await order()).get("brokerOrderId"), undefined);
   await processor().process(trade); assert.equal((await order()).get("brokerOrderId"), trade.brokerOrderId);
   assert.equal((await order()).get("phase"), "PARTIALLY_FILLED"); assert.equal(await models.Fill.countDocuments(), 1);
@@ -203,7 +208,7 @@ test("real incomplete retained snapshot cannot create quantity or report PROCESS
   class UnavailableTrades extends PaperBrokerAdapter { override async getTrades(): Promise<readonly BrokerTradeObservation[]> { throw new Error("unavailable"); } }
   const paper = new UnavailableTrades(f.scope, { clock: { now: () => f.now.toISOString() }, ids: { nextId: kind => `${kind}-${++ids}` },
     scenario: () => ({ submission: "ACCEPTED", initialFills: [{ quantityUnits: 10, priceMinor: 990 }] }) });
-  await new OrderManager(connection, f.scope, paper, clock).submit("order-1");
+  await recordHistoricalEntryOutcome(connection, f.scope, paper, clock, "order-1");
   const before = await snapshot(); assert.equal((await processor().processRetained("order-1")).status, "INCOMPLETE");
   assert.deepEqual(await snapshot(), before); assert.equal((await order()).get("filledUnits"), 0);
 });
