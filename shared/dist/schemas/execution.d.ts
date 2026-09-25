@@ -43,9 +43,42 @@ export type PositionLifecycle = z.infer<typeof positionLifecycleSchema>;
 export type PositionIntegrity = z.infer<typeof positionIntegritySchema>;
 export type IntentPurpose = z.infer<typeof intentPurposeSchema>;
 export type OrderSide = z.infer<typeof orderSideSchema>;
-export declare const tradingEventTypeSchema: z.ZodEnum<["SIGNAL_CREATED", "INTENT_CREATED", "RISK_BLOCKED", "RISK_RESERVED", "SUBMISSION_CLAIMED", "ORDER_SUBMITTED", "ORDER_ACKNOWLEDGED", "ORDER_READY", "ORDER_FINALITY_CONFIRMED", "INTENT_COMPLETED", "RESERVATION_CONSUMED", "ORDER_OUTCOME_UNKNOWN", "ORDER_REJECTED", "ORDER_CANCEL_REQUESTED", "ORDER_CANCELLED", "FILL_RECEIVED", "POSITION_PARTIALLY_OPENED", "POSITION_OPENED", "POSITION_CLOSE_REQUESTED", "POSITION_PARTIALLY_CLOSED", "POSITION_CLOSED", "RESERVATION_RELEASED", "RECONCILIATION_MISMATCH", "RECONCILIATION_RESOLVED", "ACCOUNT_HALTED", "ACCOUNT_RESUMED"]>;
+export declare const tradingEventTypeSchema: z.ZodEnum<["SIGNAL_CREATED", "INTENT_CREATED", "RISK_BLOCKED", "RISK_RESERVED", "ENTRY_RISK_COMMITTED", "SUBMISSION_CLAIMED", "ORDER_SUBMITTED", "ORDER_ACKNOWLEDGED", "ORDER_READY", "ORDER_FINALITY_CONFIRMED", "INTENT_COMPLETED", "RESERVATION_CONSUMED", "ORDER_OUTCOME_UNKNOWN", "ORDER_REJECTED", "ORDER_CANCEL_REQUESTED", "ORDER_CANCELLED", "FILL_RECEIVED", "POSITION_PARTIALLY_OPENED", "POSITION_OPENED", "POSITION_CLOSE_REQUESTED", "POSITION_PARTIALLY_CLOSED", "POSITION_CLOSED", "RESERVATION_RELEASED", "RECONCILIATION_MISMATCH", "RECONCILIATION_RESOLVED", "ACCOUNT_HALTED", "ACCOUNT_RESUMED"]>;
 export declare const aggregateTypeSchema: z.ZodEnum<["TradingAccount", "StrategySignal", "OrderIntent", "RiskReservation", "BrokerOrder", "Fill", "Position"]>;
 export declare const eventPayloadSchema: z.ZodDiscriminatedUnion<"kind", [z.ZodObject<{
+    kind: z.ZodLiteral<"ENTRY_RISK_TRANSFER">;
+    reservationId: z.ZodString;
+    fillId: z.ZodString;
+    legId: z.ZodString;
+    quantityUnits: z.ZodEffects<z.ZodNumber, number, number>;
+    releasedPendingMinor: z.ZodEffects<z.ZodNumber, number, number>;
+    committedPremiumMinor: z.ZodEffects<z.ZodNumber, number, number>;
+    remainingPendingMinor: z.ZodEffects<z.ZodNumber, number, number>;
+    committedExposureMinor: z.ZodEffects<z.ZodNumber, number, number>;
+    slotTransferred: z.ZodBoolean;
+}, "strict", z.ZodTypeAny, {
+    kind: "ENTRY_RISK_TRANSFER";
+    reservationId: string;
+    fillId: string;
+    legId: string;
+    quantityUnits: number;
+    releasedPendingMinor: number;
+    committedPremiumMinor: number;
+    remainingPendingMinor: number;
+    committedExposureMinor: number;
+    slotTransferred: boolean;
+}, {
+    kind: "ENTRY_RISK_TRANSFER";
+    reservationId: string;
+    fillId: string;
+    legId: string;
+    quantityUnits: number;
+    releasedPendingMinor: number;
+    committedPremiumMinor: number;
+    remainingPendingMinor: number;
+    committedExposureMinor: number;
+    slotTransferred: boolean;
+}>, z.ZodObject<{
     kind: z.ZodLiteral<"REFERENCE">;
     entityId: z.ZodString;
 }, "strict", z.ZodTypeAny, {
@@ -75,14 +108,14 @@ export declare const eventPayloadSchema: z.ZodDiscriminatedUnion<"kind", [z.ZodO
 }, "strict", z.ZodTypeAny, {
     kind: "FILL";
     fillId: string;
-    orderId: string;
     quantityUnits: number;
+    orderId: string;
     priceMinor: number;
 }, {
     kind: "FILL";
     fillId: string;
-    orderId: string;
     quantityUnits: number;
+    orderId: string;
     priceMinor: number;
 }>, z.ZodObject<{
     kind: z.ZodLiteral<"RISK">;
@@ -106,7 +139,7 @@ export declare const tradingEventSchema: z.ZodEffects<z.ZodObject<{
     executionMode: z.ZodEnum<["LEGACY_PAPER", "PAPER", "LIVE"]>;
     accountSequence: z.ZodEffects<z.ZodNumber, number, number>;
     tradingDate: z.ZodEffects<z.ZodString, string, string>;
-    eventType: z.ZodEnum<["SIGNAL_CREATED", "INTENT_CREATED", "RISK_BLOCKED", "RISK_RESERVED", "SUBMISSION_CLAIMED", "ORDER_SUBMITTED", "ORDER_ACKNOWLEDGED", "ORDER_READY", "ORDER_FINALITY_CONFIRMED", "INTENT_COMPLETED", "RESERVATION_CONSUMED", "ORDER_OUTCOME_UNKNOWN", "ORDER_REJECTED", "ORDER_CANCEL_REQUESTED", "ORDER_CANCELLED", "FILL_RECEIVED", "POSITION_PARTIALLY_OPENED", "POSITION_OPENED", "POSITION_CLOSE_REQUESTED", "POSITION_PARTIALLY_CLOSED", "POSITION_CLOSED", "RESERVATION_RELEASED", "RECONCILIATION_MISMATCH", "RECONCILIATION_RESOLVED", "ACCOUNT_HALTED", "ACCOUNT_RESUMED"]>;
+    eventType: z.ZodEnum<["SIGNAL_CREATED", "INTENT_CREATED", "RISK_BLOCKED", "RISK_RESERVED", "ENTRY_RISK_COMMITTED", "SUBMISSION_CLAIMED", "ORDER_SUBMITTED", "ORDER_ACKNOWLEDGED", "ORDER_READY", "ORDER_FINALITY_CONFIRMED", "INTENT_COMPLETED", "RESERVATION_CONSUMED", "ORDER_OUTCOME_UNKNOWN", "ORDER_REJECTED", "ORDER_CANCEL_REQUESTED", "ORDER_CANCELLED", "FILL_RECEIVED", "POSITION_PARTIALLY_OPENED", "POSITION_OPENED", "POSITION_CLOSE_REQUESTED", "POSITION_PARTIALLY_CLOSED", "POSITION_CLOSED", "RESERVATION_RELEASED", "RECONCILIATION_MISMATCH", "RECONCILIATION_RESOLVED", "ACCOUNT_HALTED", "ACCOUNT_RESUMED"]>;
     aggregateType: z.ZodEnum<["TradingAccount", "StrategySignal", "OrderIntent", "RiskReservation", "BrokerOrder", "Fill", "Position"]>;
     aggregateId: z.ZodString;
     aggregateVersion: z.ZodNumber;
@@ -119,6 +152,39 @@ export declare const tradingEventSchema: z.ZodEffects<z.ZodObject<{
     reason: z.ZodString;
     evidenceRefs: z.ZodArray<z.ZodString, "many">;
     payload: z.ZodDiscriminatedUnion<"kind", [z.ZodObject<{
+        kind: z.ZodLiteral<"ENTRY_RISK_TRANSFER">;
+        reservationId: z.ZodString;
+        fillId: z.ZodString;
+        legId: z.ZodString;
+        quantityUnits: z.ZodEffects<z.ZodNumber, number, number>;
+        releasedPendingMinor: z.ZodEffects<z.ZodNumber, number, number>;
+        committedPremiumMinor: z.ZodEffects<z.ZodNumber, number, number>;
+        remainingPendingMinor: z.ZodEffects<z.ZodNumber, number, number>;
+        committedExposureMinor: z.ZodEffects<z.ZodNumber, number, number>;
+        slotTransferred: z.ZodBoolean;
+    }, "strict", z.ZodTypeAny, {
+        kind: "ENTRY_RISK_TRANSFER";
+        reservationId: string;
+        fillId: string;
+        legId: string;
+        quantityUnits: number;
+        releasedPendingMinor: number;
+        committedPremiumMinor: number;
+        remainingPendingMinor: number;
+        committedExposureMinor: number;
+        slotTransferred: boolean;
+    }, {
+        kind: "ENTRY_RISK_TRANSFER";
+        reservationId: string;
+        fillId: string;
+        legId: string;
+        quantityUnits: number;
+        releasedPendingMinor: number;
+        committedPremiumMinor: number;
+        remainingPendingMinor: number;
+        committedExposureMinor: number;
+        slotTransferred: boolean;
+    }>, z.ZodObject<{
         kind: z.ZodLiteral<"REFERENCE">;
         entityId: z.ZodString;
     }, "strict", z.ZodTypeAny, {
@@ -148,14 +214,14 @@ export declare const tradingEventSchema: z.ZodEffects<z.ZodObject<{
     }, "strict", z.ZodTypeAny, {
         kind: "FILL";
         fillId: string;
-        orderId: string;
         quantityUnits: number;
+        orderId: string;
         priceMinor: number;
     }, {
         kind: "FILL";
         fillId: string;
-        orderId: string;
         quantityUnits: number;
+        orderId: string;
         priceMinor: number;
     }>, z.ZodObject<{
         kind: z.ZodLiteral<"RISK">;
@@ -179,7 +245,7 @@ export declare const tradingEventSchema: z.ZodEffects<z.ZodObject<{
     eventId: string;
     accountSequence: number;
     tradingDate: string;
-    eventType: "RISK_RESERVED" | "SIGNAL_CREATED" | "INTENT_CREATED" | "RISK_BLOCKED" | "SUBMISSION_CLAIMED" | "ORDER_SUBMITTED" | "ORDER_ACKNOWLEDGED" | "ORDER_READY" | "ORDER_FINALITY_CONFIRMED" | "INTENT_COMPLETED" | "RESERVATION_CONSUMED" | "ORDER_OUTCOME_UNKNOWN" | "ORDER_REJECTED" | "ORDER_CANCEL_REQUESTED" | "ORDER_CANCELLED" | "FILL_RECEIVED" | "POSITION_PARTIALLY_OPENED" | "POSITION_OPENED" | "POSITION_CLOSE_REQUESTED" | "POSITION_PARTIALLY_CLOSED" | "POSITION_CLOSED" | "RESERVATION_RELEASED" | "RECONCILIATION_MISMATCH" | "RECONCILIATION_RESOLVED" | "ACCOUNT_HALTED" | "ACCOUNT_RESUMED";
+    eventType: "RISK_RESERVED" | "SIGNAL_CREATED" | "INTENT_CREATED" | "RISK_BLOCKED" | "ENTRY_RISK_COMMITTED" | "SUBMISSION_CLAIMED" | "ORDER_SUBMITTED" | "ORDER_ACKNOWLEDGED" | "ORDER_READY" | "ORDER_FINALITY_CONFIRMED" | "INTENT_COMPLETED" | "RESERVATION_CONSUMED" | "ORDER_OUTCOME_UNKNOWN" | "ORDER_REJECTED" | "ORDER_CANCEL_REQUESTED" | "ORDER_CANCELLED" | "FILL_RECEIVED" | "POSITION_PARTIALLY_OPENED" | "POSITION_OPENED" | "POSITION_CLOSE_REQUESTED" | "POSITION_PARTIALLY_CLOSED" | "POSITION_CLOSED" | "RESERVATION_RELEASED" | "RECONCILIATION_MISMATCH" | "RECONCILIATION_RESOLVED" | "ACCOUNT_HALTED" | "ACCOUNT_RESUMED";
     aggregateType: "TradingAccount" | "StrategySignal" | "OrderIntent" | "RiskReservation" | "BrokerOrder" | "Fill" | "Position";
     aggregateId: string;
     aggregateVersion: number;
@@ -192,6 +258,17 @@ export declare const tradingEventSchema: z.ZodEffects<z.ZodObject<{
     reason: string;
     evidenceRefs: string[];
     payload: {
+        kind: "ENTRY_RISK_TRANSFER";
+        reservationId: string;
+        fillId: string;
+        legId: string;
+        quantityUnits: number;
+        releasedPendingMinor: number;
+        committedPremiumMinor: number;
+        remainingPendingMinor: number;
+        committedExposureMinor: number;
+        slotTransferred: boolean;
+    } | {
         kind: "REFERENCE";
         entityId: string;
     } | {
@@ -201,8 +278,8 @@ export declare const tradingEventSchema: z.ZodEffects<z.ZodObject<{
     } | {
         kind: "FILL";
         fillId: string;
-        orderId: string;
         quantityUnits: number;
+        orderId: string;
         priceMinor: number;
     } | {
         kind: "RISK";
@@ -216,7 +293,7 @@ export declare const tradingEventSchema: z.ZodEffects<z.ZodObject<{
     eventId: string;
     accountSequence: number;
     tradingDate: string;
-    eventType: "RISK_RESERVED" | "SIGNAL_CREATED" | "INTENT_CREATED" | "RISK_BLOCKED" | "SUBMISSION_CLAIMED" | "ORDER_SUBMITTED" | "ORDER_ACKNOWLEDGED" | "ORDER_READY" | "ORDER_FINALITY_CONFIRMED" | "INTENT_COMPLETED" | "RESERVATION_CONSUMED" | "ORDER_OUTCOME_UNKNOWN" | "ORDER_REJECTED" | "ORDER_CANCEL_REQUESTED" | "ORDER_CANCELLED" | "FILL_RECEIVED" | "POSITION_PARTIALLY_OPENED" | "POSITION_OPENED" | "POSITION_CLOSE_REQUESTED" | "POSITION_PARTIALLY_CLOSED" | "POSITION_CLOSED" | "RESERVATION_RELEASED" | "RECONCILIATION_MISMATCH" | "RECONCILIATION_RESOLVED" | "ACCOUNT_HALTED" | "ACCOUNT_RESUMED";
+    eventType: "RISK_RESERVED" | "SIGNAL_CREATED" | "INTENT_CREATED" | "RISK_BLOCKED" | "ENTRY_RISK_COMMITTED" | "SUBMISSION_CLAIMED" | "ORDER_SUBMITTED" | "ORDER_ACKNOWLEDGED" | "ORDER_READY" | "ORDER_FINALITY_CONFIRMED" | "INTENT_COMPLETED" | "RESERVATION_CONSUMED" | "ORDER_OUTCOME_UNKNOWN" | "ORDER_REJECTED" | "ORDER_CANCEL_REQUESTED" | "ORDER_CANCELLED" | "FILL_RECEIVED" | "POSITION_PARTIALLY_OPENED" | "POSITION_OPENED" | "POSITION_CLOSE_REQUESTED" | "POSITION_PARTIALLY_CLOSED" | "POSITION_CLOSED" | "RESERVATION_RELEASED" | "RECONCILIATION_MISMATCH" | "RECONCILIATION_RESOLVED" | "ACCOUNT_HALTED" | "ACCOUNT_RESUMED";
     aggregateType: "TradingAccount" | "StrategySignal" | "OrderIntent" | "RiskReservation" | "BrokerOrder" | "Fill" | "Position";
     aggregateId: string;
     aggregateVersion: number;
@@ -229,6 +306,17 @@ export declare const tradingEventSchema: z.ZodEffects<z.ZodObject<{
     reason: string;
     evidenceRefs: string[];
     payload: {
+        kind: "ENTRY_RISK_TRANSFER";
+        reservationId: string;
+        fillId: string;
+        legId: string;
+        quantityUnits: number;
+        releasedPendingMinor: number;
+        committedPremiumMinor: number;
+        remainingPendingMinor: number;
+        committedExposureMinor: number;
+        slotTransferred: boolean;
+    } | {
         kind: "REFERENCE";
         entityId: string;
     } | {
@@ -238,8 +326,8 @@ export declare const tradingEventSchema: z.ZodEffects<z.ZodObject<{
     } | {
         kind: "FILL";
         fillId: string;
-        orderId: string;
         quantityUnits: number;
+        orderId: string;
         priceMinor: number;
     } | {
         kind: "RISK";
@@ -253,7 +341,7 @@ export declare const tradingEventSchema: z.ZodEffects<z.ZodObject<{
     eventId: string;
     accountSequence: number;
     tradingDate: string;
-    eventType: "RISK_RESERVED" | "SIGNAL_CREATED" | "INTENT_CREATED" | "RISK_BLOCKED" | "SUBMISSION_CLAIMED" | "ORDER_SUBMITTED" | "ORDER_ACKNOWLEDGED" | "ORDER_READY" | "ORDER_FINALITY_CONFIRMED" | "INTENT_COMPLETED" | "RESERVATION_CONSUMED" | "ORDER_OUTCOME_UNKNOWN" | "ORDER_REJECTED" | "ORDER_CANCEL_REQUESTED" | "ORDER_CANCELLED" | "FILL_RECEIVED" | "POSITION_PARTIALLY_OPENED" | "POSITION_OPENED" | "POSITION_CLOSE_REQUESTED" | "POSITION_PARTIALLY_CLOSED" | "POSITION_CLOSED" | "RESERVATION_RELEASED" | "RECONCILIATION_MISMATCH" | "RECONCILIATION_RESOLVED" | "ACCOUNT_HALTED" | "ACCOUNT_RESUMED";
+    eventType: "RISK_RESERVED" | "SIGNAL_CREATED" | "INTENT_CREATED" | "RISK_BLOCKED" | "ENTRY_RISK_COMMITTED" | "SUBMISSION_CLAIMED" | "ORDER_SUBMITTED" | "ORDER_ACKNOWLEDGED" | "ORDER_READY" | "ORDER_FINALITY_CONFIRMED" | "INTENT_COMPLETED" | "RESERVATION_CONSUMED" | "ORDER_OUTCOME_UNKNOWN" | "ORDER_REJECTED" | "ORDER_CANCEL_REQUESTED" | "ORDER_CANCELLED" | "FILL_RECEIVED" | "POSITION_PARTIALLY_OPENED" | "POSITION_OPENED" | "POSITION_CLOSE_REQUESTED" | "POSITION_PARTIALLY_CLOSED" | "POSITION_CLOSED" | "RESERVATION_RELEASED" | "RECONCILIATION_MISMATCH" | "RECONCILIATION_RESOLVED" | "ACCOUNT_HALTED" | "ACCOUNT_RESUMED";
     aggregateType: "TradingAccount" | "StrategySignal" | "OrderIntent" | "RiskReservation" | "BrokerOrder" | "Fill" | "Position";
     aggregateId: string;
     aggregateVersion: number;
@@ -266,6 +354,17 @@ export declare const tradingEventSchema: z.ZodEffects<z.ZodObject<{
     reason: string;
     evidenceRefs: string[];
     payload: {
+        kind: "ENTRY_RISK_TRANSFER";
+        reservationId: string;
+        fillId: string;
+        legId: string;
+        quantityUnits: number;
+        releasedPendingMinor: number;
+        committedPremiumMinor: number;
+        remainingPendingMinor: number;
+        committedExposureMinor: number;
+        slotTransferred: boolean;
+    } | {
         kind: "REFERENCE";
         entityId: string;
     } | {
@@ -275,8 +374,8 @@ export declare const tradingEventSchema: z.ZodEffects<z.ZodObject<{
     } | {
         kind: "FILL";
         fillId: string;
-        orderId: string;
         quantityUnits: number;
+        orderId: string;
         priceMinor: number;
     } | {
         kind: "RISK";
@@ -290,7 +389,7 @@ export declare const tradingEventSchema: z.ZodEffects<z.ZodObject<{
     eventId: string;
     accountSequence: number;
     tradingDate: string;
-    eventType: "RISK_RESERVED" | "SIGNAL_CREATED" | "INTENT_CREATED" | "RISK_BLOCKED" | "SUBMISSION_CLAIMED" | "ORDER_SUBMITTED" | "ORDER_ACKNOWLEDGED" | "ORDER_READY" | "ORDER_FINALITY_CONFIRMED" | "INTENT_COMPLETED" | "RESERVATION_CONSUMED" | "ORDER_OUTCOME_UNKNOWN" | "ORDER_REJECTED" | "ORDER_CANCEL_REQUESTED" | "ORDER_CANCELLED" | "FILL_RECEIVED" | "POSITION_PARTIALLY_OPENED" | "POSITION_OPENED" | "POSITION_CLOSE_REQUESTED" | "POSITION_PARTIALLY_CLOSED" | "POSITION_CLOSED" | "RESERVATION_RELEASED" | "RECONCILIATION_MISMATCH" | "RECONCILIATION_RESOLVED" | "ACCOUNT_HALTED" | "ACCOUNT_RESUMED";
+    eventType: "RISK_RESERVED" | "SIGNAL_CREATED" | "INTENT_CREATED" | "RISK_BLOCKED" | "ENTRY_RISK_COMMITTED" | "SUBMISSION_CLAIMED" | "ORDER_SUBMITTED" | "ORDER_ACKNOWLEDGED" | "ORDER_READY" | "ORDER_FINALITY_CONFIRMED" | "INTENT_COMPLETED" | "RESERVATION_CONSUMED" | "ORDER_OUTCOME_UNKNOWN" | "ORDER_REJECTED" | "ORDER_CANCEL_REQUESTED" | "ORDER_CANCELLED" | "FILL_RECEIVED" | "POSITION_PARTIALLY_OPENED" | "POSITION_OPENED" | "POSITION_CLOSE_REQUESTED" | "POSITION_PARTIALLY_CLOSED" | "POSITION_CLOSED" | "RESERVATION_RELEASED" | "RECONCILIATION_MISMATCH" | "RECONCILIATION_RESOLVED" | "ACCOUNT_HALTED" | "ACCOUNT_RESUMED";
     aggregateType: "TradingAccount" | "StrategySignal" | "OrderIntent" | "RiskReservation" | "BrokerOrder" | "Fill" | "Position";
     aggregateId: string;
     aggregateVersion: number;
@@ -303,6 +402,17 @@ export declare const tradingEventSchema: z.ZodEffects<z.ZodObject<{
     reason: string;
     evidenceRefs: string[];
     payload: {
+        kind: "ENTRY_RISK_TRANSFER";
+        reservationId: string;
+        fillId: string;
+        legId: string;
+        quantityUnits: number;
+        releasedPendingMinor: number;
+        committedPremiumMinor: number;
+        remainingPendingMinor: number;
+        committedExposureMinor: number;
+        slotTransferred: boolean;
+    } | {
         kind: "REFERENCE";
         entityId: string;
     } | {
@@ -312,8 +422,8 @@ export declare const tradingEventSchema: z.ZodEffects<z.ZodObject<{
     } | {
         kind: "FILL";
         fillId: string;
-        orderId: string;
         quantityUnits: number;
+        orderId: string;
         priceMinor: number;
     } | {
         kind: "RISK";

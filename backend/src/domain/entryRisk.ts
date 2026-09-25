@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
+import { fillAccounting } from "./fillAccounting";
 import { identifierSchema, quantityUnitsSchema } from "@trading-bot/shared";
 
 const positive = quantityUnitsSchema.refine(n => n > 0);
@@ -66,19 +67,62 @@ export const entryAdmissionSchema = z.object({
   generation: z.literal(0), executionEpoch: quantityUnitsSchema, policyVersion: quantityUnitsSchema,
 }).strict();
 
-/** 2C1 retains the full original debit and slot, including after fills/UNKNOWN/close.
- * Release or transfer is deliberately unsupported until proven settlement exists.
+export const entryProgressSchema = z.array(z.object({
+  legId: identifierSchema, transferredUnits: quantityUnitsSchema, committedMinor: quantityUnitsSchema,
+}).strict()).min(1);
+export type EntryRiskRequirement = ReturnType<typeof calculateEntryRisk>;
+
+/** Progress is a projection, never execution evidence. Persistence proves it against
+ * immutable owned Fills. Missing progress is compatible ONLY with an unfilled 2C1 hold.
+ */
+export function entryProjection(requirement: EntryRiskRequirement, input?: unknown) {
+  const progress = entryProgressSchema.parse(input === undefined ? requirement.legs.map(leg => ({
+    legId: leg.legId, transferredUnits: 0, committedMinor: 0,
+  })) : input).sort((a, b) => a.legId.localeCompare(b.legId));
+  riskAssert(progress.length === requirement.legs.length && new Set(progress.map(p => p.legId)).size === progress.length, "RISK_PROJECTION_MISMATCH");
+  let pending = 0n, committed = 0n, executed = false;
+  for (const leg of requirement.legs) {
+    const item = progress.find(p => p.legId === leg.legId);
+    riskAssert(item && item.transferredUnits <= leg.quantityUnits && (item.transferredUnits > 0 || item.committedMinor === 0), "RISK_PROJECTION_MISMATCH");
+    pending += BigInt(leg.quantityUnits - item.transferredUnits) * BigInt(leg.limitPriceMinor);
+    committed += BigInt(item.committedMinor); executed ||= item.transferredUnits > 0;
+  }
+  return { progress, pendingMinor: checkedRiskUnits(pending), committedMinor: checkedRiskUnits(committed),
+    reservedSlots: executed ? 0 : 1, committedSlots: executed ? 1 : 0 };
+}
+
+const riskFillSchema = z.object({ fillId: identifierSchema, intentId: identifierSchema, legId: identifierSchema,
+  contractKey: identifierSchema, side: z.literal("BUY"), quantityUnits: positive, priceMinor: quantityUnitsSchema });
+export function entryProjectionFromFills(requirement: EntryRiskRequirement, intentId: string, input: readonly unknown[]) {
+  const fills = z.array(riskFillSchema).parse(input);
+  riskAssert(new Set(fills.map(f => f.fillId)).size === fills.length, "RISK_PROJECTION_MISMATCH");
+  for (const fill of fills) riskAssert(fill.intentId === intentId && requirement.legs.some(leg =>
+    leg.legId === fill.legId && leg.contractKey === fill.contractKey), "STALE_EXECUTION_CHAIN");
+  return entryProjection(requirement, requirement.legs.map(leg => {
+    const owned = fills.filter(fill => fill.legId === leg.legId);
+    const transferredUnits = checkedRiskUnits(owned.reduce((sum, fill) => sum + BigInt(fill.quantityUnits), 0n));
+    // Actual price is truth, including zero or a price above the authorization limit.
+    const { entryNotionalMinor } = fillAccounting(owned, intentId);
+    return { legId: leg.legId, transferredUnits, committedMinor: entryNotionalMinor };
+  }));
+}
+
+/** Original admission remains immutable; only proved Fill progress changes pending
+ * risk. HELD retains the economic history and one total slot, even after full close.
  */
 export function verifyEntryReservation(reservation: Record<string, unknown>, intent: Record<string, unknown>, positionId: string) {
   const admission = entryAdmissionSchema.safeParse(reservation.entryAdmission);
   riskAssert(admission.success && admission.data.positionId === positionId && intent.purpose === "ENTRY"
     && reservation.kind === "ENTRY_RISK" && reservation.intentId === intent.intentId, "STALE_EXECUTION_CHAIN");
   const requirement = calculateEntryRisk(intent.targetLegs, intent.entryPlan);
+  const projection = entryProjection(requirement, reservation.entryProgress);
   riskAssert(admission.data.economicsFingerprint === requirement.fingerprint && reservation.state === "HELD"
     && reservation.policyVersion === admission.data.policyVersion && reservation.positionSlots === 1, "RISK_PROJECTION_MISMATCH");
-  for (const key of ["initialMarginMinor", "remainingMarginMinor", "initialExposureMinor", "remainingExposureMinor"])
+  for (const key of ["initialMarginMinor", "initialExposureMinor"])
     riskAssert(reservation[key] === requirement.requiredRiskMinor, "RISK_PROJECTION_MISMATCH");
+  for (const key of ["remainingMarginMinor", "remainingExposureMinor"])
+    riskAssert(reservation[key] === projection.pendingMinor, "RISK_PROJECTION_MISMATCH");
   riskAssert(JSON.stringify(z.array(z.string()).parse(reservation.instrumentKeys).slice().sort())
     === JSON.stringify(requirement.legs.map(leg => leg.contractKey).sort()), "STALE_EXECUTION_CHAIN");
-  return { requirement, admission: admission.data };
+  return { requirement, admission: admission.data, projection };
 }

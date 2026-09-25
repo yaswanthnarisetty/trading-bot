@@ -13,11 +13,15 @@ export const TradingAccountSchema = executionSchema({
   entryRiskPolicy: { type: Schema.Types.Mixed },
   reservedMarginMinor: moneyField(), reservedExposureMinor: moneyField(),
   committedExposureMinor: moneyField(), realizedPnlMinor: moneyField(true),
+  // positionSlots remains TOTAL retained slots. Reserved slots = total - committed.
+  committedPositionSlots: { ...unitsField(), default: 0 },
   positionSlots: unitsField(), nextEventSequence: unitsField(true),
 }, "execution_accounts");
 TradingAccountSchema.index({ accountId: 1 }, { unique: true });
 TradingAccountSchema.index({ broker: 1, brokerAccountRef: 1, executionMode: 1 }, { unique: true });
 TradingAccountSchema.pre("validate", function () {
+  if (Number(this.get("committedPositionSlots")) > Number(this.get("positionSlots")))
+    this.invalidate("committedPositionSlots", "Committed slots exceed total slots");
   if (this.get("entryRiskPolicy") !== undefined && !entryRiskPolicySchema.safeParse(this.get("entryRiskPolicy")).success)
     this.invalidate("entryRiskPolicy", "Invalid persisted entry risk policy");
   if (this.get("admissionStatus") === "PAPER_READY" && this.get("executionMode") !== "PAPER")

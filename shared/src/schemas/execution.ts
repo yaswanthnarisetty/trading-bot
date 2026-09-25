@@ -52,7 +52,7 @@ export type IntentPurpose = z.infer<typeof intentPurposeSchema>;
 export type OrderSide = z.infer<typeof orderSideSchema>;
 
 export const tradingEventTypeSchema = z.enum([
-  "SIGNAL_CREATED", "INTENT_CREATED", "RISK_BLOCKED", "RISK_RESERVED",
+  "SIGNAL_CREATED", "INTENT_CREATED", "RISK_BLOCKED", "RISK_RESERVED", "ENTRY_RISK_COMMITTED",
   "SUBMISSION_CLAIMED", "ORDER_SUBMITTED", "ORDER_ACKNOWLEDGED",
   "ORDER_READY", "ORDER_FINALITY_CONFIRMED", "INTENT_COMPLETED", "RESERVATION_CONSUMED",
   "ORDER_OUTCOME_UNKNOWN", "ORDER_REJECTED", "ORDER_CANCEL_REQUESTED", "ORDER_CANCELLED",
@@ -66,6 +66,12 @@ export const aggregateTypeSchema = z.enum([
   "BrokerOrder", "Fill", "Position",
 ]);
 export const eventPayloadSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("ENTRY_RISK_TRANSFER"), reservationId: identifierSchema, fillId: identifierSchema, legId: identifierSchema,
+    quantityUnits: quantityUnitsSchema.refine(n => n > 0), releasedPendingMinor: nonnegativeMoneyMinorSchema,
+    committedPremiumMinor: nonnegativeMoneyMinorSchema, remainingPendingMinor: nonnegativeMoneyMinorSchema,
+    committedExposureMinor: nonnegativeMoneyMinorSchema, slotTransferred: z.boolean(),
+  }).strict(),
   z.object({ kind: z.literal("REFERENCE"), entityId: identifierSchema }).strict(),
   z.object({
     kind: z.literal("STATE_CHANGE"), from: identifierSchema.nullable(), to: identifierSchema,
@@ -95,7 +101,11 @@ export const tradingEventSchema = z.object({
   if (event.eventType === "FILL_RECEIVED" && event.payload.kind !== "FILL") {
     ctx.addIssue({ code: "custom", message: "FILL_RECEIVED requires a FILL payload" });
   }
-  if (["FILL_RECEIVED", "POSITION_OPENED", "POSITION_CLOSED", "ORDER_ACKNOWLEDGED", "RECONCILIATION_RESOLVED",
+  if (event.eventType === "ENTRY_RISK_COMMITTED" && (event.payload.kind !== "ENTRY_RISK_TRANSFER"
+    || event.aggregateType !== "RiskReservation" || event.aggregateId !== event.payload.reservationId || event.causationId !== event.payload.fillId)) {
+    ctx.addIssue({ code: "custom", message: "ENTRY_RISK_COMMITTED requires owned reservation and Fill transfer payload" });
+  }
+  if (["ENTRY_RISK_COMMITTED", "FILL_RECEIVED", "POSITION_OPENED", "POSITION_CLOSED", "ORDER_ACKNOWLEDGED", "RECONCILIATION_RESOLVED",
     "ORDER_READY", "ORDER_FINALITY_CONFIRMED", "INTENT_COMPLETED", "RESERVATION_CONSUMED"].includes(event.eventType)
     && event.evidenceRefs.length === 0) {
     ctx.addIssue({ code: "custom", message: "This event requires evidence" });

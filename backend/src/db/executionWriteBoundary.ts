@@ -11,7 +11,9 @@ import { brokerOrderRequestSchema } from "../brokers/BrokerAdapter";
 import { submissionFingerprint, validateSubmissionEvidence } from "../brokers/submissionEvidence";
 import { fillAccounting, type AccountingFill } from "../domain/fillAccounting";
 import { dependenciesAreSafe, verifyCloseLedger } from "../domain/closeWorkflowEvidence";
-import { entryRiskPolicySchema, riskAssert, verifyEntryReservation } from "../domain/entryRisk";
+import { checkedRiskUnits, entryRiskPolicySchema, riskAssert, verifyEntryReservation } from "../domain/entryRisk";
+
+import { assertAccountEntryProjection, loadAccountEntryProjection, verifyEntryRiskLedger } from "./entryRiskProjection";
 
 type RecordData = Record<string, unknown>;
 const text = (r: RecordData, key: string): string => z.string().trim().min(1).parse(r[key]);
@@ -103,7 +105,7 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
       checkIntentPosition(intent, position);
       equal(data.strategyInstanceId, position.strategyInstanceId, "entry reservation strategy");
       equal(scope.executionMode, "PAPER", "entry reservation mode");
-      const { requirement, admission: snapshot } = verifyEntryReservation(data, intent, text(position, "positionId"));
+      const { requirement, admission: snapshot } = await verifyEntryRiskLedger(connection, session, scope, data, intent, position);
       if (doc.isNew) {
         const policy = entryRiskPolicySchema.safeParse(account.entryRiskPolicy);
         riskAssert(policy.success && policy.data.policyVersion === account.policyVersion, "RISK_POLICY_REQUIRED");
@@ -111,17 +113,12 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
         equal(snapshot.policyVersion, account.policyVersion, "entry admission policy");
         equal(snapshot.executionEpoch, account.executionEpoch, "entry admission epoch");
         equal(intent.policyVersion, account.policyVersion, "entry intent policy");
-        riskAssert(account.committedExposureMinor === 0, "UNSUPPORTED_ACCOUNT_EXPOSURE");
-        const retained = await db.collection(name).find({ ...scope, kind: { $ne: "CLOSE_QUANTITY" } }, { session }).toArray();
-        riskAssert(retained.every(hold => hold.kind === "ENTRY_RISK" && hold.state === "HELD"), "UNSUPPORTED_ACCOUNT_EXPOSURE");
-        const totalRisk = retained.reduce((total, hold) => total + BigInt(units(hold, "remainingExposureMinor")), BigInt(requirement.requiredRiskMinor));
-        const totalMargin = retained.reduce((total, hold) => total + BigInt(units(hold, "remainingMarginMinor")), BigInt(requirement.requiredRiskMinor));
-        const totalSlots = retained.reduce((total, hold) => total + BigInt(units(hold, "positionSlots")), 1n);
-        riskAssert(BigInt(units(account, "reservedExposureMinor")) === totalRisk && BigInt(units(account, "reservedMarginMinor")) === totalMargin
-          && BigInt(units(account, "positionSlots")) === totalSlots, "RISK_PROJECTION_MISMATCH");
-        riskAssert(requirement.requiredRiskMinor <= policy.data.maxRiskPerEntryMinor, "RISK_PER_TRADE_EXCEEDED");
-        riskAssert(totalRisk <= BigInt(policy.data.maxReservedRiskMinor), "RISK_CAPACITY_EXCEEDED");
-        riskAssert(totalSlots <= BigInt(policy.data.maxPositionSlots), "POSITION_LIMIT_EXCEEDED");
+        const retained = await loadAccountEntryProjection(connection, session, scope);
+        const charged = { ...retained, pending: retained.pending + BigInt(requirement.requiredRiskMinor), reservedSlots: retained.reservedSlots + 1n };
+        assertAccountEntryProjection(account, charged);
+        riskAssert(requirement.requiredRiskMinor <= policy.data.maxRiskPerEntryMinor && retained.maxEntryUsage <= BigInt(policy.data.maxRiskPerEntryMinor), "RISK_PER_TRADE_EXCEEDED");
+        riskAssert(charged.pending + charged.committed <= BigInt(policy.data.maxReservedRiskMinor), "RISK_CAPACITY_EXCEEDED");
+        riskAssert(charged.reservedSlots + charged.committedSlots <= BigInt(policy.data.maxPositionSlots), "POSITION_LIMIT_EXCEEDED");
       }
     }
     if (data.kind === "CLOSE_QUANTITY") {
@@ -168,12 +165,7 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
         // An initial claim must be backed by the atomically published admission.
         // Once claimed, evidence ingestion never repeats pre-dispatch admission.
         if (initialEntryClaim) {
-          const retained = await db.collection("execution_reservations").find({ ...scope, kind: { $ne: "CLOSE_QUANTITY" } }, { session }).toArray();
-          riskAssert(retained.every(hold => hold.kind === "ENTRY_RISK" && hold.state === "HELD"), "RISK_PROJECTION_MISMATCH");
-          for (const [counter, field] of [["reservedExposureMinor", "remainingExposureMinor"], ["reservedMarginMinor", "remainingMarginMinor"], ["positionSlots", "positionSlots"]]) {
-            const total = retained.reduce((sum, hold) => sum + BigInt(units(hold, field)), 0n);
-            riskAssert(BigInt(units(account, counter)) === total, "RISK_PROJECTION_MISMATCH");
-          }
+          assertAccountEntryProjection(account, await loadAccountEntryProjection(connection, session, scope));
           const event = await find("execution_events", "eventId", `${reservation.reservationId}:RISK_RESERVED`);
           equal(event.eventType, "RISK_RESERVED", "entry admission event"); equal(event.aggregateId, intent.intentId, "entry admission intent");
           equal(event.aggregateType, "OrderIntent", "entry admission aggregate");
@@ -308,6 +300,22 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
     const [collection, key] = aggregateCollections[text(data, "aggregateType")];
     const aggregate = await find(collection, key, data.aggregateId);
     equal(data.aggregateVersion, aggregate.version ?? 0, "audit aggregate version");
+    if (data.eventType === "ENTRY_RISK_COMMITTED") {
+      const payload = z.record(z.unknown()).parse(data.payload), fill = await find("execution_fills", "fillId", payload.fillId);
+      equal(data.eventId, `${fill.fillId}:ENTRY_RISK_COMMITTED`, "unique Fill risk event");
+      equal(aggregate.reservationId, payload.reservationId, "risk event reservation");
+      equal(aggregate.intentId, fill.intentId, "risk event Fill intent");
+      const intent = await intentFor(fill.intentId), position = await positionFor(fill.positionId);
+      const { requirement, projection, fills } = await verifyEntryRiskLedger(connection, session, scope, aggregate, intent, position);
+      const leg = requirement.legs.find(leg => leg.legId === fill.legId)!;
+      equal(payload.legId, fill.legId, "risk event leg"); equal(payload.quantityUnits, fill.quantityUnits, "risk event units");
+      equal(payload.releasedPendingMinor, checkedRiskUnits(BigInt(units(fill, "quantityUnits")) * BigInt(leg.limitPriceMinor)), "risk event pending transfer");
+      equal(payload.committedPremiumMinor, checkedRiskUnits(BigInt(units(fill, "quantityUnits")) * BigInt(units(fill, "priceMinor"))), "risk event actual premium");
+      equal(payload.remainingPendingMinor, projection.pendingMinor, "risk event remaining pending");
+      equal(payload.committedExposureMinor, projection.committedMinor, "risk event committed premium");
+      equal(payload.slotTransferred, fills.length === 1, "risk event first Fill slot transfer");
+      assertAccountEntryProjection(account, await loadAccountEntryProjection(connection, session, scope));
+    }
   }
 }
 function sum(fills: RecordData[]): number {

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { ClientSession, Connection, Document } from "mongoose";
-import { executionScopeSchema, identifierSchema, type ExecutionScope, type TradingEventType } from "@trading-bot/shared";
+import { executionScopeSchema, identifierSchema, type ExecutionScope, type TradingEventType, type TradingEvent } from "@trading-bot/shared";
 import { paperTradeObservationSchema, submissionEvidenceSchema } from "../brokers/submissionEvidence";
 import { executionModels } from "../db/executionModels";
 import { loadExecutionChain, requireAggregateVersion } from "../db/executionConcurrency";
@@ -8,6 +8,8 @@ import { assertExecutionIndexes } from "../db/executionIndexes";
 import { transitionOrder, type OrderState } from "../domain/OrderStateMachine";
 import { transitionPosition, type PositionState } from "../domain/PositionStateMachine";
 import { fillAccounting } from "../domain/fillAccounting";
+import { checkedRiskUnits, entryProjectionFromFills, verifyEntryReservation } from "../domain/entryRisk";
+import { assertAccountEntryProjection, loadAccountEntryProjection } from "../db/entryRiskProjection";
 import type { FillEvidence, Result } from "../domain/execution";
 import type { z } from "zod";
 
@@ -61,19 +63,19 @@ export class FillProcessor {
     await document.save({ session });
   }
   private async audit(fill: Document, aggregate: Document, eventType: TradingEventType,
-    from: string | undefined, session: ClientSession): Promise<void> {
+    from: string | undefined, session: ClientSession, riskPayload?: Extract<TradingEvent["payload"], { kind: "ENTRY_RISK_TRANSFER" }>): Promise<void> {
     // Mandatory model saves fence the account. Reload before allocating a sequence.
     const account = await this.models.TradingAccount.findOne(this.scope).session(session).orFail();
     const sequence: number = account.get("nextEventSequence");
     if (!Number.isSafeInteger(sequence) || sequence < 1 || sequence >= Number.MAX_SAFE_INTEGER) throw new Error("EVENT_SEQUENCE_EXHAUSTED");
     account.set("nextEventSequence", sequence + 1); await this.save(account, session);
-    const now = this.clock(), isFill = eventType === "FILL_RECEIVED", fillId: string = fill.get("fillId");
+    const now = this.clock(), isFill = eventType === "FILL_RECEIVED", isRisk = eventType === "ENTRY_RISK_COMMITTED", fillId: string = fill.get("fillId");
     await new this.models.TradingEvent({ ...this.scope, schemaVersion: 1, correlationId: fill.get("correlationId"), createdAt: now,
       eventId: `${fillId}:${eventType}`, accountSequence: sequence, tradingDate: fill.get("executedAt").toISOString().slice(0, 10),
-      eventType, aggregateType: isFill ? "Fill" : "Position", aggregateId: aggregate.get(isFill ? "fillId" : "positionId"),
+      eventType, aggregateType: isFill ? "Fill" : isRisk ? "RiskReservation" : "Position", aggregateId: aggregate.get(isFill ? "fillId" : isRisk ? "reservationId" : "positionId"),
       aggregateVersion: isFill ? 0 : aggregate.get("version"), causationId: fillId, actor: "FillProcessor",
       occurredAt: fill.get("executedAt"), recordedAt: now, reason: eventType, evidenceRefs: [fill.get("evidenceRef")],
-      payload: isFill ? { kind: "FILL", fillId, orderId: fill.get("orderId"), quantityUnits: fill.get("quantityUnits"), priceMinor: fill.get("priceMinor") }
+      payload: isRisk ? riskPayload : isFill ? { kind: "FILL", fillId, orderId: fill.get("orderId"), quantityUnits: fill.get("quantityUnits"), priceMinor: fill.get("priceMinor") }
         : { kind: "STATE_CHANGE", from, to: aggregate.get("lifecycle") } }).save({ session });
   }
   async process(input: unknown): Promise<FillResult> {
@@ -93,6 +95,14 @@ export class FillProcessor {
         if (!sameTrade(existing, trade)) throw new Error("DUPLICATE_FILL_CONFLICT");
         return { status: "DUPLICATE", fillId: existing.get("fillId") };
       }
+      const entryReservation = intent.get("purpose") === "ENTRY"
+        ? await this.models.RiskReservation.findOne({ ...this.scope, intentId: trade.intentId }).session(session) : null;
+      const supported = entryReservation?.get("kind") === "ENTRY_RISK";
+      // Verify the BEFORE projection. Never repair drift or run current policy limits
+      // while recording owned broker truth. Historical untyped fills retain their old path.
+      const priorAccount = supported ? await loadAccountEntryProjection(this.connection, session, this.scope) : undefined;
+      if (priorAccount) assertAccountEntryProjection(account.toObject(), priorAccount);
+      const priorRisk = supported ? verifyEntryReservation(entryReservation!.toObject(), intent.toObject(), trade.positionId) : undefined;
       const oldFills = (await this.models.Fill.find({ ...this.scope, positionId: trade.positionId }).session(session)).map(evidence);
       const orders = await this.models.BrokerOrder.find({ ...this.scope, positionId: trade.positionId }).session(session);
       const now = this.clock();
@@ -141,6 +151,26 @@ export class FillProcessor {
       position.set({ legs, lifecycle: nextPosition.lifecycle, integrity: nextPosition.integrity,
         executionEvidenceRefs: nextPosition.fills.map(f => f.fillId) });
       await this.save(position, session);
+      let riskPayload: Extract<TradingEvent["payload"], { kind: "ENTRY_RISK_TRANSFER" }> | undefined;
+      if (priorAccount && priorRisk && entryReservation) {
+        const next = entryProjectionFromFills(priorRisk.requirement, trade.intentId,
+          [...oldFills.filter(f => f.intentId === trade.intentId), evidence(fill)]);
+        entryReservation.set({ entryProgress: next.progress, remainingMarginMinor: next.pendingMinor, remainingExposureMinor: next.pendingMinor });
+        await this.save(entryReservation, session); // Mandatory proof against the just-inserted owned Fill ledger.
+        const current = await this.models.TradingAccount.findOne(this.scope).session(session).orFail();
+        const pending = priorAccount.pending - BigInt(priorRisk.projection.pendingMinor) + BigInt(next.pendingMinor);
+        const committed = priorAccount.committed - BigInt(priorRisk.projection.committedMinor) + BigInt(next.committedMinor);
+        const committedSlots = priorAccount.committedSlots + BigInt(next.committedSlots - priorRisk.projection.committedSlots);
+        current.set({ reservedMarginMinor: checkedRiskUnits(pending), reservedExposureMinor: checkedRiskUnits(pending),
+          committedExposureMinor: checkedRiskUnits(committed), committedPositionSlots: checkedRiskUnits(committedSlots) });
+        await this.save(current, session);
+        assertAccountEntryProjection(current.toObject(), await loadAccountEntryProjection(this.connection, session, this.scope));
+        const leg = priorRisk.requirement.legs.find(leg => leg.legId === trade.legId)!;
+        riskPayload = { kind: "ENTRY_RISK_TRANSFER", reservationId: entryReservation.get("reservationId"), fillId, legId: trade.legId,
+          quantityUnits: trade.quantityUnits, releasedPendingMinor: checkedRiskUnits(BigInt(trade.quantityUnits) * BigInt(leg.limitPriceMinor)),
+          committedPremiumMinor: checkedRiskUnits(BigInt(trade.quantityUnits) * BigInt(trade.priceMinor)), remainingPendingMinor: next.pendingMinor,
+          committedExposureMinor: next.committedMinor, slotTransferred: next.committedSlots > priorRisk.projection.committedSlots };
+      }
       await this.audit(fill, fill, "FILL_RECEIVED", undefined, session);
       if (from !== nextPosition.lifecycle) {
         const events: Partial<Record<PositionState["lifecycle"], TradingEventType>> = {
@@ -150,6 +180,7 @@ export class FillProcessor {
         if (!eventType) throw new Error("UNSUPPORTED_FILL_LIFECYCLE_TRANSITION");
         await this.audit(fill, position, eventType, from, session);
       }
+      if (riskPayload && entryReservation) await this.audit(fill, entryReservation, "ENTRY_RISK_COMMITTED", undefined, session, riskPayload);
       return { status: "APPLIED", fillId };
     });
   }

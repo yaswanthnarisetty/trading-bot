@@ -186,14 +186,17 @@ test("real admitted ENTRY uses unchanged OrderManager/FillProcessor and full clo
   const processor = new FillProcessor(connection, f.scope, clock); await processor.processRetained(result.orderIds[0]);
   assert.equal((await models.Position.findOne().orFail()).get("legs.0.netQuantityUnits"), 10);
   await seed("2"); await configure({ entryRiskPolicy: { ...policy, maxReservedRiskMinor: 15000 } });
-  await rejected("RISK_CAPACITY_EXCEEDED", "intent-2"); // Filled risk still counted once, fully held.
+  await rejected("RISK_CAPACITY_EXCEEDED", "intent-2"); // Filled risk remains counted once as committed exposure.
   const close = await new CloseIntentService(connection, f.scope, clock).requestClose("position-1", "close");
   const exit = paper({ submission: "ACCEPTED", initialFills: [{ quantityUnits: 10, priceMinor: 1000 }] });
   await exit.manager.submit(close.orderIds[0]); await processor.processRetained(close.orderIds[0]);
   assert.equal((await new CloseWorkflowService(connection, f.scope, clock).advance("position-1")).status, "CLOSED");
   assert.equal((await models.RiskReservation.findOne({ reservationId: result.reservationId }).orFail()).get("state"), "HELD");
   assert.equal((await models.RiskReservation.findOne({ intentId: close.intentId }).orFail()).get("state"), "CONSUMED");
-  assert.equal((await models.TradingAccount.findOne().orFail()).get("reservedExposureMinor"), 10000);
+  const account = await models.TradingAccount.findOne().orFail();
+  assert.equal(account.get("reservedExposureMinor"), 0);
+  assert.equal(account.get("committedExposureMinor"), 10000);
+  assert.equal(account.get("committedPositionSlots"), 1);
 });
 test("real failed admission cannot dispatch and consumes no broker calls", async () => {
   await seed(); await configure({ admissionStatus: "HALTED" }); const p = paper();
@@ -205,7 +208,7 @@ test("real missing policy and inconsistent projection fail closed", async () => 
   await configure({ entryRiskPolicy: policy, reservedExposureMinor: 1 }); await rejected("RISK_PROJECTION_MISMATCH");
 });
 test("real unsupported committed exposure cannot disappear from capacity", async () => {
-  await seed(); await configure({ committedExposureMinor: 1 }); await rejected("UNSUPPORTED_ACCOUNT_EXPOSURE");
+  await seed(); await configure({ committedExposureMinor: 1 }); await rejected("RISK_PROJECTION_MISMATCH");
 });
 test("real original ENTRY hold cannot release after possible send", async () => {
   await seed(); authorized(await service().authorizeEntry("intent-1")); const before = await snapshot();
@@ -345,7 +348,8 @@ for (const submission of ["ACCEPTED", "AMBIGUOUS"] as const)
   const processor = new FillProcessor(connection, f.scope, clock);
   assert.equal((await processor.processRetained(entry.orderIds[0])).status, "PROCESSED");
   assert.equal((await models.Position.findOne().orFail()).get("legs.0.entryFilledUnits"), 4);
-  assert.equal((await models.RiskReservation.findOne().orFail()).get("remainingExposureMinor"), 10000);
+  assert.equal((await models.RiskReservation.findOne().orFail()).get("remainingExposureMinor"), 6000);
+  assert.equal((await models.TradingAccount.findOne().orFail()).get("committedExposureMinor"), 3960);
   assert.equal((await models.TradingAccount.findOne().orFail()).get("positionSlots"), 1);
   if (submission === "AMBIGUOUS") assert.equal((await models.BrokerOrder.findOne().orFail()).get("knowledge"), "UNKNOWN");
   assert.equal((await p.manager.submit(entry.orderIds[0])).status, "CURRENT"); assert.equal(p.calls(), 1);

@@ -6,7 +6,7 @@ import { assertExecutionIndexes } from "../db/executionIndexes";
 import { requireAggregateVersion } from "../db/executionConcurrency";
 import { calculateEntryRisk, checkedRiskUnits, entryRiskPolicySchema, EntryRiskError, riskAssert,
   verifyEntryReservation, type EntryRiskReason } from "../domain/entryRisk";
-import { positionEconomicsSchema } from "../domain/financialInvariants";
+import { assertAccountEntryProjection, loadAccountEntryProjection } from "../db/entryRiskProjection";
 import { transitionIntent } from "../domain/IntentStateMachine";
 import { brokerOrderRequestSchema } from "../brokers/BrokerAdapter";
 import { submissionFingerprint } from "../brokers/submissionEvidence";
@@ -35,42 +35,10 @@ export class RiskAdmissionService {
     const result = transitionIntent(intent.get("state"), to, { reservationId });
     riskAssert(result.ok, "STALE_EXECUTION_CHAIN"); intent.set("state", result.value);
   }
-  /** 2C1 supports a ledger of fully retained ENTRY_RISK holds. Existing unpriced
-   * exposure or a pending→committed transfer cannot be netted safely: reject admission
-   * instead of guessing whether counters overlap or silently dropping actual risk.
-   */
   private async capacity(account: Document, session: ClientSession) {
-    riskAssert(account.get("committedExposureMinor") === 0, "UNSUPPORTED_ACCOUNT_EXPOSURE");
-    const reservations = await this.models.RiskReservation.find(this.scope).session(session);
-    const heldIntents = new Set<string>(); let risk = 0n, slots = 0n;
-    for (const reservation of reservations) {
-      if (reservation.get("kind") === "CLOSE_QUANTITY") continue;
-      riskAssert(reservation.get("kind") === "ENTRY_RISK", "UNSUPPORTED_ACCOUNT_EXPOSURE");
-      const intent = await this.models.OrderIntent.findOne({ ...this.scope, intentId: reservation.get("intentId") }).session(session);
-      const pos = await this.models.Position.findOne({ ...this.scope, entryIntentId: reservation.get("intentId") }).session(session);
-      riskAssert(intent && pos, "RISK_PROJECTION_MISMATCH");
-      const { requirement } = verifyEntryReservation(plain(reservation), plain(intent), pos.get("positionId"));
-      const actual = await this.models.Fill.find({ ...this.scope, positionId: pos.get("positionId"), intentId: intent.get("intentId") }).session(session);
-      const paid = actual.reduce((total, fill) => total + BigInt(fill.get("quantityUnits")) * BigInt(fill.get("priceMinor")), 0n);
-      riskAssert(paid <= BigInt(requirement.requiredRiskMinor), "UNSUPPORTED_ACCOUNT_EXPOSURE");
-      risk += BigInt(requirement.requiredRiskMinor); slots += 1n; heldIntents.add(intent.get("intentId"));
-    }
-    const positions = await this.models.Position.find(this.scope).session(session);
-    for (const position of positions) {
-      const raw = plain(position), validated = positionEconomicsSchema.safeParse(raw);
-      riskAssert(validated.success, "RISK_PROJECTION_MISMATCH");
-      if (heldIntents.has(position.get("entryIntentId"))) continue;
-      // A pre-created empty, unadmitted Position is not an occupied slot. Anything
-      // executed or possibly sent without a supported full hold blocks new admission.
-      const fills = await this.models.Fill.countDocuments({ ...this.scope, positionId: position.get("positionId") }).session(session);
-      const orders = await this.models.BrokerOrder.countDocuments({ ...this.scope, positionId: position.get("positionId"),
-        $or: [{ phase: { $nin: ["PLANNED", "NOT_SENT"] } }, { submissionClaim: { $exists: true } }, { knowledge: { $ne: "KNOWN" } }] }).session(session);
-      riskAssert(!fills && !orders && validated.data.lifecycle === "PENDING_ENTRY", "UNSUPPORTED_ACCOUNT_EXPOSURE");
-    }
-    const reserved = checkedRiskUnits(risk), occupied = checkedRiskUnits(slots);
-    riskAssert(account.get("reservedExposureMinor") === reserved && account.get("reservedMarginMinor") === reserved
-      && account.get("positionSlots") === occupied, "RISK_PROJECTION_MISMATCH");
-    return { risk, slots };
+    const projection = await loadAccountEntryProjection(this.connection, session, this.scope);
+    assertAccountEntryProjection(plain(account), projection);
+    return projection;
   }
   async authorizeEntry(input: string): Promise<EntryAdmissionResult> {
     const intentId = identifierSchema.parse(input);
@@ -125,11 +93,13 @@ export class RiskAdmissionService {
         riskAssert(policy.success && policy.data.policyVersion === account.get("policyVersion"), "RISK_POLICY_REQUIRED");
         const held = await this.capacity(account, session);
         riskAssert(requirement.requiredRiskMinor <= policy.data.maxRiskPerEntryMinor, "RISK_PER_TRADE_EXCEEDED");
-        const total = held.risk + BigInt(requirement.requiredRiskMinor), slots = held.slots + 1n;
+        riskAssert(held.maxEntryUsage <= BigInt(policy.data.maxRiskPerEntryMinor), "RISK_PER_TRADE_EXCEEDED");
+        const pending = held.pending + BigInt(requirement.requiredRiskMinor), total = pending + held.committed;
+        const slots = held.reservedSlots + held.committedSlots + 1n;
         riskAssert(total <= BigInt(policy.data.maxReservedRiskMinor), "RISK_CAPACITY_EXCEEDED");
         riskAssert(slots <= BigInt(policy.data.maxPositionSlots), "POSITION_LIMIT_EXCEEDED");
         // This first CAS write serializes competing admissions before any authorization.
-        account.set({ reservedExposureMinor: checkedRiskUnits(total), reservedMarginMinor: checkedRiskUnits(total), positionSlots: checkedRiskUnits(slots) });
+        account.set({ reservedExposureMinor: checkedRiskUnits(pending), reservedMarginMinor: checkedRiskUnits(pending), positionSlots: checkedRiskUnits(slots), committedPositionSlots: checkedRiskUnits(held.committedSlots) });
         await this.save(account, session);
         const reservationId = randomUUID(), base = { ...this.scope, schemaVersion: 1, correlationId: intent.get("correlationId"),
           createdAt: now, updatedAt: now, version: 0 };
