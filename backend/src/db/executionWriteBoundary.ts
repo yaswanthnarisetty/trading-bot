@@ -4,12 +4,13 @@ interface WriteDocument {
   $session(): ClientSession | null; validate(): Promise<void>; toObject(): Record<string, unknown>;
 }
 import { z } from "zod";
-import { executionScopeSchema } from "@trading-bot/shared";
+import { executionScopeSchema, type ExecutionScope } from "@trading-bot/shared";
 import { requireExecutionTransaction } from "./executionReadiness";
 import { assertExecutionIndexes } from "./executionIndexes";
 import { brokerOrderRequestSchema } from "../brokers/BrokerAdapter";
 import { submissionFingerprint, validateSubmissionEvidence } from "../brokers/submissionEvidence";
 import { fillAccounting, type AccountingFill } from "../domain/fillAccounting";
+import { dependenciesAreSafe, verifyCloseLedger } from "../domain/closeWorkflowEvidence";
 
 type RecordData = Record<string, unknown>;
 const text = (r: RecordData, key: string): string => z.string().trim().min(1).parse(r[key]);
@@ -17,9 +18,28 @@ const units = (r: RecordData, key: string): number => z.number().int().nonnegati
 const rows = (r: RecordData, key: string): RecordData[] => z.array(z.record(z.unknown())).parse(r[key]);
 const equal = (a: unknown, b: unknown, label: string) => { if (a !== b) throw new Error(`LEDGER_RELATIONSHIP_MISMATCH: ${label}`); };
 
+/** Pre-dispatch admission only: may this dependent close action still be sent?
+ * Called for promotion and the initial claim, before any claim exists in storage.
+ * Evidence for an already claimed physical order must never pass through this gate.
+ */
+async function validateCloseSubmissionAuthorization(db: NonNullable<Connection["db"]>, session: ClientSession,
+  scope: ExecutionScope, order: RecordData, position: RecordData, dependencies: string[], activation: RecordData) {
+  const chainOrders = await db.collection("execution_orders").find({ ...scope, positionId: order.positionId }, { session }).toArray();
+  const chainFills = await db.collection("execution_fills").find({ ...scope, positionId: order.positionId }, { session }).toArray();
+  const chainIntents = await db.collection("execution_intents").find({ ...scope,
+    intentId: { $in: [...new Set([position.entryIntentId, ...chainOrders.map(child => child.intentId)])] } }, { session }).toArray();
+  verifyCloseLedger(position, chainOrders, chainFills, chainIntents);
+  const proofRefs = z.array(z.string().min(1)).min(1).parse(activation.evidenceRefs);
+  if (proofRefs.some(ref => !chainFills.some(fill => fill.fillId === ref && dependencies.includes(String(fill.legId)))))
+    throw new Error("CLOSE_DEPENDENCY_NOT_AUTHORIZED");
+  if (!dependenciesAreSafe(position, dependencies, chainOrders, chainFills)) throw new Error("CLOSE_DEPENDENCY_NOT_AUTHORIZED");
+}
+
 /** Every supported ledger save passes here, including create() and save({validateBeforeSave:false}).
  * No broker callbacks, account credentials, risk decisions, or execution dispatch live here.
  * Native driver writes are an administrative escape hatch, not a supported financial API.
+ * Chain ownership, immutable economics, fill evidence, quantity bounds and CAS apply
+ * both before and after dispatch. Only submission admission depends on current safety.
  */
 export async function validateExecutionWrite(doc: WriteDocument): Promise<void> {
   const connection = doc.db;
@@ -92,6 +112,7 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
     }
   } else if (name === "execution_orders") {
     const { position, intent } = await checkOrder(data);
+    const previous = await db.collection(name).findOne({ ...scope, orderId: data.orderId }, { session });
     if (data.submissionAuthorization) {
       const authorization = z.record(z.unknown()).parse(data.submissionAuthorization);
       const reservation = await find("execution_reservations", "reservationId", authorization.reservationId);
@@ -108,7 +129,20 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
         equal(leg.closeHoldIntentId, intent.intentId, "close child hold owner");
         const dependencies = leg.entrySide === "BUY" ? rows(position, "legs").filter(l => l.entrySide === "SELL").map(l => text(l, "legId")).sort() : [];
         equal(JSON.stringify([...plan.dependsOnLegIds].sort()), JSON.stringify(dependencies), "short-first dependency set");
-        if (dependencies.length && !["PLANNED", "NOT_SENT"].includes(text(data, "phase"))) throw new Error("CLOSE_DEPENDENCY_NOT_AUTHORIZED");
+        if (dependencies.length && !["PLANNED", "NOT_SENT"].includes(text(data, "phase"))) {
+          if (!data.dependencyActivation) throw new Error("CLOSE_DEPENDENCY_NOT_AUTHORIZED");
+          const activation = z.record(z.unknown()).parse(data.dependencyActivation);
+          for (const key of ["positionId", "intentId", "orderId"]) equal(activation[key], data[key], "dependency activation identity");
+          equal(activation.closeGeneration, intent.closeGeneration, "dependency activation generation");
+          equal(activation.eventId, `${data.orderId}:ORDER_READY`, "dependency activation event");
+          // The persisted claim, not the incoming phase or a caller-supplied purpose,
+          // determines whether this physical order has crossed the submission boundary.
+          // A new claim in `data` still requires admission. Subsequent evidence saves
+          // (including broker-ID attachment while SUBMITTING) retain all checks below,
+          // but must not ask whether we would choose to dispatch this action again now.
+          if (!previous?.submissionClaim)
+            await validateCloseSubmissionAuthorization(db, session, scope, data, position, dependencies, activation);
+        }
         const siblings = await db.collection(name).find({ ...scope, intentId: data.intentId, legId: data.legId,
           orderId: { $ne: data.orderId } }, { session }).toArray();
         const outstanding = [...siblings, data].reduce((total, child) => total + BigInt(units(child, "quantityUnits")) - BigInt(units(child, "filledUnits")), 0n);
@@ -139,7 +173,6 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
     }
     const fills = await db.collection("execution_fills").find({ ...scope, orderId: data.orderId }, { session }).toArray();
     checkFillTotals(data, fills, "filledUnits");
-    const previous = await db.collection(name).findOne({ ...scope, orderId: data.orderId }, { session });
     if (previous && (units(data, "filledUnits") < units(previous, "filledUnits") || units(data, "lastObservationVersion") < units(previous, "lastObservationVersion"))) throw new Error("OBSERVATION_REGRESSION");
     if (previous && !["PLANNED", "READY"].includes(text(previous, "phase")) && ["PLANNED", "READY"].includes(text(data, "phase"))) throw new Error("BLIND_RETRY_FORBIDDEN");
     if (previous?.knowledge === "UNKNOWN" && data.knowledge === "KNOWN") throw new Error("RECONCILIATION_REQUIRED");

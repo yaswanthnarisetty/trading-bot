@@ -43,6 +43,7 @@ exports.executionScopeSchema = zod_1.z.object({
 exports.tradingEventTypeSchema = zod_1.z.enum([
     "SIGNAL_CREATED", "INTENT_CREATED", "RISK_BLOCKED", "RISK_RESERVED",
     "SUBMISSION_CLAIMED", "ORDER_SUBMITTED", "ORDER_ACKNOWLEDGED",
+    "ORDER_READY", "ORDER_FINALITY_CONFIRMED", "INTENT_COMPLETED", "RESERVATION_CONSUMED",
     "ORDER_OUTCOME_UNKNOWN", "ORDER_REJECTED", "ORDER_CANCEL_REQUESTED", "ORDER_CANCELLED",
     "FILL_RECEIVED", "POSITION_PARTIALLY_OPENED", "POSITION_OPENED",
     "POSITION_CLOSE_REQUESTED", "POSITION_PARTIALLY_CLOSED", "POSITION_CLOSED",
@@ -83,7 +84,8 @@ exports.tradingEventSchema = zod_1.z.object({
     if (event.eventType === "FILL_RECEIVED" && event.payload.kind !== "FILL") {
         ctx.addIssue({ code: "custom", message: "FILL_RECEIVED requires a FILL payload" });
     }
-    if (["FILL_RECEIVED", "POSITION_OPENED", "POSITION_CLOSED", "ORDER_ACKNOWLEDGED", "RECONCILIATION_RESOLVED"].includes(event.eventType)
+    if (["FILL_RECEIVED", "POSITION_OPENED", "POSITION_CLOSED", "ORDER_ACKNOWLEDGED", "RECONCILIATION_RESOLVED",
+        "ORDER_READY", "ORDER_FINALITY_CONFIRMED", "INTENT_COMPLETED", "RESERVATION_CONSUMED"].includes(event.eventType)
         && event.evidenceRefs.length === 0) {
         ctx.addIssue({ code: "custom", message: "This event requires evidence" });
     }

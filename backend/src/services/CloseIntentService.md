@@ -111,12 +111,11 @@ children stay PLANNED. Only independent short-covering children (or a standalone
 long close without short legs) can initially be READY, and only for PAPER_READY
 accounts. Other admission states retain planned orders and holds.
 
-No dependent-child activation operation is implemented. The model and mandatory
-write boundary reject promoting dependent children to executable phases. Thus
-neither short-close submission, acknowledgement, partial fills nor full fills can
-automatically release or dispatch the protective hedge. A future slice must prove
-short finality and no reopening orders before adding activation. This is the
-explicitly deferred sequencing option; a spread is not fully closed by this slice.
+This planner never activates dependent children. Phase 2B5's explicit
+CloseWorkflowService.advance operation proves short finality and absence of reopening
+orders before promotion; see CloseWorkflowService.md. The model and mandatory write
+boundary require durable activation evidence. Submission, acknowledgement and fills
+alone never automatically release or dispatch the protective hedge.
 
 ## Explicit handoff and finality
 

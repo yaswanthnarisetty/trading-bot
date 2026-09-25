@@ -37,10 +37,14 @@ export const BrokerOrderSchema = executionSchema({
     closeGeneration: unitsField(),
     dependsOnLegIds: { type: [String], required: true },
   }, { _id: false, strict: "throw" }), immutable: true },
+  dependencyActivation: { type: new Schema({
+    positionId: { ...idField(), immutable: false }, intentId: { ...idField(), immutable: false }, orderId: { ...idField(), immutable: false }, closeGeneration: unitsField(),
+    eventId: { ...idField(), immutable: false }, evidenceRefs: { type: [String], required: true, validate: (refs: string[]) => refs.length > 0 },
+  }, { _id: false, strict: "throw" }) },
   executionEvidenceRefs: { type: [String], default: [] },
 }, "execution_orders");
 identityIndexes(BrokerOrderSchema, "orderId");
-writeOnceFields(BrokerOrderSchema, ["brokerOrderId", "submissionClaim", "submissionOutcome", "closePlan"]);
+writeOnceFields(BrokerOrderSchema, ["brokerOrderId", "submissionClaim", "submissionOutcome", "closePlan", "dependencyActivation"]);
 monotonicFields(BrokerOrderSchema, ["filledUnits", "lastObservationVersion"]);
 BrokerOrderSchema.index({ intentId: 1, legId: 1, sliceId: 1, generation: 1 }, { unique: true });
 // Not verified from broker contract: namespace must encode verified ID scope before live ingestion.
@@ -60,9 +64,9 @@ BrokerOrderSchema.pre("validate", function () {
   const phase = this.get("phase");
   if (this.get("closePlan") && !(Number(this.get("limitPriceMinor")) > 0))
     this.invalidate("limitPriceMinor", "Close LIMIT price must be positive");
-  // Phase 2B4 deliberately has no dependent-child activation operation.
+  // An explicit advancement operation must attach durable proof before dependency activation.
   const dependencies = this.get("closePlan.dependsOnLegIds");
-  if (Array.isArray(dependencies) && dependencies.length && (typeof phase !== "string" || !["PLANNED", "NOT_SENT"].includes(phase)))
+  if (Array.isArray(dependencies) && dependencies.length && (typeof phase !== "string" || !["PLANNED", "NOT_SENT"].includes(phase)) && !this.get("dependencyActivation"))
     this.invalidate("phase", "CLOSE_DEPENDENCY_NOT_AUTHORIZED: hedge removal remains PLANNED");
   if (typeof phase === "string" && ["SUBMITTING", "SUBMITTED", "ACKNOWLEDGED", "PARTIALLY_FILLED", "FILLED"].includes(phase) && !this.get("submissionClaim")) {
     this.invalidate("submissionClaim", "Sent order requires durable authorization metadata");
