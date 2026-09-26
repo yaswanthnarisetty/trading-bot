@@ -1,3 +1,6 @@
+import { dailyLossReached } from "../domain/realizedRisk";
+import { assertRealizedProjection, currentDailyState, loadRealizedProjection, withDayWrite } from "../db/realizedRiskProjection";
+import { riskAudit } from "./riskAudit";
 import { randomUUID } from "node:crypto";
 import type { ClientSession, Connection, Document } from "mongoose";
 import { executionScopeSchema, identifierSchema, type ExecutionScope } from "@trading-bot/shared";
@@ -61,6 +64,7 @@ export class RiskAdmissionService {
         const children = await this.models.BrokerOrder.find({ ...this.scope, intentId }).session(session);
         const existing = await this.models.RiskReservation.findOne({ ...this.scope, intentId }).session(session);
         if (existing) {
+          riskAssert(existing.get("state") === "HELD", "STALE_EXECUTION_CHAIN");
           const { admission } = verifyEntryReservation(plain(existing), plain(intent), position.get("positionId"));
           riskAssert(["RISK_RESERVED", "EXECUTING", "COMPLETED", "ABORTING", "ABORTED"].includes(intent.get("state")), "STALE_EXECUTION_CHAIN");
           riskAssert(children.length === requirement.legs.length && requirement.legs.every(leg => children.some(child =>
@@ -92,6 +96,11 @@ export class RiskAdmissionService {
         const policy = entryRiskPolicySchema.safeParse(account.get("entryRiskPolicy"));
         riskAssert(policy.success && policy.data.policyVersion === account.get("policyVersion"), "RISK_POLICY_REQUIRED");
         const held = await this.capacity(account, session);
+        riskAssert(!account.get("killSwitchEnabled"), "KILL_SWITCH_ACTIVE");
+        riskAssert(policy.data.maxDailyLossMinor !== undefined, "DAILY_LOSS_POLICY_REQUIRED");
+        assertRealizedProjection(plain(account), await loadRealizedProjection(this.connection, session, this.scope, account.get("riskTradingCalendar")));
+        const daily = currentDailyState(plain(account), now), fromDay: string | null = account.get("dailyTradingDay") ?? null;
+        riskAssert(!dailyLossReached(daily.dailyRealizedPnlMinor, policy.data.maxDailyLossMinor), "DAILY_LOSS_LIMIT_EXCEEDED");
         riskAssert(requirement.requiredRiskMinor <= policy.data.maxRiskPerEntryMinor, "RISK_PER_TRADE_EXCEEDED");
         riskAssert(held.maxEntryUsage <= BigInt(policy.data.maxRiskPerEntryMinor), "RISK_PER_TRADE_EXCEEDED");
         const pending = held.pending + BigInt(requirement.requiredRiskMinor), total = pending + held.committed;
@@ -99,8 +108,8 @@ export class RiskAdmissionService {
         riskAssert(total <= BigInt(policy.data.maxReservedRiskMinor), "RISK_CAPACITY_EXCEEDED");
         riskAssert(slots <= BigInt(policy.data.maxPositionSlots), "POSITION_LIMIT_EXCEEDED");
         // This first CAS write serializes competing admissions before any authorization.
-        account.set({ reservedExposureMinor: checkedRiskUnits(pending), reservedMarginMinor: checkedRiskUnits(pending), positionSlots: checkedRiskUnits(slots), committedPositionSlots: checkedRiskUnits(held.committedSlots) });
-        await this.save(account, session);
+        account.set({ ...daily, reservedExposureMinor: checkedRiskUnits(pending), reservedMarginMinor: checkedRiskUnits(pending), positionSlots: checkedRiskUnits(slots), committedPositionSlots: checkedRiskUnits(held.committedSlots) });
+        await withDayWrite(session, () => this.save(account, session));
         const reservationId = randomUUID(), base = { ...this.scope, schemaVersion: 1, correlationId: intent.get("correlationId"),
           createdAt: now, updatedAt: now, version: 0 };
         const reservation = new this.models.RiskReservation({ ...base, reservationId, intentId, kind: "ENTRY_RISK",
@@ -136,6 +145,10 @@ export class RiskAdmissionService {
           actor: "RiskAdmissionService", occurredAt: now, recordedAt: now, reason: "BUY_OPTION_PREMIUM_RESERVED",
           evidenceRefs: [reservationId, ...requirement.legs.map(leg => leg.qualificationRef)],
           payload: { kind: "RISK", reservationId, marginMinor: requirement.requiredRiskMinor, exposureMinor: requirement.requiredRiskMinor } }).save({ session });
+        if (fromDay !== daily.dailyTradingDay) await riskAudit(this.models, this.scope, session, now, {
+          eventId: `${reservationId}:TRADING_DAY_ADVANCED`, eventType: "TRADING_DAY_ADVANCED", causationId: intentId,
+          reason: "QUALIFIED_LOCAL_DAY", tradingDate: daily.dailyTradingDay, evidenceRefs: [reservationId],
+          payload: { kind: "TRADING_DAY", from: fromDay, to: daily.dailyTradingDay, realizedPnlMinor: daily.dailyRealizedPnlMinor } });
         return { status: "AUTHORIZED", intentId, reservationId, orderIds: orderIds.sort(), requiredRiskMinor: requirement.requiredRiskMinor };
       }, { readConcern: { level: "snapshot" }, writeConcern: { w: "majority" } });
     } catch (error) {

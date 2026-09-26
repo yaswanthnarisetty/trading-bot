@@ -42,6 +42,7 @@ exports.executionScopeSchema = zod_1.z.object({
 });
 exports.tradingEventTypeSchema = zod_1.z.enum([
     "SIGNAL_CREATED", "INTENT_CREATED", "RISK_BLOCKED", "RISK_RESERVED", "ENTRY_RISK_COMMITTED",
+    "DAILY_PNL_UPDATED", "TRADING_DAY_ADVANCED", "KILL_SWITCH_ENABLED", "KILL_SWITCH_DISABLED", "ENTRY_RISK_SETTLED",
     "SUBMISSION_CLAIMED", "ORDER_SUBMITTED", "ORDER_ACKNOWLEDGED",
     "ORDER_READY", "ORDER_FINALITY_CONFIRMED", "INTENT_COMPLETED", "RESERVATION_CONSUMED",
     "ORDER_OUTCOME_UNKNOWN", "ORDER_REJECTED", "ORDER_CANCEL_REQUESTED", "ORDER_CANCELLED",
@@ -55,6 +56,14 @@ exports.aggregateTypeSchema = zod_1.z.enum([
     "BrokerOrder", "Fill", "Position",
 ]);
 exports.eventPayloadSchema = zod_1.z.discriminatedUnion("kind", [
+    zod_1.z.object({ kind: zod_1.z.literal("DAILY_PNL"), fillId: exports.identifierSchema, positionId: exports.identifierSchema,
+        tradingDay: exports.tradingDateSchema.nullable(), realizedPnlMinor: exports.moneyMinorSchema, dailyRealizedPnlMinor: exports.moneyMinorSchema }).strict(),
+    zod_1.z.object({ kind: zod_1.z.literal("TRADING_DAY"), from: exports.tradingDateSchema.nullable(), to: exports.tradingDateSchema,
+        realizedPnlMinor: exports.moneyMinorSchema }).strict(),
+    zod_1.z.object({ kind: zod_1.z.literal("KILL_SWITCH"), commandId: exports.identifierSchema, enabled: zod_1.z.boolean(), reason: exports.identifierSchema }).strict(),
+    zod_1.z.object({ kind: zod_1.z.literal("RISK_SETTLEMENT"), positionId: exports.identifierSchema, reservationId: exports.identifierSchema,
+        pendingReleasedMinor: exports.nonnegativeMoneyMinorSchema, committedReleasedMinor: exports.nonnegativeMoneyMinorSchema,
+        reservedSlotsReleased: exports.quantityUnitsSchema, committedSlotsReleased: exports.quantityUnitsSchema }).strict(),
     zod_1.z.object({
         kind: zod_1.z.literal("ENTRY_RISK_TRANSFER"), reservationId: exports.identifierSchema, fillId: exports.identifierSchema, legId: exports.identifierSchema,
         quantityUnits: exports.quantityUnitsSchema.refine(n => n > 0), releasedPendingMinor: exports.nonnegativeMoneyMinorSchema,
@@ -87,6 +96,11 @@ exports.tradingEventSchema = zod_1.z.object({
     if (!exports.executionScopeSchema.safeParse({ accountId: event.accountId, executionMode: event.executionMode }).success) {
         ctx.addIssue({ code: "custom", message: "Invalid execution scope" });
     }
+    const kinds = { DAILY_PNL_UPDATED: "DAILY_PNL", TRADING_DAY_ADVANCED: "TRADING_DAY",
+        KILL_SWITCH_ENABLED: "KILL_SWITCH", KILL_SWITCH_DISABLED: "KILL_SWITCH", ENTRY_RISK_SETTLED: "RISK_SETTLEMENT" };
+    if (kinds[event.eventType] && (event.payload.kind !== kinds[event.eventType]
+        || event.aggregateType !== (event.eventType === "ENTRY_RISK_SETTLED" ? "RiskReservation" : "TradingAccount")))
+        ctx.addIssue({ code: "custom", message: "Risk control event requires its typed payload and aggregate" });
     if (event.eventType === "FILL_RECEIVED" && event.payload.kind !== "FILL") {
         ctx.addIssue({ code: "custom", message: "FILL_RECEIVED requires a FILL payload" });
     }

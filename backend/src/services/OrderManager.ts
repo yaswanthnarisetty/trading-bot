@@ -74,6 +74,7 @@ export class OrderManager {
       const [, intent, reservation] = await loadExecutionChain(this.connection, session, this.scope,
         [{ entity: "OrderIntent", id: order.get("intentId") }, { entity: "RiskReservation", id: authorization.reservationId }]);
       const now = this.clock();
+      if (intent.get("purpose") === "ENTRY" && account.get("killSwitchEnabled")) throw new Error("KILL_SWITCH_ACTIVE");
       if (!["RISK_RESERVED", "EXECUTING"].includes(intent.get("state")) || !["HELD", "PARTIALLY_CONSUMED"].includes(reservation.get("state"))
         || authorization.expiresAt.getTime() <= now.getTime() || intent.get("deadline").getTime() <= now.getTime()
         || authorization.policyVersion !== account.get("policyVersion") || authorization.executionEpoch !== account.get("executionEpoch")

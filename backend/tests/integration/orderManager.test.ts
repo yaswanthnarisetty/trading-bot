@@ -70,7 +70,7 @@ before(async () => { await connection.asPromise(); });
 after(async () => { await connection.close(); });
 beforeEach(async () => {
   sessions.clear(); admitted.clear(); await connection.dropDatabase(); await createExecutionIndexes(connection);
-  await tx(session => new models.TradingAccount({ ...f.account(), admissionStatus: "PAPER_READY", entryRiskPolicy: { policyVersion: 1, maxRiskPerEntryMinor: 100000, maxReservedRiskMinor: 200000, maxPositionSlots: 3 } }).save({ session }));
+  await tx(session => new models.TradingAccount({ ...f.account(), admissionStatus: "PAPER_READY", entryRiskPolicy: { policyVersion: 1, maxRiskPerEntryMinor: 100000, maxReservedRiskMinor: 200000, maxPositionSlots: 3, maxDailyLossMinor: 1000000 } }).save({ session }));
   await seed();
 });
 

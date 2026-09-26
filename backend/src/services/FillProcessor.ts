@@ -8,6 +8,9 @@ import { assertExecutionIndexes } from "../db/executionIndexes";
 import { transitionOrder, type OrderState } from "../domain/OrderStateMachine";
 import { transitionPosition, type PositionState } from "../domain/PositionStateMachine";
 import { fillAccounting } from "../domain/fillAccounting";
+import { dailyPnl, realizedPosition, tradingDay } from "../domain/realizedRisk";
+import { assertRealizedProjection, loadRealizedProjection, withDayWrite } from "../db/realizedRiskProjection";
+import { riskAudit } from "./riskAudit";
 import { checkedRiskUnits, entryProjectionFromFills, verifyEntryReservation } from "../domain/entryRisk";
 import { assertAccountEntryProjection, loadAccountEntryProjection } from "../db/entryRiskProjection";
 import type { FillEvidence, Result } from "../domain/execution";
@@ -98,6 +101,9 @@ export class FillProcessor {
       const entryReservation = intent.get("purpose") === "ENTRY"
         ? await this.models.RiskReservation.findOne({ ...this.scope, intentId: trade.intentId }).session(session) : null;
       const supported = entryReservation?.get("kind") === "ENTRY_RISK";
+      const realizedHold = entryReservation ?? await this.models.RiskReservation.findOne({ ...this.scope, intentId: position.get("entryIntentId"), kind: "ENTRY_RISK" }).session(session);
+      const tracksRealized = realizedHold?.get("kind") === "ENTRY_RISK";
+      if (tracksRealized) assertRealizedProjection(account.toObject(), await loadRealizedProjection(this.connection, session, this.scope, account.get("riskTradingCalendar")));
       // Verify the BEFORE projection. Never repair drift or run current policy limits
       // while recording owned broker truth. Historical untyped fills retain their old path.
       const priorAccount = supported ? await loadAccountEntryProjection(this.connection, session, this.scope) : undefined;
@@ -115,6 +121,7 @@ export class FillProcessor {
         { type: "APPLY_FILL", fill: evidence(fill) }));
       const nextPosition = value(transitionPosition({ ...position.toObject(), fills: oldFills, orders: orders.map(o => o.toObject()) } as PositionState,
         { type: intent.get("purpose") === "ENTRY" ? "ENTRY_FILL" : "EXIT_FILL", fill: evidence(fill) }));
+      const realized = tracksRealized ? realizedPosition(position.get("entryIntentId"), [...oldFills, evidence(fill)]) : undefined;
       const legs = nextPosition.legs.map(leg => {
         const accounting = fillAccounting(nextPosition.fills.filter(f => f.legId === leg.legId), nextPosition.entryIntentId);
         if (intent.get("purpose") === "ENTRY" || leg.legId !== trade.legId) return { ...leg, ...accounting };
@@ -148,6 +155,10 @@ export class FillProcessor {
         executionEvidenceRefs: nextOrder.fills.map(f => f.fillId) });
       await this.save(order, session); // Does not consume a broker snapshot or advance its observation version.
       const from: string = position.get("lifecycle");
+      if (realized) {
+        for (const leg of legs) Object.assign(leg, { realizedPnlMinor: realized.legs[leg.legId] ?? 0 });
+        position.set("realizedPnlMinor", realized.realizedPnlMinor);
+      }
       position.set({ legs, lifecycle: nextPosition.lifecycle, integrity: nextPosition.integrity,
         executionEvidenceRefs: nextPosition.fills.map(f => f.fillId) });
       await this.save(position, session);
@@ -170,6 +181,23 @@ export class FillProcessor {
           quantityUnits: trade.quantityUnits, releasedPendingMinor: checkedRiskUnits(BigInt(trade.quantityUnits) * BigInt(leg.limitPriceMinor)),
           committedPremiumMinor: checkedRiskUnits(BigInt(trade.quantityUnits) * BigInt(trade.priceMinor)), remainingPendingMinor: next.pendingMinor,
           committedExposureMinor: next.committedMinor, slotTransferred: next.committedSlots > priorRisk.projection.committedSlots };
+      }
+      if (tracksRealized) {
+        const current = await this.models.TradingAccount.findOne(this.scope).session(session).orFail();
+        const projection = await loadRealizedProjection(this.connection, session, this.scope, current.get("riskTradingCalendar"));
+        const fromDay: string | null = current.get("dailyTradingDay") ?? null;
+        const clockDay = current.get("riskTradingCalendar") === undefined ? null : tradingDay(current.get("riskTradingCalendar"), now);
+        const day = clockDay && (!fromDay || clockDay > fromDay) ? clockDay : fromDay;
+        current.set({ realizedPnlMinor: projection.realizedPnlMinor, realizedPnlDays: projection.days,
+          dailyRealizedPnlMinor: day ? dailyPnl(projection.days, day) : 0, ...(day ? { dailyTradingDay: day } : {}) });
+        await withDayWrite(session, () => this.save(current, session));
+        if (day && day !== fromDay) await riskAudit(this.models, this.scope, session, now, {
+          eventId: `${fillId}:TRADING_DAY_ADVANCED`, eventType: "TRADING_DAY_ADVANCED", causationId: fillId, reason: "QUALIFIED_LOCAL_DAY",
+          tradingDate: day, evidenceRefs: [fillId], payload: { kind: "TRADING_DAY", from: fromDay, to: day, realizedPnlMinor: current.get("dailyRealizedPnlMinor") } });
+        await riskAudit(this.models, this.scope, session, now, { eventId: `${fillId}:DAILY_PNL_UPDATED`, eventType: "DAILY_PNL_UPDATED",
+          causationId: fillId, reason: "FILL_DERIVED_REALIZED_PNL", tradingDate: day ?? now.toISOString().slice(0, 10), evidenceRefs: [fillId],
+          payload: { kind: "DAILY_PNL", fillId, positionId: trade.positionId, tradingDay: day,
+            realizedPnlMinor: projection.realizedPnlMinor, dailyRealizedPnlMinor: current.get("dailyRealizedPnlMinor") } });
       }
       await this.audit(fill, fill, "FILL_RECEIVED", undefined, session);
       if (from !== nextPosition.lifecycle) {

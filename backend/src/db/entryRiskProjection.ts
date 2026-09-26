@@ -1,6 +1,7 @@
 import type { ClientSession, Connection } from "mongoose";
 import type { ExecutionScope } from "@trading-bot/shared";
 import { checkedRiskUnits, entryProjectionFromFills, riskAssert, verifyEntryReservation } from "../domain/entryRisk";
+import { terminalRiskProof } from "./terminalRiskEvidence";
 import { positionEconomicsSchema } from "../domain/financialInvariants";
 
 type Row = Record<string, any>;
@@ -48,11 +49,16 @@ export async function verifyEntryRiskLedger(connection: Connection, session: Cli
     riskAssert(posLeg && posLeg.entryFilledUnits === leg.transferredUnits
       && (posLeg.entryNotionalMinor === undefined ? leg.transferredUnits === 0 : posLeg.entryNotionalMinor === leg.committedMinor), "RISK_PROJECTION_MISMATCH");
   }
+  if (reservation.state === "RELEASED") {
+    const proof = await terminalRiskProof(connection, session, scope, position);
+    riskAssert(reservation.entrySettlement.closeIntentId === proof.closeIntentId, "RISK_PROJECTION_MISMATCH");
+  }
   return { ...verified, fills };
 }
 
 /** Supported ledger only. Unknown legacy overlap and unexplained drift fail closed. */
-export async function loadAccountEntryProjection(connection: Connection, session: ClientSession, scope: ExecutionScope): Promise<AccountEntryProjection> {
+export async function loadAccountEntryProjection(connection: Connection, session: ClientSession, scope: ExecutionScope,
+  pendingSettlementEventId?: string): Promise<AccountEntryProjection> {
   const db = connection.db!;
   const reservations = await db.collection("execution_reservations").find(scope, { session }).toArray();
   const positions = await db.collection("execution_positions").find(scope, { session }).toArray();
@@ -65,6 +71,15 @@ export async function loadAccountEntryProjection(connection: Connection, session
     const position = positions.find(p => p.entryIntentId === reservation.intentId);
     riskAssert(intent && position, "RISK_PROJECTION_MISMATCH");
     const { projection } = await verifyEntryRiskLedger(connection, session, scope, reservation, intent, position);
+    held.add(intent.intentId);
+    if (reservation.state === "RELEASED") {
+      const eventId = reservation.entrySettlement.eventId;
+      // The settlement audit validates its final transaction state just before its
+      // own insert. Every subsequent capacity reader requires the published event.
+      if (eventId !== pendingSettlementEventId) riskAssert(await db.collection("execution_events").findOne({ ...scope,
+        eventId, eventType: "ENTRY_RISK_SETTLED", aggregateId: reservation.reservationId }, { session }), "RISK_PROJECTION_MISMATCH");
+      continue;
+    }
     result.pending += BigInt(projection.pendingMinor); result.committed += BigInt(projection.committedMinor);
     result.reservedSlots += BigInt(projection.reservedSlots); result.committedSlots += BigInt(projection.committedSlots);
     const usage = BigInt(projection.pendingMinor) + BigInt(projection.committedMinor);

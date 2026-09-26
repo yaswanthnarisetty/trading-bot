@@ -7,6 +7,7 @@ const positive = quantityUnitsSchema.refine(n => n > 0);
 export const entryRiskPolicySchema = z.object({
   policyVersion: quantityUnitsSchema,
   maxRiskPerEntryMinor: positive, maxReservedRiskMinor: positive, maxPositionSlots: positive,
+  maxDailyLossMinor: positive.optional(),
 }).strict();
 
 /** Qualified immutable execution terms, persisted by the trusted planner, never an
@@ -27,7 +28,8 @@ const targetsSchema = z.array(z.object({
 export type EntryRiskReason = "INVALID_RISK_ECONOMICS" | "UNSUPPORTED_RISK_SHAPE" | "RISK_ARITHMETIC_OVERFLOW"
   | "RISK_PER_TRADE_EXCEEDED" | "RISK_CAPACITY_EXCEEDED" | "POSITION_LIMIT_EXCEEDED"
   | "ACCOUNT_NOT_READY" | "RISK_POLICY_REQUIRED" | "INTENT_NOT_FOUND" | "ENTRY_ONLY"
-  | "STALE_EXECUTION_CHAIN" | "RISK_PROJECTION_MISMATCH" | "UNSUPPORTED_ACCOUNT_EXPOSURE";
+  | "STALE_EXECUTION_CHAIN" | "RISK_PROJECTION_MISMATCH" | "UNSUPPORTED_ACCOUNT_EXPOSURE"
+  | "KILL_SWITCH_ACTIVE" | "DAILY_LOSS_LIMIT_EXCEEDED" | "DAILY_LOSS_POLICY_REQUIRED" | "TRADING_DAY_CONFIG_REQUIRED" | "TRADING_DAY_REGRESSION";
 export class EntryRiskError extends Error {
   constructor(readonly reason: EntryRiskReason) { super(reason); }
 }
@@ -70,6 +72,11 @@ export const entryAdmissionSchema = z.object({
 export const entryProgressSchema = z.array(z.object({
   legId: identifierSchema, transferredUnits: quantityUnitsSchema, committedMinor: quantityUnitsSchema,
 }).strict()).min(1);
+export const entrySettlementSchema = z.object({
+  positionId: identifierSchema, closeIntentId: identifierSchema, eventId: identifierSchema, settledAt: z.date(),
+  pendingReleasedMinor: quantityUnitsSchema, committedReleasedMinor: quantityUnitsSchema,
+  reservedSlotsReleased: quantityUnitsSchema, committedSlotsReleased: quantityUnitsSchema,
+}).strict();
 export type EntryRiskRequirement = ReturnType<typeof calculateEntryRisk>;
 
 /** Progress is a projection, never execution evidence. Persistence proves it against
@@ -116,13 +123,19 @@ export function verifyEntryReservation(reservation: Record<string, unknown>, int
     && reservation.kind === "ENTRY_RISK" && reservation.intentId === intent.intentId, "STALE_EXECUTION_CHAIN");
   const requirement = calculateEntryRisk(intent.targetLegs, intent.entryPlan);
   const projection = entryProjection(requirement, reservation.entryProgress);
-  riskAssert(admission.data.economicsFingerprint === requirement.fingerprint && reservation.state === "HELD"
-    && reservation.policyVersion === admission.data.policyVersion && reservation.positionSlots === 1, "RISK_PROJECTION_MISMATCH");
+  riskAssert(admission.data.economicsFingerprint === requirement.fingerprint && ["HELD", "RELEASED"].includes(String(reservation.state))
+    && reservation.policyVersion === admission.data.policyVersion && reservation.positionSlots === (reservation.state === "RELEASED" ? 0 : 1), "RISK_PROJECTION_MISMATCH");
   for (const key of ["initialMarginMinor", "initialExposureMinor"])
     riskAssert(reservation[key] === requirement.requiredRiskMinor, "RISK_PROJECTION_MISMATCH");
   for (const key of ["remainingMarginMinor", "remainingExposureMinor"])
-    riskAssert(reservation[key] === projection.pendingMinor, "RISK_PROJECTION_MISMATCH");
+    riskAssert(reservation[key] === (reservation.state === "RELEASED" ? 0 : projection.pendingMinor), "RISK_PROJECTION_MISMATCH");
   riskAssert(JSON.stringify(z.array(z.string()).parse(reservation.instrumentKeys).slice().sort())
     === JSON.stringify(requirement.legs.map(leg => leg.contractKey).sort()), "STALE_EXECUTION_CHAIN");
+  if (reservation.state === "RELEASED") {
+    const settled = entrySettlementSchema.parse(reservation.entrySettlement);
+    riskAssert(settled.positionId === positionId && settled.eventId === `${reservation.reservationId}:ENTRY_RISK_SETTLED`
+      && settled.pendingReleasedMinor === projection.pendingMinor && settled.committedReleasedMinor === projection.committedMinor
+      && settled.reservedSlotsReleased === projection.reservedSlots && settled.committedSlotsReleased === projection.committedSlots, "RISK_PROJECTION_MISMATCH");
+  } else riskAssert(reservation.entrySettlement === undefined, "RISK_PROJECTION_MISMATCH");
   return { requirement, admission: admission.data, projection };
 }

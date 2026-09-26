@@ -11,6 +11,8 @@ import { brokerOrderRequestSchema } from "../brokers/BrokerAdapter";
 import { submissionFingerprint, validateSubmissionEvidence } from "../brokers/submissionEvidence";
 import { fillAccounting, type AccountingFill } from "../domain/fillAccounting";
 import { dependenciesAreSafe, verifyCloseLedger } from "../domain/closeWorkflowEvidence";
+import { realizedPosition } from "../domain/realizedRisk";
+import { assertRealizedProjection, dayWriteAllowed, killWriteAllowed, loadRealizedProjection } from "./realizedRiskProjection";
 import { checkedRiskUnits, entryRiskPolicySchema, riskAssert, verifyEntryReservation } from "../domain/entryRisk";
 
 import { assertAccountEntryProjection, loadAccountEntryProjection, verifyEntryRiskLedger } from "./entryRiskProjection";
@@ -61,7 +63,15 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
     return record;
   };
   const name = doc.collection.collectionName;
-  if (name === "execution_accounts") return;
+  if (name === "execution_accounts") {
+    const previous = await db.collection(name).findOne(scope, { session });
+    if (previous?.dailyTradingDay && (!data.dailyTradingDay || String(data.dailyTradingDay) < previous.dailyTradingDay)) throw new Error("TRADING_DAY_REGRESSION");
+    if (previous && previous.dailyTradingDay !== data.dailyTradingDay && !dayWriteAllowed(session)) throw new Error("AUDITED_TRADING_DAY_SERVICE_REQUIRED");
+    if (previous && (Boolean(previous.killSwitchEnabled) !== data.killSwitchEnabled
+      || JSON.stringify(previous.killSwitchCommand) !== JSON.stringify(data.killSwitchCommand)) && !killWriteAllowed(session)) throw new Error("AUDITED_KILL_SERVICE_REQUIRED");
+    if (!previous && (data.killSwitchEnabled || data.killSwitchCommand)) throw new Error("AUDITED_KILL_SERVICE_REQUIRED");
+    return;
+  }
   const account = await find("execution_accounts", "accountId", scope.accountId);
   if (units(account, "version") === Number.MAX_SAFE_INTEGER) throw new Error("CAS_VERSION_EXHAUSTED");
   // All chain writes contend on the account version. Snapshot reads alone permit
@@ -100,6 +110,8 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
   } else if (name === "execution_reservations") {
     const intent = await intentFor(data.intentId);
     if (data.kind === "ENTRY_RISK") {
+      const prior = await db.collection(name).findOne({ ...scope, reservationId: data.reservationId }, { session });
+      if ((doc.isNew && data.state !== "HELD") || (prior?.state === "RELEASED" && data.state !== "RELEASED")) throw new Error("SETTLEMENT_CANNOT_REGRESS");
       const admission = z.record(z.unknown()).parse(data.entryAdmission);
       const position = await positionFor(admission.positionId);
       checkIntentPosition(intent, position);
@@ -143,6 +155,7 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
     const initialEntryClaim = scope.executionMode === "PAPER" && intent.purpose === "ENTRY"
       && Boolean(data.submissionClaim) && !previous?.submissionClaim;
     if (initialEntryClaim) {
+      if (account.killSwitchEnabled) throw new Error("KILL_SWITCH_ACTIVE");
       equal(previous?.phase, "READY", "ENTRY admission requires an existing READY child");
       if (!data.submissionAuthorization) throw new Error("ENTRY_ADMISSION_REQUIRED");
     }
@@ -271,6 +284,12 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
     }
     const fills = await db.collection("execution_fills").find({ ...scope, positionId: data.positionId }, { session }).toArray();
     checkEvidenceIds(data, fills);
+    const entryRisk = await db.collection("execution_reservations").findOne({ ...scope, intentId: data.entryIntentId, kind: "ENTRY_RISK" }, { session });
+    if (entryRisk) {
+      const pnl = realizedPosition(text(data, "entryIntentId"), fills);
+      equal(data.realizedPnlMinor, pnl.realizedPnlMinor, "Fill-derived position P&L");
+      for (const leg of rows(data, "legs")) equal(leg.realizedPnlMinor, pnl.legs[text(leg, "legId")] ?? 0, "Fill-derived leg P&L");
+    }
     for (const leg of rows(data, "legs")) {
       const entry = fills.filter(f => f.legId === leg.legId && f.intentId === data.entryIntentId);
       const exit = fills.filter(f => f.legId === leg.legId && f.intentId !== data.entryIntentId);
@@ -298,8 +317,34 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
       BrokerOrder: ["execution_orders", "orderId"], Fill: ["execution_fills", "fillId"], Position: ["execution_positions", "positionId"],
     };
     const [collection, key] = aggregateCollections[text(data, "aggregateType")];
-    const aggregate = await find(collection, key, data.aggregateId);
+    const aggregate = data.aggregateType === "TradingAccount" ? account : await find(collection, key, data.aggregateId);
     equal(data.aggregateVersion, aggregate.version ?? 0, "audit aggregate version");
+    if (["DAILY_PNL_UPDATED", "TRADING_DAY_ADVANCED"].includes(String(data.eventType))) {
+      equal(data.aggregateId, scope.accountId, "P&L account");
+      const payload = z.record(z.unknown()).parse(data.payload);
+      assertRealizedProjection(account, await loadRealizedProjection(connection, session, scope, account.riskTradingCalendar));
+      if (data.eventType === "DAILY_PNL_UPDATED") {
+        const fill = await find("execution_fills", "fillId", payload.fillId);
+        equal(fill.positionId, payload.positionId, "P&L Fill position"); equal(data.causationId, fill.fillId, "P&L Fill causation");
+        equal(payload.realizedPnlMinor, account.realizedPnlMinor, "P&L total");
+        equal(payload.dailyRealizedPnlMinor, account.dailyRealizedPnlMinor, "P&L daily");
+        equal(payload.tradingDay, account.dailyTradingDay ?? null, "P&L trading day");
+      } else { equal(payload.to, account.dailyTradingDay, "rollover trading day"); equal(payload.realizedPnlMinor, account.dailyRealizedPnlMinor, "rollover P&L"); }
+    }
+    if (["KILL_SWITCH_ENABLED", "KILL_SWITCH_DISABLED"].includes(String(data.eventType))) {
+      const payload = z.record(z.unknown()).parse(data.payload), command = z.record(z.unknown()).parse(account.killSwitchCommand);
+      equal(data.aggregateId, scope.accountId, "kill account"); equal(payload.enabled, account.killSwitchEnabled, "kill state");
+      equal(data.eventType, payload.enabled ? "KILL_SWITCH_ENABLED" : "KILL_SWITCH_DISABLED", "kill event state");
+      for (const field of ["commandId", "enabled", "reason"]) equal(payload[field], command[field], "kill audit command");
+    }
+    if (data.eventType === "ENTRY_RISK_SETTLED") {
+      const payload = z.record(z.unknown()).parse(data.payload), settled = z.record(z.unknown()).parse(aggregate.entrySettlement);
+      equal(aggregate.state, "RELEASED", "settled reservation"); equal(data.eventId, settled.eventId, "settlement event");
+      equal(payload.reservationId, aggregate.reservationId, "settlement owner");
+      for (const key of ["positionId", "pendingReleasedMinor", "committedReleasedMinor", "reservedSlotsReleased", "committedSlotsReleased"])
+        equal(payload[key], settled[key], "settlement release");
+      assertAccountEntryProjection(account, await loadAccountEntryProjection(connection, session, scope, text(data, "eventId")));
+    }
     if (data.eventType === "ENTRY_RISK_COMMITTED") {
       const payload = z.record(z.unknown()).parse(data.payload), fill = await find("execution_fills", "fillId", payload.fillId);
       equal(data.eventId, `${fill.fillId}:ENTRY_RISK_COMMITTED`, "unique Fill risk event");

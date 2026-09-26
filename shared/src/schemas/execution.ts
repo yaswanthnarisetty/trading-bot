@@ -53,6 +53,7 @@ export type OrderSide = z.infer<typeof orderSideSchema>;
 
 export const tradingEventTypeSchema = z.enum([
   "SIGNAL_CREATED", "INTENT_CREATED", "RISK_BLOCKED", "RISK_RESERVED", "ENTRY_RISK_COMMITTED",
+  "DAILY_PNL_UPDATED", "TRADING_DAY_ADVANCED", "KILL_SWITCH_ENABLED", "KILL_SWITCH_DISABLED", "ENTRY_RISK_SETTLED",
   "SUBMISSION_CLAIMED", "ORDER_SUBMITTED", "ORDER_ACKNOWLEDGED",
   "ORDER_READY", "ORDER_FINALITY_CONFIRMED", "INTENT_COMPLETED", "RESERVATION_CONSUMED",
   "ORDER_OUTCOME_UNKNOWN", "ORDER_REJECTED", "ORDER_CANCEL_REQUESTED", "ORDER_CANCELLED",
@@ -66,6 +67,14 @@ export const aggregateTypeSchema = z.enum([
   "BrokerOrder", "Fill", "Position",
 ]);
 export const eventPayloadSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("DAILY_PNL"), fillId: identifierSchema, positionId: identifierSchema,
+    tradingDay: tradingDateSchema.nullable(), realizedPnlMinor: moneyMinorSchema, dailyRealizedPnlMinor: moneyMinorSchema }).strict(),
+  z.object({ kind: z.literal("TRADING_DAY"), from: tradingDateSchema.nullable(), to: tradingDateSchema,
+    realizedPnlMinor: moneyMinorSchema }).strict(),
+  z.object({ kind: z.literal("KILL_SWITCH"), commandId: identifierSchema, enabled: z.boolean(), reason: identifierSchema }).strict(),
+  z.object({ kind: z.literal("RISK_SETTLEMENT"), positionId: identifierSchema, reservationId: identifierSchema,
+    pendingReleasedMinor: nonnegativeMoneyMinorSchema, committedReleasedMinor: nonnegativeMoneyMinorSchema,
+    reservedSlotsReleased: quantityUnitsSchema, committedSlotsReleased: quantityUnitsSchema }).strict(),
   z.object({
     kind: z.literal("ENTRY_RISK_TRANSFER"), reservationId: identifierSchema, fillId: identifierSchema, legId: identifierSchema,
     quantityUnits: quantityUnitsSchema.refine(n => n > 0), releasedPendingMinor: nonnegativeMoneyMinorSchema,
@@ -98,6 +107,11 @@ export const tradingEventSchema = z.object({
   if (!executionScopeSchema.safeParse({ accountId: event.accountId, executionMode: event.executionMode }).success) {
     ctx.addIssue({ code: "custom", message: "Invalid execution scope" });
   }
+  const kinds: Record<string, string> = { DAILY_PNL_UPDATED: "DAILY_PNL", TRADING_DAY_ADVANCED: "TRADING_DAY",
+    KILL_SWITCH_ENABLED: "KILL_SWITCH", KILL_SWITCH_DISABLED: "KILL_SWITCH", ENTRY_RISK_SETTLED: "RISK_SETTLEMENT" };
+  if (kinds[event.eventType] && (event.payload.kind !== kinds[event.eventType]
+    || event.aggregateType !== (event.eventType === "ENTRY_RISK_SETTLED" ? "RiskReservation" : "TradingAccount")))
+    ctx.addIssue({ code: "custom", message: "Risk control event requires its typed payload and aggregate" });
   if (event.eventType === "FILL_RECEIVED" && event.payload.kind !== "FILL") {
     ctx.addIssue({ code: "custom", message: "FILL_RECEIVED requires a FILL payload" });
   }

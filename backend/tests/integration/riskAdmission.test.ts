@@ -16,7 +16,7 @@ if (!uri || !new URL(uri).pathname.startsWith("/phase2a_test_")) throw new Error
 const connection = mongoose.createConnection(uri, { serverSelectionTimeoutMS: 5000 });
 const models = executionModels(connection), clock = () => new Date(f.now), deadline = new Date(f.now.getTime() + 60000);
 const service = () => new RiskAdmissionService(connection, f.scope, clock);
-const policy = { policyVersion: 1, maxRiskPerEntryMinor: 100000, maxReservedRiskMinor: 200000, maxPositionSlots: 3 };
+const policy = { policyVersion: 1, maxRiskPerEntryMinor: 100000, maxReservedRiskMinor: 200000, maxPositionSlots: 3, maxDailyLossMinor: 1000000 };
 async function tx<T>(work: (session: ClientSession) => Promise<T>) {
   const session = await connection.startSession();
   try { return await session.withTransaction(() => work(session)); } finally { await session.endSession(); }

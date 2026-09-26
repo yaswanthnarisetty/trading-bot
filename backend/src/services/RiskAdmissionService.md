@@ -1,4 +1,4 @@
-# PAPER ENTRY admission and Fill-backed risk (Phases 2C1–2C2)
+# PAPER ENTRY admission and Fill-backed risk (Phases 2C1–2C3)
 
 `RiskAdmissionService.authorizeEntry(intentId)` accepts only a durable ENTRY identity.
 It has no broker dependency or dispatch. The caller explicitly submits returned child
@@ -7,7 +7,8 @@ IDs through OrderManager. FillProcessor remains the sole executed-quantity servi
 ## Admission prerequisites
 
 TradingAccount must be PAPER_READY with an explicit durable `entryRiskPolicy`:
-`policyVersion`, `maxRiskPerEntryMinor`, `maxReservedRiskMinor`, `maxPositionSlots`.
+`policyVersion`, `maxRiskPerEntryMinor`, `maxReservedRiskMinor`, `maxPositionSlots`, and
+`maxDailyLossMinor`. Qualified account trading-day configuration and inactive kill are required for new admission.
 There are no default ceilings, environment fallbacks or configuration endpoints.
 `maxReservedRiskMinor` now limits total ENTRY usage: pending plus committed risk.
 
@@ -74,7 +75,7 @@ The transfer event references its Fill and reservation, with quantity, released 
 premium, actual committed premium, resulting reservation totals and first-slot transfer.
 A deterministic per-Fill event ID prevents duplicate transfer audits.
 
-Current policy limits, readiness and authorization expiry are not Fill-ingestion gates.
+Current policy limits, daily loss, kill, readiness and authorization expiry are not Fill-ingestion gates.
 Valid owned evidence above the authorized price is recorded at its actual premium,
 even above configured limits. New admission then fails if current/per-entry or aggregate
 usage exceeds policy. Safe-integer overflow and invalid ownership remain atomic errors;
@@ -104,14 +105,15 @@ validation path. It does not rerun initial admission or current policy limits.
 
 UNKNOWN, SUBMITTING, cancellation requests and rejected/cancelled unfilled units retain
 pending risk. Full entry execution reduces pending to zero solely from proved Fills;
-ENTRY_RISK remains HELD with its original admission history.
+ENTRY_RISK remains HELD with its original admission history until explicit proven settlement.
 
 CLOSE_QUANTITY remains a separate quantity-only reservation. CLOSE fills update Position
 through the unchanged close logic; they do not consume ENTRY pending risk, reduce
 committed ENTRY premium or release the retained slot. A fully CLOSED Position therefore
-still occupies committed exposure and a slot until Phase 2C3 settlement.
+still occupies committed exposure and a slot until explicit RiskSettlementService settlement.
 
-Deferred: terminal/cancellation release, daily loss, durable kill-switch/operational
-halt policy and recovery liquidation. SELL/spread admission also remains unsupported.
+Phase 2C3 adds Fill-backed realized P&L, explicit qualified trading days, daily-loss admission,
+an audited durable kill switch and proven CLOSED settlement. See [RiskLifecycle.md](RiskLifecycle.md).
+Cancellation/zero-fill settlement and recovery liquidation remain deferred. SELL/spread admission remains unsupported.
 No Kite/Delta/LIVE execution, reconciliation worker, SignalLoop/PaperTrade wiring,
 Redis, frontend changes or historical Fill fabrication is introduced.

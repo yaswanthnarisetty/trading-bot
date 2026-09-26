@@ -13,7 +13,7 @@ const uri = process.env.EXECUTION_TEST_MONGO_URI;
 if (!uri || !new URL(uri).pathname.startsWith("/phase2a_test_")) throw new Error("isolated real Mongo required");
 const connection = mongoose.createConnection(uri), models = executionModels(connection), clock = () => new Date(f.now);
 const deadline = new Date(f.now.getTime() + 60000);
-const policy = { policyVersion: 1, maxRiskPerEntryMinor: 1000000, maxReservedRiskMinor: 1000000, maxPositionSlots: 10 };
+const policy = { policyVersion: 1, maxRiskPerEntryMinor: 1000000, maxReservedRiskMinor: 1000000, maxPositionSlots: 10, maxDailyLossMinor: 1000000 };
 const admission = () => new RiskAdmissionService(connection, f.scope, clock);
 const processor = () => new FillProcessor(connection, f.scope, clock);
 let ids = 0;

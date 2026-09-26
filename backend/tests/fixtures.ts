@@ -9,6 +9,7 @@ export const now = new Date("2026-09-11T04:00:00.000Z");
 export const base = (customScope = scope) => ({ ...customScope, schemaVersion: 1, correlationId: "trade-1", createdAt: now });
 export const mutable = (customScope = scope) => ({ ...base(customScope), version: 0, updatedAt: now });
 export const account = (accountId = scope.accountId) => ({ ...mutable({ ...scope, accountId }), broker: "PAPER", brokerAccountRef: accountId,
+  riskTradingCalendar: { kind: "LOCAL_DATE_V1", timeZone: "Asia/Kolkata" }, dailyTradingDay: "2026-09-11",
   currency: "INR", admissionStatus: "DISABLED", policyVersion: 1, executionEpoch: 1,
   reservedMarginMinor: 0, reservedExposureMinor: 0, committedExposureMinor: 0, realizedPnlMinor: 0,
   positionSlots: 0, nextEventSequence: 1 });
