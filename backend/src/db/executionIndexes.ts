@@ -1,13 +1,13 @@
 import type { Connection } from "mongoose";
-import { executionSchemas } from "./executionModels";
+import { schemasForIndexGroup, type ExecutionIndexGroup } from "./executionModels";
 
 export interface RequiredExecutionIndex {
   collection: string;
   key: Record<string, unknown>;
   options: Record<string, unknown>;
 }
-export function requiredExecutionIndexes(): RequiredExecutionIndex[] {
-  return Object.values(executionSchemas).flatMap(schema => schema.indexes().map(([key, options]) => ({
+export function requiredExecutionIndexes(group: ExecutionIndexGroup = "BASE"): RequiredExecutionIndex[] {
+  return Object.values(schemasForIndexGroup(group)).flatMap(schema => schema.indexes().map(([key, options]) => ({
     collection: String(schema.get("collection")), key: { ...key }, options: { ...options },
   })));
 }
@@ -31,10 +31,10 @@ export function compareExecutionIndexes(required: RequiredExecutionIndex[], inve
   }
   return issues;
 }
-export async function verifyExecutionIndexes(connection: Connection): Promise<{ verified: boolean; issues: string[] }> {
+export async function verifyExecutionIndexes(connection: Connection, group: ExecutionIndexGroup = "BASE"): Promise<{ verified: boolean; issues: string[] }> {
   if (connection.readyState !== 1 || !connection.db) return { verified: false, issues: ["DISCONNECTED"] };
   try {
-    const required = requiredExecutionIndexes();
+    const required = requiredExecutionIndexes(group);
     const inventory: Record<string, Record<string, unknown>[]> = {};
     for (const collection of new Set(required.map(s => s.collection))) {
       const exists = await connection.db.listCollections({ name: collection }, { nameOnly: true }).hasNext();
@@ -44,7 +44,7 @@ export async function verifyExecutionIndexes(connection: Connection): Promise<{ 
     return { verified: issues.length === 0, issues };
   } catch { return { verified: false, issues: ["INDEX_VERIFICATION_FAILED"] }; }
 }
-export async function assertExecutionIndexes(connection: Connection): Promise<void> {
-  const result = await verifyExecutionIndexes(connection);
+export async function assertExecutionIndexes(connection: Connection, group: ExecutionIndexGroup = "BASE"): Promise<void> {
+  const result = await verifyExecutionIndexes(connection, group);
   if (!result.verified) throw new Error(`EXECUTION_INDEXES_NOT_READY: ${result.issues.join("; ")}`);
 }

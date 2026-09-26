@@ -75,3 +75,13 @@ test("index specification verification detects absent and conflicting unique/par
   entry.partialFilterExpression = { purpose: "ENTRY" }; entry.unique = false;
   assert.ok(compareExecutionIndexes(required, inventory).some(issue => issue.startsWith("CONFLICTING")));
 });
+
+test("reconciliation indexes are a separate mandatory group with all seven constraints retained", () => {
+  const base=requiredExecutionIndexes(), reconciliation=requiredExecutionIndexes("RECONCILIATION"), all=requiredExecutionIndexes("ALL");
+  assert.equal(base.length,28); assert.equal(reconciliation.length,7); assert.equal(all.length,35);
+  assert.ok(base.every(i=>!i.collection.startsWith("execution_reconcil")));
+  assert.ok(reconciliation.every(i=>i.collection.startsWith("execution_reconcil")));
+  const inventory: Record<string, Record<string, unknown>[]> = {};
+  for (const spec of base) (inventory[spec.collection]??=[]).push({key:spec.key,...spec.options});
+  assert.deepEqual(compareExecutionIndexes(base,inventory),[]); assert.equal(compareExecutionIndexes(reconciliation,inventory).length,7);
+});

@@ -1,3 +1,4 @@
+import { reconciliationConfigSchema, reconciliationStateSchema } from "../domain/reconciliation";
 import { tradingCalendarSchema, pnlDaysSchema } from "../domain/realizedRisk";
 import { tradingDateSchema, identifierSchema } from "@trading-bot/shared";
 import { z } from "zod";
@@ -8,6 +9,9 @@ import { executionSchema, idField, moneyField, unitsField, writeOnceFields } fro
 export const TradingAccountSchema = executionSchema({
   broker: { type: String, enum: ["PAPER", "KITE", "LEGACY"], required: true, immutable: true },
   brokerAccountRef: idField(),
+  // Explicit opt-in to comparison only; never changes PAPER broker ownership.
+  reconciliationConfig: { type: Schema.Types.Mixed },
+  reconciliationState: { type: Schema.Types.Mixed },
   currency: { type: String, enum: ["INR"], required: true, immutable: true },
   admissionStatus: { type: String, enum: ["DISABLED", "RECOVERING", "HALTED", "PAPER_READY"], required: true, default: "DISABLED" },
   // Explicit opt-in for isolated PAPER submission only; no LIVE readiness or credentials.
@@ -25,10 +29,14 @@ export const TradingAccountSchema = executionSchema({
   committedPositionSlots: { ...unitsField(), default: 0 },
   positionSlots: unitsField(), nextEventSequence: unitsField(true),
 }, "execution_accounts");
-writeOnceFields(TradingAccountSchema, ["riskTradingCalendar"]);
+writeOnceFields(TradingAccountSchema, ["riskTradingCalendar", "reconciliationConfig"]);
 TradingAccountSchema.index({ accountId: 1 }, { unique: true });
 TradingAccountSchema.index({ broker: 1, brokerAccountRef: 1, executionMode: 1 }, { unique: true });
 TradingAccountSchema.pre("validate", function () {
+  if (this.get("reconciliationConfig") !== undefined && (this.get("executionMode") !== "PAPER"
+    || !reconciliationConfigSchema.safeParse(this.get("reconciliationConfig")).success)) this.invalidate("reconciliationConfig", "Explicit PAPER shadow account required");
+  if (this.get("reconciliationState") !== undefined && !reconciliationStateSchema.safeParse(this.get("reconciliationState")).success)
+    this.invalidate("reconciliationState", "Invalid reconciliation state");
   if (this.get("riskTradingCalendar") !== undefined && !tradingCalendarSchema.safeParse(this.get("riskTradingCalendar")).success)
     this.invalidate("riskTradingCalendar", "Explicit IANA local-date calendar required");
   if (this.get("dailyTradingDay") !== undefined && !tradingDateSchema.safeParse(this.get("dailyTradingDay")).success)

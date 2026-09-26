@@ -2,6 +2,13 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { Immutable } from "./BrokerAdapter";
 
+// Runtime provenance boundary: only immutable snapshots normalized by this adapter
+// enter reconciliation. Serialized/reconstituted snapshot ingestion is deferred.
+const normalizedSnapshots = new WeakSet<object>();
+export function assertKiteAccountSnapshot(value: unknown): asserts value is BrokerAccountSnapshot {
+  if (!value || typeof value !== "object" || !normalizedSnapshots.has(value)) throw new Error("NORMALIZED_KITE_SNAPSHOT_REQUIRED");
+}
+
 export const kiteReadPaths = ["/orders", "/trades", "/portfolio/positions", "/user/margins"] as const;
 export type KiteReadPath = typeof kiteReadPaths[number];
 /** Authenticated, account-bound raw REST session. Never an SDK that rewrites dates.
@@ -238,10 +245,12 @@ export class KiteReadOnlyAdapter {
     const startedAt = this.clock().toISOString();
     const [orders, trades, positions, funds] = await Promise.all([this.getOrders(), this.getTrades(), this.getPositions(), this.getFunds()]);
     const available = [orders, trades, positions, funds].filter(r => r.availability === "AVAILABLE").length;
-    return freeze({ source: "KITE" as const, broker: "KITE" as const, brokerAccountId: this.brokerAccountId,
+    const snapshot = freeze({ source: "KITE" as const, broker: "KITE" as const, brokerAccountId: this.brokerAccountId,
       normalizationVersion: 1 as const, startedAt, fetchedAt: this.clock().toISOString(),
       completeness: available === 4 ? "COMPLETE" as const : available === 0 ? "UNAVAILABLE" as const : "PARTIAL" as const,
       consistency: "INDEPENDENT_ENDPOINT_READS" as const, orders, trades, positions, funds });
+    normalizedSnapshots.add(snapshot);
+    return snapshot;
   }
 }
 export type BrokerAccountSnapshot = Awaited<ReturnType<KiteReadOnlyAdapter["getSnapshot"]>>;

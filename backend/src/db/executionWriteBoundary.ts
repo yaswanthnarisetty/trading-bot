@@ -1,3 +1,6 @@
+import { reconciliationWriteAllowed } from "./reconciliationWrite";
+import { reconciliationAdmissionHealthy, assertAccountReconciliationIndexes } from "./reconciliationAdmission";
+import { canonical, reconciliationConfigSchema, reconciliationLinkSchema, orderKey, fingerprint, istDay } from "../domain/reconciliation";
 import type { ClientSession, Connection } from "mongoose";
 interface WriteDocument {
   db: Connection; collection: { collectionName: string }; isNew: boolean;
@@ -65,6 +68,11 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
   const name = doc.collection.collectionName;
   if (name === "execution_accounts") {
     const previous = await db.collection(name).findOne(scope, { session });
+    await assertAccountReconciliationIndexes(connection, data);
+    if (previous) await assertAccountReconciliationIndexes(connection, previous);
+    if (previous?.reconciliationConfig && canonical(previous.reconciliationConfig) !== canonical(data.reconciliationConfig)) throw new Error("RECONCILIATION_CONFIG_IMMUTABLE");
+    if (canonical(previous?.reconciliationState) !== canonical(data.reconciliationState) && !reconciliationWriteAllowed(session))
+      throw new Error("AUDITED_RECONCILIATION_SERVICE_REQUIRED");
     if (previous?.dailyTradingDay && (!data.dailyTradingDay || String(data.dailyTradingDay) < previous.dailyTradingDay)) throw new Error("TRADING_DAY_REGRESSION");
     if (previous && previous.dailyTradingDay !== data.dailyTradingDay && !dayWriteAllowed(session)) throw new Error("AUDITED_TRADING_DAY_SERVICE_REQUIRED");
     if (previous && (Boolean(previous.killSwitchEnabled) !== data.killSwitchEnabled
@@ -73,6 +81,9 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
     return;
   }
   const account = await find("execution_accounts", "accountId", scope.accountId);
+  await assertAccountReconciliationIndexes(connection, account);
+  if (["execution_reconciliations", "execution_reconciliation_links"].includes(name))
+    await assertExecutionIndexes(connection, "RECONCILIATION");
   if (units(account, "version") === Number.MAX_SAFE_INTEGER) throw new Error("CAS_VERSION_EXHAUSTED");
   // All chain writes contend on the account version. Snapshot reads alone permit
   // write skew (e.g. a new fill racing closure); this CAS makes one transaction retry.
@@ -95,7 +106,33 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
     if (units(order, "quantityUnits") > units(leg, "targetUnits")) throw new Error("Order exceeds intent target");
     return { intent, position };
   };
-  if (name === "execution_intents") {
+  if (name === "execution_reconciliations") {
+    if (!reconciliationWriteAllowed(session)) throw new Error("AUDITED_RECONCILIATION_SERVICE_REQUIRED");
+    const config = reconciliationConfigSchema.parse(account.reconciliationConfig);
+    equal(data.brokerAccountId, config.brokerAccountId, "reconciliation broker account");
+    const state = z.record(z.unknown()).parse(account.reconciliationState), report = z.record(z.unknown()).parse(data.report);
+    equal(state.recordId, data.recordId, "current reconciliation record");
+    equal(state.classification, report.classification, "reconciliation classification");
+  } else if (name === "execution_reconciliation_links") {
+    const config = reconciliationConfigSchema.parse(account.reconciliationConfig), link = reconciliationLinkSchema.parse(data.link);
+    equal(data.brokerAccountId, config.brokerAccountId, "shadow link account");
+    if (link.kind === "ORDER") {
+      const order = await find("execution_orders", "orderId", link.internalId);
+      equal(order.contractKey, `${link.instrument.exchange}:${link.instrument.tradingsymbol}`, "exact shadow instrument");
+      equal(z.record(z.unknown()).parse(order.submissionAuthorization).product, link.internalProduct, "explicit product correspondence");
+      equal(link.brokerKey, orderKey(link.instrument.exchange, link.tradingDay, link.brokerOrderId), "shadow order namespace");
+    } else {
+      const fill = await find("execution_fills", "fillId", link.internalId);
+      const parent = await find("execution_reconciliation_links", "linkId", link.orderLinkId);
+      const orderLink = reconciliationLinkSchema.parse(parent.link);
+      if (orderLink.kind !== "ORDER") throw new Error("SHADOW_ORDER_LINK_REQUIRED");
+      equal(parent.brokerAccountId, data.brokerAccountId, "shadow fill account");
+      equal(fill.orderId, orderLink.internalId, "shadow fill order");
+      equal(istDay(z.date().parse(fill.executedAt).toISOString()), orderLink.tradingDay, "shadow trade day");
+      equal(link.brokerKey, fingerprint(["KITE_READ_V1", data.brokerAccountId, orderLink.instrument.exchange,
+        orderLink.tradingDay, orderLink.brokerOrderId, link.nativeTradeId]), "shadow trade namespace");
+    }
+  } else if (name === "execution_intents") {
     if (data.purpose === "ENTRY") {
       await find("execution_signals", "signalId", data.signalId);
     } else {
@@ -119,6 +156,7 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
       equal(scope.executionMode, "PAPER", "entry reservation mode");
       const { requirement, admission: snapshot } = await verifyEntryRiskLedger(connection, session, scope, data, intent, position);
       if (doc.isNew) {
+        if (!await reconciliationAdmissionHealthy(connection, session, scope, account)) throw new Error("RECONCILIATION_REQUIRED");
         const policy = entryRiskPolicySchema.safeParse(account.entryRiskPolicy);
         riskAssert(policy.success && policy.data.policyVersion === account.policyVersion, "RISK_POLICY_REQUIRED");
         riskAssert(account.admissionStatus === "PAPER_READY" && account.broker === "PAPER", "ACCOUNT_NOT_READY");
@@ -155,6 +193,7 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
     const initialEntryClaim = scope.executionMode === "PAPER" && intent.purpose === "ENTRY"
       && Boolean(data.submissionClaim) && !previous?.submissionClaim;
     if (initialEntryClaim) {
+      if (!await reconciliationAdmissionHealthy(connection, session, scope, account)) throw new Error("RECONCILIATION_REQUIRED");
       if (account.killSwitchEnabled) throw new Error("KILL_SWITCH_ACTIVE");
       equal(previous?.phase, "READY", "ENTRY admission requires an existing READY child");
       if (!data.submissionAuthorization) throw new Error("ENTRY_ADMISSION_REQUIRED");
@@ -311,6 +350,17 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
       if (data.lifecycle === "CLOSED" && previous?.lifecycle !== "CLOSED") equal(data.integrity, "CONSISTENT", "closure integrity");
     }
   } else if (name === "execution_events") {
+    if (["RECONCILIATION_RESOLVED", "RECONCILIATION_MISMATCH"].includes(String(data.eventType))) {
+      if (!reconciliationWriteAllowed(session)) throw new Error("AUDITED_RECONCILIATION_SERVICE_REQUIRED");
+      const record = await find("execution_reconciliations", "recordId", data.causationId);
+      const report = z.record(z.unknown()).parse(record.report), state = z.record(z.unknown()).parse(account.reconciliationState);
+      equal(data.eventId, record.recordId, "reconciliation event identity"); equal(state.recordId, record.recordId, "reconciliation current state");
+      equal(data.aggregateType, "TradingAccount", "reconciliation aggregate"); equal(data.aggregateId, scope.accountId, "reconciliation account");
+      equal(data.reason, report.classification, "reconciliation event classification");
+      equal(data.eventType, report.classification === "MATCHED" ? "RECONCILIATION_RESOLVED" : "RECONCILIATION_MISMATCH", "reconciliation event kind");
+      const payload = z.record(z.unknown()).parse(data.payload);
+      equal(payload.kind, "REFERENCE", "reconciliation payload"); equal(payload.entityId, record.recordId, "reconciliation reference");
+    }
     const aggregateCollections: Record<string, [string, string]> = {
       TradingAccount: ["execution_accounts", "accountId"], StrategySignal: ["execution_signals", "signalId"],
       OrderIntent: ["execution_intents", "intentId"], RiskReservation: ["execution_reservations", "reservationId"],

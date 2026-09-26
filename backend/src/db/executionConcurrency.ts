@@ -5,6 +5,7 @@ import { executionModels, type ExecutionEntity } from "./executionModels";
 import { requireExecutionTransaction } from "./executionReadiness";
 
 export const entityIdFields = {
+  ReconciliationRecord: "recordId", ReconciliationLink: "linkId",
   TradingAccount: "accountId", StrategySignal: "signalId", OrderIntent: "intentId",
   RiskReservation: "reservationId", BrokerOrder: "orderId", Fill: "fillId", Position: "positionId", TradingEvent: "eventId",
 } as const satisfies Record<ExecutionEntity, string>;

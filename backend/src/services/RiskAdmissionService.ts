@@ -1,3 +1,4 @@
+import { reconciliationAdmissionHealthy, assertAccountReconciliationIndexes } from "../db/reconciliationAdmission";
 import { dailyLossReached } from "../domain/realizedRisk";
 import { assertRealizedProjection, currentDailyState, loadRealizedProjection, withDayWrite } from "../db/realizedRiskProjection";
 import { riskAudit } from "./riskAudit";
@@ -51,6 +52,7 @@ export class RiskAdmissionService {
       return await session.withTransaction(async (): Promise<EntryAdmissionResult> => {
         const account = await this.models.TradingAccount.findOne(this.scope).session(session);
         riskAssert(account && account.get("broker") === "PAPER" && account.get("admissionStatus") === "PAPER_READY", "ACCOUNT_NOT_READY");
+        await assertAccountReconciliationIndexes(this.connection, plain(account));
         const intent = await this.models.OrderIntent.findOne({ ...this.scope, intentId }).session(session);
         riskAssert(intent, "INTENT_NOT_FOUND"); riskAssert(intent.get("purpose") === "ENTRY", "ENTRY_ONLY");
         const position = await this.models.Position.findOne({ ...this.scope, entryIntentId: intentId }).session(session);
@@ -87,6 +89,7 @@ export class RiskAdmissionService {
           return { status: "AUTHORIZED", intentId, reservationId: existing.get("reservationId"),
             orderIds: children.map(child => String(child.get("orderId"))).sort(), requiredRiskMinor: requirement.requiredRiskMinor };
         }
+        riskAssert(await reconciliationAdmissionHealthy(this.connection, session, this.scope, plain(account)), "RECONCILIATION_REQUIRED");
         riskAssert(["CREATED", "RISK_PENDING"].includes(intent.get("state")) && !children.length
           && position.get("lifecycle") === "PENDING_ENTRY" && position.get("integrity") === "CONSISTENT"
           && position.get("activeCloseIntentId") === null, "STALE_EXECUTION_CHAIN");

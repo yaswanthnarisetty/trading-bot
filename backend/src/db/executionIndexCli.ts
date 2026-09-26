@@ -1,18 +1,19 @@
 import mongoose from "mongoose";
 import { requiredExecutionIndexes, verifyExecutionIndexes } from "./executionIndexes";
-import { createExecutionIndexes } from "./executionModels";
+import { createExecutionIndexes, type ExecutionIndexGroup } from "./executionModels";
 
 async function main(): Promise<void> {
-  const action = process.argv[2];
-  if (action === "list") { console.log(JSON.stringify(requiredExecutionIndexes(), null, 2)); return; }
-  if (!["verify", "provision"].includes(action)) throw new Error("Usage: execution:indexes list|verify|provision");
+  const action = process.argv[2], group = (process.argv[3] ?? "ALL") as ExecutionIndexGroup;
+  if (!["BASE", "RECONCILIATION", "ALL"].includes(group)) throw new Error("Invalid index group");
+  if (action === "list") { console.log(JSON.stringify(requiredExecutionIndexes(group), null, 2)); return; }
+  if (!["verify", "provision"].includes(action)) throw new Error("Usage: execution:indexes list|verify|provision [BASE|RECONCILIATION|ALL]");
   const uri = process.env.EXECUTION_MONGO_URI;
   if (!uri) throw new Error("EXECUTION_MONGO_URI must explicitly select the database; application .env is never loaded");
   const connection = mongoose.createConnection(uri, { serverSelectionTimeoutMS: 5000 });
   try {
     await connection.asPromise();
-    if (action === "provision") await createExecutionIndexes(connection);
-    const result = await verifyExecutionIndexes(connection);
+    if (action === "provision") await createExecutionIndexes(connection, group);
+    const result = await verifyExecutionIndexes(connection, group);
     console.log(JSON.stringify(result, null, 2));
     if (!result.verified) process.exitCode = 1;
   } finally { await connection.close(); }
