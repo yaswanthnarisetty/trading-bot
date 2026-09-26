@@ -11,6 +11,8 @@ import {
   generateOptionChain,
 } from "./MockDataService";
 import { logger } from "../utils/logger";
+import { BrokerReadError, classifyKiteReadError, kiteIdentity, kiteReadPaths, kiteResponseData,
+  type KiteReadSession } from "../brokers/KiteReadOnlyAdapter";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -157,6 +159,31 @@ export function getAuthHeader(): Record<string, string> {
     "X-Kite-Version": "3",
     Authorization: `token ${apiKey}:${accessToken}`,
   };
+}
+
+/** Explicit read-only capability; reuses this client's transport and supported auth.
+ * A captured credential pair cannot silently switch accounts during a snapshot.
+ * The optional dependencies permit offline tests without any broker account.
+ * No legacy mock fallback, raw error logging, automatic refresh or execution access.
+ */
+export async function createKiteReadSession(expectedAccountId: string,
+  client: Pick<AxiosInstance, "get"> = getClient(), headers: () => Record<string, string> = getAuthHeader): Promise<KiteReadSession> {
+  const brokerAccountId = kiteIdentity.parse(expectedAccountId);
+  const captured: Record<string, string> = { ...headers(), ...VERSION_HEADER };
+  if (!/^token [^:\s]+:[^:\s]+$/.test(captured.Authorization ?? "")) throw new BrokerReadError("AUTHENTICATION_FAILED");
+  const read = async (path: string) => {
+    try { return (await client.get(path, { headers: { ...captured } })).data as unknown; }
+    catch (error) { const safe = classifyKiteReadError(error); throw new BrokerReadError(safe.code, safe.httpStatus); }
+  };
+  try {
+    const profile = kiteResponseData(await read("/user/profile"));
+    if (!profile || typeof profile !== "object" || !("user_id" in profile)
+      || profile.user_id !== brokerAccountId) throw new BrokerReadError("AUTHENTICATION_FAILED");
+  } catch (error) { const safe = classifyKiteReadError(error); throw new BrokerReadError(safe.code, safe.httpStatus); }
+  return Object.freeze({ brokerAccountId, async get(path) {
+    if (!kiteReadPaths.includes(path)) throw new BrokerReadError("INVALID_RESPONSE");
+    return read(path);
+  } } satisfies KiteReadSession);
 }
 
 /**
