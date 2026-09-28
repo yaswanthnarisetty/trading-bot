@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { withExecutionHost } from "../db/executionHost";
+import { validateExecutionHost, type ExecutionHostContext } from "../domain/ExecutionHostContext";
 import type { ClientSession, Connection, Document } from "mongoose";
 import { executionScopeSchema, identifierSchema, type ExecutionScope } from "@trading-bot/shared";
 import { PaperBrokerAdapter } from "../brokers/PaperBrokerAdapter";
@@ -30,15 +32,16 @@ export class OrderManager {
   private readonly scope: ExecutionScope;
   private readonly models;
   constructor(private readonly connection: Connection, scope: ExecutionScope,
-    private readonly broker: PaperBrokerAdapter, private readonly clock: () => Date = () => new Date()) {
+    private readonly broker: PaperBrokerAdapter, private readonly clock: () => Date = () => new Date(), private readonly host?: ExecutionHostContext) {
     this.scope = executionScopeSchema.parse(scope);
     if (this.scope.executionMode !== "PAPER" || !(broker instanceof PaperBrokerAdapter)) throw new Error("PAPER_ONLY");
+    validateExecutionHost(host);
     this.models = executionModels(connection);
   }
   private async transaction<T>(work: (session: ClientSession) => Promise<T>): Promise<T> {
     const session = await this.connection.startSession();
     try {
-      return await session.withTransaction(() => work(session), { readConcern: { level: "snapshot" }, writeConcern: { w: "majority" } });
+      return await session.withTransaction(() => withExecutionHost(session, this.host, () => work(session)), { readConcern: { level: "snapshot" }, writeConcern: { w: "majority" } });
     } finally { await session.endSession(); }
   }
   private async save(order: Document, session: ClientSession): Promise<void> {

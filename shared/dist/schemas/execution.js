@@ -49,6 +49,7 @@ exports.tradingEventTypeSchema = zod_1.z.enum([
     "FILL_RECEIVED", "POSITION_PARTIALLY_OPENED", "POSITION_OPENED",
     "POSITION_CLOSE_REQUESTED", "POSITION_PARTIALLY_CLOSED", "POSITION_CLOSED",
     "RESERVATION_RELEASED", "RECONCILIATION_MISMATCH", "RECONCILIATION_RESOLVED",
+    "RECOVERY_REQUIRED", "RECOVERY_READY",
     "ACCOUNT_HALTED", "ACCOUNT_RESUMED",
 ]);
 exports.aggregateTypeSchema = zod_1.z.enum([
@@ -56,6 +57,8 @@ exports.aggregateTypeSchema = zod_1.z.enum([
     "BrokerOrder", "Fill", "Position",
 ]);
 exports.eventPayloadSchema = zod_1.z.discriminatedUnion("kind", [
+    zod_1.z.object({ kind: zod_1.z.literal("RECOVERY"), generation: exports.quantityUnitsSchema.refine(n => n > 0),
+        startupId: exports.identifierSchema.optional(), commandKey: exports.identifierSchema, recordId: exports.identifierSchema.nullable() }).strict(),
     zod_1.z.object({ kind: zod_1.z.literal("DAILY_PNL"), fillId: exports.identifierSchema, positionId: exports.identifierSchema,
         tradingDay: exports.tradingDateSchema.nullable(), realizedPnlMinor: exports.moneyMinorSchema, dailyRealizedPnlMinor: exports.moneyMinorSchema }).strict(),
     zod_1.z.object({ kind: zod_1.z.literal("TRADING_DAY"), from: exports.tradingDateSchema.nullable(), to: exports.tradingDateSchema,
@@ -93,6 +96,11 @@ exports.tradingEventSchema = zod_1.z.object({
     occurredAt: zod_1.z.string().datetime(), recordedAt: zod_1.z.string().datetime(),
     reason: exports.identifierSchema, evidenceRefs: zod_1.z.array(exports.identifierSchema), payload: exports.eventPayloadSchema,
 }).strict().superRefine((event, ctx) => {
+    if (["RECOVERY_REQUIRED", "RECOVERY_READY"].includes(event.eventType)
+        && (event.payload.kind !== "RECOVERY" || event.aggregateType !== "TradingAccount" || event.aggregateId !== event.accountId
+            || (event.payload.kind === "RECOVERY" && ((event.eventType === "RECOVERY_READY") !== (event.payload.recordId !== null)))
+            || event.evidenceRefs.length === 0))
+        ctx.addIssue({ code: "custom", message: "Recovery event requires typed generation and transition evidence" });
     if (!exports.executionScopeSchema.safeParse({ accountId: event.accountId, executionMode: event.executionMode }).success) {
         ctx.addIssue({ code: "custom", message: "Invalid execution scope" });
     }

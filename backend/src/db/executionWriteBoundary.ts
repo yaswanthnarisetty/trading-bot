@@ -1,4 +1,8 @@
 import { reconciliationWriteAllowed } from "./reconciliationWrite";
+import { recoveryWriteAllowed } from "./recoveryWrite";
+import { executionHostFor } from "./executionHost";
+import { requireExecutionHost } from "../domain/ExecutionHostContext";
+import { recoveryStateSchema, recoveryBeginId, recoveryReadyId } from "../domain/recovery";
 import { reconciliationAdmissionHealthy, assertAccountReconciliationIndexes } from "./reconciliationAdmission";
 import { canonical, reconciliationConfigSchema, reconciliationLinkSchema, orderKey, fingerprint, istDay } from "../domain/reconciliation";
 import type { ClientSession, Connection } from "mongoose";
@@ -73,6 +77,10 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
     if (previous?.reconciliationConfig && canonical(previous.reconciliationConfig) !== canonical(data.reconciliationConfig)) throw new Error("RECONCILIATION_CONFIG_IMMUTABLE");
     if (canonical(previous?.reconciliationState) !== canonical(data.reconciliationState) && !reconciliationWriteAllowed(session))
       throw new Error("AUDITED_RECONCILIATION_SERVICE_REQUIRED");
+    if (canonical(previous?.recoveryState) !== canonical(data.recoveryState)) {
+      if (!recoveryWriteAllowed(session)) throw new Error("AUDITED_RECOVERY_SERVICE_REQUIRED");
+      equal(recoveryStateSchema.parse(data.recoveryState).startupId, requireExecutionHost(executionHostFor(session)).startupId, "recovery host");
+    }
     if (previous?.dailyTradingDay && (!data.dailyTradingDay || String(data.dailyTradingDay) < previous.dailyTradingDay)) throw new Error("TRADING_DAY_REGRESSION");
     if (previous && previous.dailyTradingDay !== data.dailyTradingDay && !dayWriteAllowed(session)) throw new Error("AUDITED_TRADING_DAY_SERVICE_REQUIRED");
     if (previous && (Boolean(previous.killSwitchEnabled) !== data.killSwitchEnabled
@@ -113,6 +121,10 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
     const state = z.record(z.unknown()).parse(account.reconciliationState), report = z.record(z.unknown()).parse(data.report);
     equal(state.recordId, data.recordId, "current reconciliation record");
     equal(state.classification, report.classification, "reconciliation classification");
+    const recovery = account.recoveryState === undefined ? undefined : recoveryStateSchema.parse(account.recoveryState);
+    equal(report.recoveryGeneration, recovery?.generation, "reconciliation recovery generation");
+    equal(report.recoveryStartupId, recovery?.startupId, "reconciliation recovery host");
+    if (recovery) equal(recovery.startupId, requireExecutionHost(executionHostFor(session)).startupId, "reconciliation current host");
   } else if (name === "execution_reconciliation_links") {
     const config = reconciliationConfigSchema.parse(account.reconciliationConfig), link = reconciliationLinkSchema.parse(data.link);
     equal(data.brokerAccountId, config.brokerAccountId, "shadow link account");
@@ -350,6 +362,21 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
       if (data.lifecycle === "CLOSED" && previous?.lifecycle !== "CLOSED") equal(data.integrity, "CONSISTENT", "closure integrity");
     }
   } else if (name === "execution_events") {
+    if (["RECOVERY_REQUIRED", "RECOVERY_READY"].includes(String(data.eventType))) {
+      if (!recoveryWriteAllowed(session)) throw new Error("AUDITED_RECOVERY_SERVICE_REQUIRED");
+      const state = recoveryStateSchema.parse(account.recoveryState), payload = z.record(z.unknown()).parse(data.payload);
+      const ready = data.eventType === "RECOVERY_READY";
+      equal(state.status, ready ? "READY" : "RECOVERY_REQUIRED", "recovery transition");
+      equal(payload.kind, "RECOVERY", "recovery payload"); equal(payload.generation, state.generation, "recovery generation");
+      equal(payload.commandKey, state.commandKey, "recovery command");
+      const { startupId } = requireExecutionHost(executionHostFor(session));
+      equal(state.startupId, startupId, "recovery event host"); equal(payload.startupId, startupId, "recovery payload host");
+      equal(data.eventId, ready ? recoveryReadyId(scope.accountId, state.generation) : recoveryBeginId(scope.accountId, state.commandKey, startupId), "recovery event identity");
+      equal(payload.recordId, state.status === "READY" ? state.recordId : null, "recovery proof");
+      equal(data.aggregateType, "TradingAccount", "recovery aggregate"); equal(data.aggregateId, scope.accountId, "recovery account");
+      equal(data.causationId, state.status === "READY" ? state.recordId : state.commandKey, "recovery causation");
+      equal(data.reason, state.status, "recovery reason");
+    }
     if (["RECONCILIATION_RESOLVED", "RECONCILIATION_MISMATCH"].includes(String(data.eventType))) {
       if (!reconciliationWriteAllowed(session)) throw new Error("AUDITED_RECONCILIATION_SERVICE_REQUIRED");
       const record = await find("execution_reconciliations", "recordId", data.causationId);

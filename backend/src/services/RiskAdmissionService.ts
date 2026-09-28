@@ -1,4 +1,6 @@
-import { reconciliationAdmissionHealthy, assertAccountReconciliationIndexes } from "../db/reconciliationAdmission";
+import { reconciliationAdmissionHealthy, assertAccountReconciliationIndexes, assertCurrentRecoveryHost } from "../db/reconciliationAdmission";
+import { withExecutionHost } from "../db/executionHost";
+import { validateExecutionHost, type ExecutionHostContext } from "../domain/ExecutionHostContext";
 import { dailyLossReached } from "../domain/realizedRisk";
 import { assertRealizedProjection, currentDailyState, loadRealizedProjection, withDayWrite } from "../db/realizedRiskProjection";
 import { riskAudit } from "./riskAudit";
@@ -25,9 +27,11 @@ const plain = (doc: Document): Record<string, unknown> => doc.toObject();
 export class RiskAdmissionService {
   private readonly scope: ExecutionScope;
   private readonly models;
-  constructor(private readonly connection: Connection, scope: ExecutionScope, private readonly clock: () => Date = () => new Date()) {
+  constructor(private readonly connection: Connection, scope: ExecutionScope, private readonly clock: () => Date = () => new Date(),
+    private readonly host?: ExecutionHostContext) {
     this.scope = executionScopeSchema.parse(scope);
     if (this.scope.executionMode !== "PAPER") throw new Error("PAPER_ONLY");
+    validateExecutionHost(host);
     this.models = executionModels(connection);
   }
   private async save(doc: Document, session: ClientSession) {
@@ -49,10 +53,11 @@ export class RiskAdmissionService {
     await assertExecutionIndexes(this.connection);
     const session = await this.connection.startSession();
     try {
-      return await session.withTransaction(async (): Promise<EntryAdmissionResult> => {
+      return await session.withTransaction(() => withExecutionHost(session, this.host, async (): Promise<EntryAdmissionResult> => {
         const account = await this.models.TradingAccount.findOne(this.scope).session(session);
         riskAssert(account && account.get("broker") === "PAPER" && account.get("admissionStatus") === "PAPER_READY", "ACCOUNT_NOT_READY");
         await assertAccountReconciliationIndexes(this.connection, plain(account));
+        assertCurrentRecoveryHost(plain(account), this.host);
         const intent = await this.models.OrderIntent.findOne({ ...this.scope, intentId }).session(session);
         riskAssert(intent, "INTENT_NOT_FOUND"); riskAssert(intent.get("purpose") === "ENTRY", "ENTRY_ONLY");
         const position = await this.models.Position.findOne({ ...this.scope, entryIntentId: intentId }).session(session);
@@ -153,7 +158,7 @@ export class RiskAdmissionService {
           reason: "QUALIFIED_LOCAL_DAY", tradingDate: daily.dailyTradingDay, evidenceRefs: [reservationId],
           payload: { kind: "TRADING_DAY", from: fromDay, to: daily.dailyTradingDay, realizedPnlMinor: daily.dailyRealizedPnlMinor } });
         return { status: "AUTHORIZED", intentId, reservationId, orderIds: orderIds.sort(), requiredRiskMinor: requirement.requiredRiskMinor };
-      }, { readConcern: { level: "snapshot" }, writeConcern: { w: "majority" } });
+      }), { readConcern: { level: "snapshot" }, writeConcern: { w: "majority" } });
     } catch (error) {
       if (error instanceof EntryRiskError) return { status: "REJECTED", intentId, reason: error.reason };
       throw error; // Persistence failures abort; never disguise them as a successful risk decision.

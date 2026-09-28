@@ -60,6 +60,7 @@ export const tradingEventTypeSchema = z.enum([
   "FILL_RECEIVED", "POSITION_PARTIALLY_OPENED", "POSITION_OPENED",
   "POSITION_CLOSE_REQUESTED", "POSITION_PARTIALLY_CLOSED", "POSITION_CLOSED",
   "RESERVATION_RELEASED", "RECONCILIATION_MISMATCH", "RECONCILIATION_RESOLVED",
+  "RECOVERY_REQUIRED", "RECOVERY_READY",
   "ACCOUNT_HALTED", "ACCOUNT_RESUMED",
 ]);
 export const aggregateTypeSchema = z.enum([
@@ -67,6 +68,8 @@ export const aggregateTypeSchema = z.enum([
   "BrokerOrder", "Fill", "Position",
 ]);
 export const eventPayloadSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("RECOVERY"), generation: quantityUnitsSchema.refine(n => n > 0),
+    startupId: identifierSchema.optional(), commandKey: identifierSchema, recordId: identifierSchema.nullable() }).strict(),
   z.object({ kind: z.literal("DAILY_PNL"), fillId: identifierSchema, positionId: identifierSchema,
     tradingDay: tradingDateSchema.nullable(), realizedPnlMinor: moneyMinorSchema, dailyRealizedPnlMinor: moneyMinorSchema }).strict(),
   z.object({ kind: z.literal("TRADING_DAY"), from: tradingDateSchema.nullable(), to: tradingDateSchema,
@@ -104,6 +107,10 @@ export const tradingEventSchema = z.object({
   occurredAt: z.string().datetime(), recordedAt: z.string().datetime(),
   reason: identifierSchema, evidenceRefs: z.array(identifierSchema), payload: eventPayloadSchema,
 }).strict().superRefine((event, ctx) => {
+  if (["RECOVERY_REQUIRED", "RECOVERY_READY"].includes(event.eventType)
+    && (event.payload.kind !== "RECOVERY" || event.aggregateType !== "TradingAccount" || event.aggregateId !== event.accountId
+      || (event.payload.kind === "RECOVERY" && ((event.eventType === "RECOVERY_READY") !== (event.payload.recordId !== null)))
+      || event.evidenceRefs.length === 0)) ctx.addIssue({ code: "custom", message: "Recovery event requires typed generation and transition evidence" });
   if (!executionScopeSchema.safeParse({ accountId: event.accountId, executionMode: event.executionMode }).success) {
     ctx.addIssue({ code: "custom", message: "Invalid execution scope" });
   }

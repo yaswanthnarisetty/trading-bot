@@ -1,8 +1,10 @@
+import { createExecutionHostContext } from "../../src/domain/ExecutionHostContext";
 import { verifyExecutionIndexes } from "../../src/db/executionIndexes";
 import { before, after, beforeEach, test } from "node:test";
 import assert from "node:assert/strict";
 import mongoose, { type ClientSession } from "mongoose";
 import { executionModels, createExecutionIndexes } from "../../src/db/executionModels";
+import { RecoveryBarrierService } from "../../src/services/RecoveryBarrierService";
 import { ReconciliationService } from "../../src/services/ReconciliationService";
 import { RiskAdmissionService } from "../../src/services/RiskAdmissionService";
 import { FillProcessor } from "../../src/services/FillProcessor";
@@ -14,18 +16,27 @@ import * as f from "../fixtures";
 const uri = process.env.EXECUTION_TEST_MONGO_URI;
 if (!uri || !new URL(uri).pathname.startsWith("/phase2a_test_")) throw new Error("NOT RUN: isolated real Mongo required");
 const connection = mongoose.createConnection(uri), models = executionModels(connection);
+const host = createExecutionHostContext("test-host");
 let now = new Date(reconciliationTime), ids = 0;
 const clock = () => new Date(now), paperClock = () => new Date(f.now), deadline = new Date(f.now.getTime() + 60000);
 const policy = { policyVersion: 1, maxRiskPerEntryMinor: 1000000, maxReservedRiskMinor: 1000000, maxPositionSlots: 10, maxDailyLossMinor: 1000000 };
-const service = () => new ReconciliationService(connection, f.scope, clock);
-const admission = () => new RiskAdmissionService(connection, f.scope, clock);
+const service = () => new ReconciliationService(connection, f.scope, clock, host);
+const admission = () => new RiskAdmissionService(connection, f.scope, clock, host);
 const processor = () => new FillProcessor(connection, f.scope, paperClock);
-const reconcile = async (options: Parameters<typeof brokerSnapshot>[0] = {}) => service().reconcileAccount(f.scope.accountId, await brokerSnapshot({ time: now, ...options }));
+const reconcile = async (options: Parameters<typeof brokerSnapshot>[0] = {}) => {
+  const result = await service().reconcileAccount(f.scope.accountId, await brokerSnapshot({ time: now, ...options }));
+  if (result.report.classification === "MATCHED" && (await models.TradingAccount.findOne(f.scope).orFail()).get("recoveryState.status") === "RECOVERY_REQUIRED")
+    await new RecoveryBarrierService(connection, f.scope, clock, host).completeRecovery(f.scope.accountId, result.recordId);
+  return result;
+};
 const has = (result: any, code: string) => assert.ok(result.report.discrepancies.some((d: any) => d.code === code), JSON.stringify(result.report));
 async function tx<T>(work: (session: ClientSession) => Promise<T>) { const session = await connection.startSession();
   try { return await session.withTransaction(() => work(session)); } finally { await session.endSession(); } }
 async function configure() { await tx(async session => { const a = await models.TradingAccount.findOne(f.scope).session(session).orFail();
-  a.set("reconciliationConfig", config); await a.save({ session }); }); }
+  a.set("reconciliationConfig", config); await a.save({ session }); });
+  await new RecoveryBarrierService(connection, f.scope, clock, host).beginRecovery(f.scope.accountId, "test-startup");
+  now = new Date(now.getTime() + 1);
+}
 async function seed(id = "1") {
   await tx(async session => {
     await new models.StrategySignal({ ...f.signal(`s-${id}`), decisionKey: `d-${id}`, expiresAt: deadline }).save({ session });
@@ -44,7 +55,7 @@ async function setup(units = 4, ingest = true, linked = true, ownsNetPosition = 
   const orderId = admissionResult.orderIds[0];
   const paper = new PaperBrokerAdapter(f.scope, { clock: { now: () => f.now.toISOString() }, ids: { nextId: kind => `${kind}-${++ids}` },
     scenario: () => ({ submission: "ACCEPTED", steps: units ? [{ kind: "FILL", quantityUnits: units, priceMinor: 900 }] : [] }) });
-  await new OrderManager(connection, f.scope, paper, paperClock).submit(orderId);
+  await new OrderManager(connection, f.scope, paper, paperClock, host).submit(orderId);
   if (units) await paper.advance({ ...f.scope, orderId });
   const trades = await paper.getTrades(f.scope);
   if (ingest && units) await processor().process(trades[0]);
@@ -60,13 +71,15 @@ async function setup(units = 4, ingest = true, linked = true, ownsNetPosition = 
 }
 async function financial() {
   const a = (await models.TradingAccount.findOne().lean())! as Record<string, unknown>;
-  const { version, nextEventSequence, updatedAt, reconciliationState, ...account } = a;
+  const { version, nextEventSequence, updatedAt, reconciliationState, recoveryState, ...account } = a;
   const result: Record<string, unknown> = { account };
   for (const name of ["BrokerOrder", "Fill", "Position", "RiskReservation", "OrderIntent"] as const) result[name] = await models[name].find().sort({ _id: 1 }).lean();
   return result;
 }
 async function all() { const out: Record<string, unknown> = {}; for (const [key, model] of Object.entries(models)) out[key] = await model.find().sort({ _id: 1 }).lean(); return out; }
-async function entryBlocked() { await seed("2"); const r = await admission().authorizeEntry("i-2"); assert.deepEqual(r, { status: "REJECTED", intentId: "i-2", reason: "RECONCILIATION_REQUIRED" }); }
+async function entryBlocked() { await seed("2"); const r = await admission().authorizeEntry("i-2");
+  const ready = (await models.TradingAccount.findOne(f.scope).orFail()).get("recoveryState.status") === "READY";
+  assert.deepEqual(r, { status: "REJECTED", intentId: "i-2", reason: ready ? "RECONCILIATION_REQUIRED" : "RECOVERY_REQUIRED" }); }
 function nextSnapshot() { now = new Date(now.getTime() + 1000); }
 const flat = { orders: false, trades: false, positions: false };
 before(async () => { await connection.asPromise(); });
@@ -103,9 +116,9 @@ test("real reconciliation configured without proof fails closed", async () => { 
 test("real reconciliation discrepancy permits CLOSE with existing finality proof", async () => { await setup(10); await reconcile({ units: 10, position: { quantity: 12 } });
   const close = await new CloseIntentService(connection, f.scope, clock).requestClose("p-1", "close-under-discrepancy"); assert.equal(close.status, "CREATED"); });
 test("real reconciliation discrepancy permits post-dispatch Fill ingestion", async () => { const { trades } = await setup(4, false); await reconcile(); assert.equal((await processor().process(trades[0])).status, "APPLIED"); assert.equal(await models.Fill.countDocuments(), 1); });
-test("real reconciliation same snapshot replay adds no records, events or mutations", async () => { await setup(); const snapshot = await brokerSnapshot(); const first = await service().reconcileAccount(f.scope.accountId, snapshot), before = await all();
+test("real reconciliation same snapshot replay adds no records, events or mutations", async () => { await setup(); const snapshot = await brokerSnapshot({ time: now }); const first = await service().reconcileAccount(f.scope.accountId, snapshot), before = await all();
   assert.deepEqual(await service().reconcileAccount(f.scope.accountId, snapshot), first); assert.deepEqual(await all(), before); });
-test("real reconciliation concurrent same snapshot has one result and unique event sequence", async () => { await setup(); const snapshot = await brokerSnapshot();
+test("real reconciliation concurrent same snapshot has one result and unique event sequence", async () => { await setup(); const snapshot = await brokerSnapshot({ time: now });
   const [a, b] = await Promise.all([service().reconcileAccount(f.scope.accountId, snapshot), service().reconcileAccount(f.scope.accountId, snapshot)]);
   assert.deepEqual(a, b); assert.equal(await models.ReconciliationRecord.countDocuments(), 1);
   const events = await models.TradingEvent.find().lean(); assert.equal(new Set(events.map(e => (e as Record<string, unknown>).accountSequence)).size, events.length);
@@ -113,7 +126,7 @@ test("real reconciliation concurrent same snapshot has one result and unique eve
 test("real reconciliation newer matching snapshot clears block and preserves discrepancy history", async () => { await setup(); const first = await reconcile({ position: { quantity: 8 } }); nextSnapshot(); const second = await reconcile();
   assert.equal(first.report.classification, "DISCREPANCY"); assert.equal(second.report.classification, "MATCHED"); assert.equal(await models.ReconciliationRecord.countDocuments(), 2);
   assert.equal((await models.TradingAccount.findOne().orFail()).get("reconciliationState.recordId"), second.recordId); });
-test("real reconciliation replay of old MATCHED never clears newer discrepancy", async () => { await setup(); const old = await brokerSnapshot(); await service().reconcileAccount(f.scope.accountId, old); nextSnapshot(); const current = await reconcile({ position: { quantity: 8 } });
+test("real reconciliation replay of old MATCHED never clears newer discrepancy", async () => { await setup(); const old = await brokerSnapshot({ time: now }); await service().reconcileAccount(f.scope.accountId, old); nextSnapshot(); const current = await reconcile({ position: { quantity: 8 } });
   await service().reconcileAccount(f.scope.accountId, old); assert.equal((await models.TradingAccount.findOne().orFail()).get("reconciliationState.recordId"), current.recordId); });
 // These barriers pause actual saves; every transaction, conflict, retry and commit uses real Mongo.
 function pauseAccountSave(predicate: (doc: any) => boolean) {
@@ -144,7 +157,7 @@ for (const entity of ["TradingEvent", "TradingAccount", "ReconciliationRecord"] 
   assert.deepEqual(await all(), before);
 });
 test("real reconciliation malformed endpoint evidence remains non-destructive and blocking", async () => { await setup(); const before = await financial(); const r = await reconcile({ trade: { quantity: -1 } }); assert.equal(r.report.classification, "INCOMPLETE"); assert.deepEqual(await financial(), before); });
-test("real reconciliation arbitrary caller snapshots rejected before persistence", async () => { await configure(); const before = await all(), snapshot = await brokerSnapshot();
+test("real reconciliation arbitrary caller snapshots rejected before persistence", async () => { await configure(); const before = await all(), snapshot = await brokerSnapshot({ time: now });
   await assert.rejects(service().reconcileAccount(f.scope.accountId, JSON.parse(JSON.stringify(snapshot))), /NORMALIZED_KITE_SNAPSHOT_REQUIRED/); assert.deepEqual(await all(), before); });
 test("real reconciliation wrong broker account rejected without mutation", async () => { await configure(); const before = await all(); await assert.rejects(reconcile({ account: "OTHER" }), /BROKER_ACCOUNT_MISMATCH/); assert.deepEqual(await all(), before); });
 test("real reconciliation cross-account link references rejected", async () => { await configure(); await assert.rejects(tx(session => new models.ReconciliationLink({ ...f.base(), ...orderLink("foreign-order") }).save({ session })), /LEDGER_REFERENCE_NOT_FOUND/); });
@@ -169,7 +182,7 @@ test("real reconciliation discrepancy fences initial dispatch of already admitte
   await seed(); const admitted = await admission().authorizeEntry("i-1"); assert.equal(admitted.status, "AUTHORIZED");
   if (admitted.status !== "AUTHORIZED") throw new Error("setup admission"); await configure(); await reconcile({ ...flat, fail: "/trades" });
   const paper = new PaperBrokerAdapter(f.scope, { clock: { now: () => f.now.toISOString() }, ids: { nextId: kind => `${kind}-${++ids}` }, scenario: () => ({ submission: "ACCEPTED" }) });
-  await assert.rejects(new OrderManager(connection, f.scope, paper, paperClock).submit(admitted.orderIds[0]), /RECONCILIATION_REQUIRED/);
+  await assert.rejects(new OrderManager(connection, f.scope, paper, paperClock, host).submit(admitted.orderIds[0]), /RECONCILIATION_REQUIRED|RECOVERY_REQUIRED/);
   assert.equal((await paper.getOrders(f.scope)).length, 0); assert.equal((await models.BrokerOrder.findOne().orFail()).get("submissionClaim"), undefined);
 });
 

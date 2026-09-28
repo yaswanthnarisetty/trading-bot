@@ -1,7 +1,9 @@
 # Phase 3B: explicit read-only Kite reconciliation
 
-`new ReconciliationService(connection, paperScope).reconcileAccount(accountId, snapshot)`
+`new ReconciliationService(connection, paperScope, clock, host).reconcileAccount(accountId, snapshot)`
 compares immutable `KiteReadOnlyAdapter.getSnapshot()` evidence without calling a broker.
+`host` is the immutable context created once by bootstrap and shared with admission,
+submission and recovery services. Enabled operation requires it.
 There is no bootstrap, route, timer, recovery loop or execution adapter.
 
 ## Explicit PAPER reference-only scope
@@ -111,8 +113,14 @@ forces stale admission to retry; a winning Fill forces reconciliation to retry c
 Every record identifies the internal state compared, without claiming perpetual synchronization.
 Failed account/record/event saves roll back all effects.
 
-Opted-in accounts require a version-2 REFERENCE_ONLY MATCHED record and its durable
+Opted-in accounts require the Phase 3C durable recovery barrier to be READY and a
+version-2 REFERENCE_ONLY MATCHED record for that recovery generation and current host startup,
+with its durable
 RECONCILIATION_RESOLVED event for new ENTRY. Missing/incomplete/contradictory proof blocks.
+Old-host READY/MATCHED proof cannot authorize a new host, even if beginRecovery is omitted.
+Reconciliation report/run identity binds both startup and generation; a pre-begin report
+cannot complete the later cycle. See [RecoveryBarrierService](./RecoveryBarrierService.md)
+for the explicit startup sequence.
 RECONCILIATION_MISMATCH events retain the precise classification and typed reference.
 The boundary also guards new ENTRY reservations and initial dispatch. Existing admission
 replay remains idempotent but cannot bypass dispatch gating. CLOSE and already-dispatched
@@ -141,6 +149,6 @@ index dropping or constraint weakening is added.
 
 ## Deferred
 
-Phase 3C: startup barriers, recovery orchestration, polling, archived history proof, UNKNOWN
-resolution automation, Fill recovery, position/reservation repair and external-order adoption.
+Polling, archived history proof, UNKNOWN resolution automation, Fill recovery,
+position/reservation repair and external-order adoption remain deferred.
 No Kite writes, LIVE execution, SELL entry, Redis or SignalLoop/PaperTrade integration.

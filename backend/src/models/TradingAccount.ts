@@ -1,4 +1,5 @@
 import { reconciliationConfigSchema, reconciliationStateSchema } from "../domain/reconciliation";
+import { recoveryStateSchema } from "../domain/recovery";
 import { tradingCalendarSchema, pnlDaysSchema } from "../domain/realizedRisk";
 import { tradingDateSchema, identifierSchema } from "@trading-bot/shared";
 import { z } from "zod";
@@ -12,6 +13,7 @@ export const TradingAccountSchema = executionSchema({
   // Explicit opt-in to comparison only; never changes PAPER broker ownership.
   reconciliationConfig: { type: Schema.Types.Mixed },
   reconciliationState: { type: Schema.Types.Mixed },
+  recoveryState: { type: Schema.Types.Mixed },
   currency: { type: String, enum: ["INR"], required: true, immutable: true },
   admissionStatus: { type: String, enum: ["DISABLED", "RECOVERING", "HALTED", "PAPER_READY"], required: true, default: "DISABLED" },
   // Explicit opt-in for isolated PAPER submission only; no LIVE readiness or credentials.
@@ -33,6 +35,9 @@ writeOnceFields(TradingAccountSchema, ["riskTradingCalendar", "reconciliationCon
 TradingAccountSchema.index({ accountId: 1 }, { unique: true });
 TradingAccountSchema.index({ broker: 1, brokerAccountRef: 1, executionMode: 1 }, { unique: true });
 TradingAccountSchema.pre("validate", function () {
+  if (this.get("recoveryState") !== undefined && (this.get("reconciliationConfig") === undefined
+    || this.get("executionMode") !== "PAPER" || !recoveryStateSchema.safeParse(this.get("recoveryState")).success))
+    this.invalidate("recoveryState", "Valid explicit PAPER reconciliation recovery required");
   if (this.get("reconciliationConfig") !== undefined && (this.get("executionMode") !== "PAPER"
     || !reconciliationConfigSchema.safeParse(this.get("reconciliationConfig")).success)) this.invalidate("reconciliationConfig", "Explicit PAPER shadow account required");
   if (this.get("reconciliationState") !== undefined && !reconciliationStateSchema.safeParse(this.get("reconciliationState")).success)

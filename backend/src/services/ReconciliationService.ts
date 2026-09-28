@@ -6,8 +6,12 @@ import { assertKiteAccountSnapshot, type BrokerAccountSnapshot } from "../broker
 import { executionModels } from "../db/executionModels";
 import { assertExecutionIndexes } from "../db/executionIndexes";
 import { withReconciliationWrite } from "../db/reconciliationWrite";
-import { compareReconciliation, fingerprint, istDay, reconciliationConfigSchema, reconciliationStateSchema, type ReconciliationLink } from "../domain/reconciliation";
+import { compareReconciliation, fingerprint, istDay, reconciliationConfigSchema, reconciliationStateSchema } from "../domain/reconciliation";
 import { saveRisk } from "./riskAudit";
+import { loadReconciliationLedger } from "../db/reconciliationLedger";
+import { recoveryStateSchema } from "../domain/recovery";
+import { withExecutionHost } from "../db/executionHost";
+import { requireExecutionHost, validateExecutionHost, type ExecutionHostContext } from "../domain/ExecutionHostContext";
 
 export interface ReconciliationResult { recordId: string; snapshotId: string; runKey: string; report: z.infer<typeof reconciliationReportSchema> }
 
@@ -15,9 +19,11 @@ export interface ReconciliationResult { recordId: string; snapshotId: string; ru
 export class ReconciliationService {
   private readonly scope: ExecutionScope;
   private readonly models;
-  constructor(private readonly connection: Connection, scope: ExecutionScope, private readonly clock: () => Date = () => new Date()) {
+  constructor(private readonly connection: Connection, scope: ExecutionScope, private readonly clock: () => Date = () => new Date(),
+    private readonly host?: ExecutionHostContext) {
     this.scope = executionScopeSchema.parse(scope);
     if (this.scope.executionMode !== "PAPER") throw new Error("PAPER_ONLY");
+    validateExecutionHost(host);
     this.models = executionModels(connection);
   }
   async reconcileAccount(accountId: string, snapshot: BrokerAccountSnapshot): Promise<ReconciliationResult> {
@@ -27,29 +33,34 @@ export class ReconciliationService {
     await assertExecutionIndexes(this.connection, "ALL");
     const session = await this.connection.startSession();
     try {
-      return await session.withTransaction(async () => {
+      return await session.withTransaction(() => withExecutionHost(session, this.host, async () => {
         const account = await this.models.TradingAccount.findOne(this.scope).session(session).orFail();
         const config = reconciliationConfigSchema.parse(account.get("reconciliationConfig"));
+        const { startupId } = requireExecutionHost(this.host);
         if (config.brokerAccountId !== snapshot.brokerAccountId) throw new Error("BROKER_ACCOUNT_MISMATCH");
-        const orders = await this.models.BrokerOrder.find(this.scope).sort({ orderId: 1 }).session(session).lean();
-        const fills = await this.models.Fill.find(this.scope).sort({ fillId: 1 }).session(session).lean();
-        const positions = await this.models.Position.find(this.scope).sort({ positionId: 1 }).session(session).lean();
-        const links = await this.models.ReconciliationLink.find(this.scope).sort({ linkId: 1 }).session(session).lean();
-        const ledger = { orders, fills, positions, links: links as unknown as ReconciliationLink[] };
+        const ledger = await loadReconciliationLedger(this.connection, session, this.scope);
+        const recovery = account.get("recoveryState") === undefined ? undefined : recoveryStateSchema.parse(account.get("recoveryState"));
+        if (recovery && recovery.startupId !== startupId) throw new Error("RECOVERY_HOST_MISMATCH");
         // Account CAS/event counters are deliberately excluded: reconciliation itself
         // must not change the identity of the state it has just compared.
         const internalFingerprint = fingerprint({ config, ledger });
-        const runKey = fingerprint([this.scope, snapshotId, internalFingerprint, 2]);
+        const runKey = fingerprint([this.scope, snapshotId, internalFingerprint, 2, recovery?.generation ?? 0, startupId]);
         const existing = await this.models.ReconciliationRecord.findOne({ ...this.scope, runKey }).session(session);
         if (existing) return existing.toObject() as unknown as ReconciliationResult; // Historical replay never clears newer blocking state.
         const prior = account.get("reconciliationState");
         const comparison = compareReconciliation(accountId, config.brokerAccountId, snapshot, ledger, this.clock(),
           prior === undefined ? undefined : reconciliationStateSchema.parse(prior));
+        if (recovery && snapshot.startedAt <= recovery.requiredAt) {
+          comparison.classification = "INCOMPLETE";
+          comparison.discrepancies.push({ code: "SNAPSHOT_TIME_UNRESOLVED", reference: snapshot.startedAt,
+            expected: `after recovery ${recovery.generation}: ${recovery.requiredAt}` });
+        }
         const recordId = `reconciliation:${runKey}`, completedAt = this.clock();
         const endpoints = [snapshot.orders, snapshot.trades, snapshot.positions, snapshot.funds].map(e => ({
           endpoint: e.endpoint, fetchedAt: e.fetchedAt, availability: e.availability,
           ...(e.availability === "UNAVAILABLE" ? { errorCode: e.error.code } : {}) }));
         const report = { ...comparison, normalizationVersion: 1, reconciliationVersion: 2, scope: config.scope, scopeKind: config.kind,
+          ...(recovery ? { recoveryGeneration: recovery.generation, recoveryStartupId: startupId } : {}),
           snapshotStartedAt: snapshot.startedAt, snapshotFetchedAt: snapshot.fetchedAt, internalFingerprint,
           internalAccountVersion: account.get("version"), endpoints };
         const sequence = account.get("nextEventSequence");
@@ -79,7 +90,7 @@ export class ReconciliationService {
             payload: { kind: "REFERENCE", entityId: recordId } }).save({ session });
           return record.toObject() as unknown as ReconciliationResult;
         });
-      }, { readConcern: { level: "snapshot" }, writeConcern: { w: "majority" } });
+      }), { readConcern: { level: "snapshot" }, writeConcern: { w: "majority" } });
     } finally { await session.endSession(); }
   }
 }

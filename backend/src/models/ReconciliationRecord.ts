@@ -4,6 +4,9 @@ import { executionSchema, idField, identityIndexes } from "./executionSupport";
 import { classificationSchema, discrepancySchema } from "../domain/reconciliation";
 export const reconciliationReportSchema = z.object({
   normalizationVersion: z.literal(1), reconciliationVersion: z.literal(2), scope: z.literal("REFERENCE_ONLY"), scopeKind: z.literal("PAPER_KITE_SHADOW_V1"),
+  // Historical pre-recovery records remain readable, but cannot complete a generation.
+  recoveryGeneration: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
+  recoveryStartupId: z.string().min(1).max(200).optional(),
   classification: classificationSchema, discrepancies: z.array(discrepancySchema),
   snapshotStartedAt: z.string().datetime(), snapshotFetchedAt: z.string().datetime(),
   internalFingerprint: z.string().regex(/^[a-f0-9]{64}$/), internalAccountVersion: z.number().int().nonnegative(),

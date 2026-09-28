@@ -25,7 +25,7 @@ export const entryPlanSchema = z.object({
 const targetsSchema = z.array(z.object({
   legId: identifierSchema, contractKey: identifierSchema, side: z.enum(["BUY", "SELL"]), targetUnits: positive,
 })).min(1);
-export type EntryRiskReason = "RECONCILIATION_REQUIRED" | "INVALID_RISK_ECONOMICS" | "UNSUPPORTED_RISK_SHAPE" | "RISK_ARITHMETIC_OVERFLOW"
+export type EntryRiskReason = "RECOVERY_REQUIRED" | "RECONCILIATION_REQUIRED" | "INVALID_RISK_ECONOMICS" | "UNSUPPORTED_RISK_SHAPE" | "RISK_ARITHMETIC_OVERFLOW"
   | "RISK_PER_TRADE_EXCEEDED" | "RISK_CAPACITY_EXCEEDED" | "POSITION_LIMIT_EXCEEDED"
   | "ACCOUNT_NOT_READY" | "RISK_POLICY_REQUIRED" | "INTENT_NOT_FOUND" | "ENTRY_ONLY"
   | "STALE_EXECUTION_CHAIN" | "RISK_PROJECTION_MISMATCH" | "UNSUPPORTED_ACCOUNT_EXPOSURE"
