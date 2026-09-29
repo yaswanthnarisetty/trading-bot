@@ -95,6 +95,16 @@ export function isMarketAnalyticsFresh(snapshot: MarketAnalyticsSnapshot, now: n
     && proof.exchangeAtMs.every(timestamp => fresh(timestamp, proof.maxAgeMs))
     && fresh(proof.lastFinalizedAtMs, proof.candleIntervalMs + proof.maxAgeMs);
 }
+/** Inclusive upper bound of the issued proof. MOCK has no real-market freshness authority. */
+export function marketEvidenceExpiry(snapshot: MarketAnalyticsSnapshot): number | null {
+  assertMarketAnalytics(snapshot);
+  if (snapshot.dataMode === "MOCK") return null;
+  const proof = realFreshness.get(snapshot);
+  if (!proof) throw new Error("INVALID_MARKET_EVIDENCE");
+  return Math.min(...proof.fetchedAtMs.map(t => t + proof.maxAgeMs),
+    ...proof.exchangeAtMs.map(t => t + proof.maxAgeMs),
+    proof.lastFinalizedAtMs + proof.candleIntervalMs + proof.maxAgeMs);
+}
 const unavailable = (reason: AnalyticsFailure): AnalyticsOutcome => freeze({ available: false, reason });
 const minor = (n: number) => Number.isSafeInteger(n) && n > 0;
 const units = (n: number) => Number.isSafeInteger(n) && n >= 0;

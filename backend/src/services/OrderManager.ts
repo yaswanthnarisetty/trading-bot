@@ -1,3 +1,5 @@
+import { permitExitClaim } from "../db/paperExitStore";
+import { assertEntryTemporalAuthorization } from "../domain/entryRisk";
 import { riskAudit } from "./riskAudit";
 import { randomUUID } from "node:crypto";
 import { withExecutionHost } from "../db/executionHost";
@@ -64,7 +66,7 @@ export class OrderManager {
       occurredAt: now, recordedAt: now, reason: eventType, evidenceRefs: [evidenceRef],
       payload: { kind: "STATE_CHANGE", from, to: order.get("phase") } }).save({ session });
   }
-  private async claim(orderId: string): Promise<{ claimed: boolean; state: SubmissionState; request?: BrokerOrderRequest }> {
+  private async claim(orderId: string, guard?: (session: ClientSession, order: Document) => Promise<void>): Promise<{ claimed: boolean; state: SubmissionState; request?: BrokerOrderRequest }> {
     if (!(await checkTransactionCapability(this.connection)).supported) throw new Error("PERSISTENCE_NOT_READY");
     await assertExecutionIndexes(this.connection);
     const claimId = randomUUID();
@@ -77,7 +79,12 @@ export class OrderManager {
       if (!authorization) throw new Error("AUTHORIZATION_REQUIRED");
       const [, intent, reservation] = await loadExecutionChain(this.connection, session, this.scope,
         [{ entity: "OrderIntent", id: order.get("intentId") }, { entity: "RiskReservation", id: authorization.reservationId }]);
+      if (order.get("closePlan.monitorDecisionId")) {
+        if (!guard) throw new Error("EXIT_AUTHORIZATION_REQUIRED");
+        await guard(session, order); permitExitClaim(session, orderId);
+      }
       const now = this.clock();
+      if (intent.get("purpose") === "ENTRY") assertEntryTemporalAuthorization(intent.get("entryPlan"), now);
       if (intent.get("purpose") === "ENTRY" && account.get("killSwitchEnabled")) throw new Error("KILL_SWITCH_ACTIVE");
       if (!["RISK_RESERVED", "EXECUTING"].includes(intent.get("state")) || !["HELD", "PARTIALLY_CONSUMED"].includes(reservation.get("state"))
         || authorization.expiresAt.getTime() <= now.getTime() || intent.get("deadline").getTime() <= now.getTime()
@@ -102,6 +109,8 @@ export class OrderManager {
         intent.set("state", next.value); await this.save(intent, session);
       }
       await this.audit(order, "SUBMISSION_CLAIMED", "READY", authorization.evidenceRef, session);
+      if (intent.get("purpose") === "ENTRY") assertEntryTemporalAuthorization(intent.get("entryPlan"), this.clock());
+      if (order.get("closePlan.monitorDecisionId")) await guard!(session, order);
       return { claimed: true, state: stateOf(order), request };
     });
   }
@@ -159,10 +168,10 @@ export class OrderManager {
       return stateOf(order);
     });
   }
-  async submit(input: string): Promise<SubmissionResult> {
+  async submit(input: string, guard?: (session: ClientSession, order: Document) => Promise<void>): Promise<SubmissionResult> {
     const orderId = identifierSchema.parse(input);
     let claim: Awaited<ReturnType<OrderManager["claim"]>>;
-    try { claim = await this.claim(orderId); }
+    try { claim = await this.claim(orderId, guard); }
     catch (error) {
       // An uncertain commit is never permission to send. No physical retry occurs here.
       if (error instanceof Error && "hasErrorLabel" in error && typeof error.hasErrorLabel === "function"

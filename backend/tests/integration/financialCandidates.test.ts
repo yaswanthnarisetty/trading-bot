@@ -156,14 +156,14 @@ for(const {family,stranded} of [...financialFamilies.map(family=>({family,strand
   const workflow=new CloseWorkflowService(connection,f.scope,clock),settlement=new RiskSettlementService(connection,f.scope,clock);
   await assert.rejects(settlement.settleClosedPosition(x.positionId));
   if(stranded){
-    // Approved successful-close workflow requires executed short evidence. Its
-    // zero-short cleanup remains intentionally deferred; never fabricate it.
-    assert.equal((await workflow.advance(x.positionId)).status,"BLOCKED");
+    // Phase 6B permits zero-short cleanup only after conclusive entry-order
+    // finality. Activation itself cannot release risk or fabricate a Fill.
+    assert.equal((await workflow.advance(x.positionId)).status,"ACTIVE");
+    assert.equal(orders.length,1);assert.equal(orders[0].get("side"),"SELL");
     await assert.rejects(settlement.settleClosedPosition(x.positionId));
     assert.equal(await models.Fill.countDocuments(),1);assert.equal((await account()).get("positionSlots"),1);
-    return;
   }
-  if(x.sell){const long=orders.find(o=>o.get("side")==="SELL")!;assert.equal(long.get("phase"),"PLANNED");assert.equal((await submit(long,{submission:"ACCEPTED"})).calls(),0);}
+  if(x.sell&&!stranded){const long=orders.find(o=>o.get("side")==="SELL")!;assert.equal(long.get("phase"),"PLANNED");assert.equal((await submit(long,{submission:"ACCEPTED"})).calls(),0);}
   for(const o of orders.sort((a,b)=>a.get("side")==="BUY"?-1:1)){
     await workflow.advance(x.positionId);const s=await submit(o,{submission:"ACCEPTED",initialFills:[{quantityUnits:65,priceMinor:o.get("limitPriceMinor")}]});
     assert.equal(s.result.status,"PERSISTED");for(const t of s.trades)await processor().process(t);

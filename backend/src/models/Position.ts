@@ -16,6 +16,7 @@ const PositionLegSchema = new Schema({
   netQuantityUnits: { ...unitsField(), min: Number.MIN_SAFE_INTEGER, required: false },
 }, { _id: false, strict: "throw" });
 const ClosePolicySchema = new Schema({
+  monitorDecisionId: { type: String },
   kind: { type: String, enum: ["POSITION_LIMIT_V1"], required: true },
   policyVersion: unitsField(), product: { ...idField(), immutable: false },
   expiresAt: { type: Date, required: true },

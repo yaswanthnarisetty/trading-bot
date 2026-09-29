@@ -178,7 +178,7 @@ test("late quote from an invalidated session cannot return as authenticated evid
   await session.exchange("replacement"); release({ data: success({}) });
   await assert.rejects(quote, /SESSION_REQUIRED/); assert.equal(session.status().tokenValid, true);
 });
-test("legacy strategy start rejects KITE_REAL before any financial database or loop work", async () => {
+test("legacy asset-only start rejects before any financial database or loop work", async () => {
   const { default: router } = await import("../../src/routes/session");
   const { kiteSession } = await import("../../src/services/KiteService");
   const layer = (router as any).stack.find((entry: any) => entry.route?.path === "/start");
@@ -188,6 +188,6 @@ test("legacy strategy start rejects KITE_REAL before any financial database or l
     await layer.route.stack.at(-1).handle({ body: { asset: "NIFTY" } }, {
       status(value: number) { status = value; return this; }, json(value: unknown) { body = value; },
     }, (error: unknown) => { throw error; });
-    assert.equal(status, 409); assert.equal(body.error, "LEGACY_MARKET_DATA_DISABLED");
+    assert.equal(status, 409); assert.equal(body.error, "PAPER_ONLY");
   } finally { kiteSession.setMode("MOCK"); }
 });

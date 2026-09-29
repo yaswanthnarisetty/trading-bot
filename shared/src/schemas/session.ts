@@ -5,7 +5,12 @@ import { z } from "zod";
  * This tracks lifecycle, performance, and configuration for a given trading session.
  */
 export const monitoringSessionSchema = z.object({
-  executionMode: z.literal("LEGACY_PAPER").optional(),
+  executionMode: z.enum(["LEGACY_PAPER", "PAPER"]).optional(),
+  strategyFamily: z.enum(["LONG_OPTION", "DEBIT_VERTICAL", "CREDIT_VERTICAL"]).optional(),
+  accountId: z.string().optional(),
+  lastCycleOutcome: z.string().optional(),
+  blockingReason: z.string().optional(),
+  lastCycleAt: z.string().optional(),
   sessionId: z.string(),
   asset: z.string(),
   startTime: z.string(),
@@ -17,7 +22,7 @@ export const monitoringSessionSchema = z.object({
   paperPnL: z.number(),
   paperCapital: z.number(),
   ticksSkipped: z.number(),
-  dataMode: z.enum(["LIVE", "MOCK"]),
+  dataMode: z.enum(["LIVE", "MOCK", "KITE_REAL"]),
 });
 
 export type MonitoringSession = z.infer<typeof monitoringSessionSchema>;

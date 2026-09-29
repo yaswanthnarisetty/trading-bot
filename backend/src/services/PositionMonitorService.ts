@@ -31,23 +31,8 @@ let monitorInterval: NodeJS.Timeout | null = null;
  *
  * @param sessionId - Identifier for the trading session to monitor.
  */
-export function start(sessionId: string): void {
-  if (monitorInterval) {
-    return;
-  }
-
-  const tick = async () => {
-    try {
-      await forceCloseAllPositions(sessionId);
-      await checkPositions(sessionId);
-    } catch (error) {
-      logger.error("Position monitor tick failed", { error, sessionId });
-    }
-  };
-
-  // Run immediately, then schedule interval.
-  void tick();
-  monitorInterval = setInterval(tick, POSITION_MONITOR_INTERVAL_MS);
+export function start(_sessionId: string): void {
+  throw new Error("LEGACY_POSITION_MONITOR_DISABLED");
 }
 
 /**

@@ -38,6 +38,7 @@ export const BrokerOrderSchema = executionSchema({
   submissionClaim: { type: ClaimSchema },
   submissionOutcome: { type: Schema.Types.Mixed },
   closePlan: { type: new Schema({
+    monitorDecisionId: { type: String },
     policy: { type: String, enum: ["POSITION_LIMIT_V1"], required: true },
     closeGeneration: unitsField(),
     dependsOnLegIds: { type: [String], required: true },

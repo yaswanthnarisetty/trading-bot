@@ -1,334 +1,56 @@
-import {
-  Router,
-  type Request,
-  type Response,
-  type NextFunction,
-} from "express";
-import { v4 as uuidv4 } from "uuid";
-import { ALLOWED_ASSETS, type AssetKey } from "../config/assets";
-import { MonitoringSessionModel } from "../models/MonitoringSession";
-import { OptionsPositionModel } from "../models/OptionsPosition";
-import {
-  start as startSignalLoop,
-  stop as stopSignalLoop,
-} from "../services/SignalLoopService";
-import {
-  start as startPositionMonitor,
-  stop as stopPositionMonitor,
-} from "../services/PositionMonitorService";
-import { closePosition, calculateCurrentPnL, getDailyPnL } from "../services/PaperTradeService";
-import { getLTP, isMock } from "../services/KiteService";
-import { WebSocketService } from "../services/WebSocketService";
-import { logger } from "../utils/logger";
-import type { OptionsPosition } from "@trading-bot/shared";
+import { Router } from "express";
 import { authMiddleware } from "./auth.middleware";
-
-const router = Router();
-
-/**
- * Extracts and validates an AssetKey from a raw request body value.
- * This ensures sessions can only be started for explicitly allowed assets.
- *
- * @param raw - The raw asset value from the request body.
- * @returns A valid AssetKey or null if the asset is not allowed.
- */
-function parseAssetKey(raw: unknown): AssetKey | null {
-  const key = typeof raw === "string" ? raw : "";
-  if (key in ALLOWED_ASSETS) {
-    return key as AssetKey;
+import { paperExitMonitor,paperConfigurations,paperOrchestrator,paperScheduler,recoverPaperAccount } from "../services/PaperOrchestrationRuntime";
+import { safeCycleError } from "../domain/paperOrchestration";
+import { kiteSession } from "../services/KiteService";
+const router=Router();
+router.use(authMiddleware);
+const sessions=paperOrchestrator.history.Session;
+router.get("/configurations",async(_req,res)=>{
+  try{res.json((await paperConfigurations()).map(c=>({configId:c.configId,accountId:c.accountId,asset:c.asset,
+    executionMode:c.executionMode,dataMode:c.dataMode,strategyFamily:c.strategyConfig.strategyFamily,intervalMs:c.intervalMs})));}
+  catch{res.status(409).json({error:"INVALID_PAPER_CONFIG"});}
+});
+router.post("/recover",async(req,res)=>{
+  try{res.json(await recoverPaperAccount(String(req.body?.configId??"")));}
+  catch(e){res.status(409).json({error:safeCycleError(e)});}
+});
+router.post("/start",async(req,res)=>{
+  try{
+    if(req.body?.executionMode!=="PAPER")throw new Error("PAPER_ONLY");
+    const c=(await paperConfigurations()).find(c=>c.configId===req.body?.configId);
+    if(!c||c.asset!==req.body.asset||c.dataMode!==req.body.dataMode||c.strategyConfig.strategyFamily!==req.body.strategyFamily){res.status(400).json({error:"EXPLICIT_PAPER_CONFIGURATION_REQUIRED"});return;}
+    const session=await paperOrchestrator.start(c);
+    paperScheduler.start(c.accountId,session.sessionId,c.intervalMs);
+    res.json(session);
+  }catch(e){res.status(409).json({error:safeCycleError(e)});}
+});
+router.post("/stop",async(req,res)=>{
+  const id=String(req.body?.sessionId??"");paperScheduler.stop(id);
+  try{res.json((await paperOrchestrator.stop(id)).toObject());}catch{res.status(404).json({error:"SESSION_NOT_FOUND"});}
+});
+router.get("/active",async(req,res,next)=>{try{
+  const accountId=req.query.accountId;
+  if(typeof accountId!=="string" || !(await paperConfigurations()).some(c=>c.accountId===accountId)) {
+    res.status(400).json({error:"EXPLICIT_PAPER_ACCOUNT_REQUIRED"});return;
   }
-  return null;
-}
-
-/**
- * Handles POST /api/session/start to create and start a new monitoring session.
- * Enforces single RUNNING session constraint, seeds DB record, and starts both loops.
- *
- * @param req - The HTTP request containing the desired asset in the body.
- * @param res - The HTTP response used to send the session summary.
- * @param next - Express next function for error propagation.
- */
-async function handleStartSession(
-  req: Request,
-  res: Response,
-  next: NextFunction
-): Promise<void> {
-  try {
-    // Phase 4B supplies data only; legacy strategy sessions cannot consume KITE_REAL.
-    if (!isMock()) {
-      res.status(409).json({ error: "LEGACY_MARKET_DATA_DISABLED" });
-      return;
-    }
-    const assetKey = parseAssetKey(req.body?.asset);
-    if (!assetKey) {
-      res.status(400).json({ error: "Invalid asset", code: 400 });
-      return;
-    }
-
-    const existing = await MonitoringSessionModel.findOne({
-      status: "RUNNING",
-    }).exec();
-
-    if (existing) {
-      res
-        .status(409)
-        .json({ error: "Session already running", code: 409 });
-      return;
-    }
-
-    const sessionId = uuidv4();
-    const nowIso = new Date().toISOString();
-    const paperCapital = Number(process.env.PAPER_CAPITAL || 200_000);
-    const dataMode = "MOCK" as const;
-
-    const sessionDoc = await MonitoringSessionModel.create({
-      sessionId,
-      asset: assetKey,
-      startTime: nowIso,
-      stopTime: null,
-      status: "RUNNING",
-      totalSignals: 0,
-      totalTrades: 0,
-      winRate: 0,
-      paperPnL: 0,
-      paperCapital,
-      ticksSkipped: 0,
-      dataMode,
-    });
-
-    await startSignalLoop(sessionId, assetKey);
-    startPositionMonitor(sessionId);
-
-    logger.info("Monitoring session started", {
-      sessionId,
-      asset: assetKey,
-      paperCapital,
-      dataMode,
-    });
-
-    res.json({
-      sessionId,
-      asset: assetKey,
-      paperCapital,
-      dataMode,
-    });
-  } catch (error) {
-    next(error);
-  }
-}
-
-/**
- * Forces closure of all open positions for a session with EOD reason.
- * This is used when stopping a session to remove any residual exposure.
- *
- * @param sessionId - Identifier of the monitoring session.
- * @returns Promise that resolves once all positions are closed.
- */
-async function forceCloseAllPositions(sessionId: string): Promise<void> {
-  const openPositions = await OptionsPositionModel.find({
-    sessionId,
-    status: "OPEN",
-  }).exec();
-
-  for (const doc of openPositions) {
-    const pos = doc.toObject() as OptionsPosition;
-    try {
-      // Fetch current market price for accurate exit P&L
-      const currentLTP = await getLTP(pos.asset as AssetKey);
-      const pnlAtClose = calculateCurrentPnL(pos, currentLTP);
-      const closed = await closePosition(
-        pos.positionId,
-        currentLTP,
-        "SESSION_STOP",
-        pnlAtClose
-      );
-      WebSocketService.emit(sessionId, {
-        type: "POSITION_CLOSED",
-        payload: closed,
-      });
-    } catch (error) {
-      logger.error("Failed to force-close position on session stop", {
-        sessionId,
-        positionId: pos.positionId,
-        error,
-      });
-    }
-  }
-}
-
-/**
- * Handles POST /api/session/stop to gracefully stop an active monitoring session.
- * Stops loops, force-closes positions, updates session stats, and emits WS notification.
- *
- * @param req - The HTTP request containing the sessionId in the body.
- * @param res - The HTTP response used to send the final session summary.
- * @param next - Express next function for error propagation.
- */
-async function handleStopSession(
-  req: Request,
-  res: Response,
-  next: NextFunction
-): Promise<void> {
-  try {
-    const sessionId = String(req.body?.sessionId || "");
-    if (!sessionId) {
-      res.status(400).json({ error: "sessionId is required", code: 400 });
-      return;
-    }
-
-    const session = await MonitoringSessionModel.findOne({
-      sessionId,
-    }).exec();
-
-    if (!session) {
-      res.status(404).json({ error: "Session not found", code: 404 });
-      return;
-    }
-
-    stopSignalLoop();
-    stopPositionMonitor();
-
-    await forceCloseAllPositions(sessionId);
-
-    const closedPositions = await OptionsPositionModel.find({
-      sessionId,
-      status: { $ne: "OPEN" },
-    }).exec();
-
-    const wins = closedPositions.filter(
-      (p) => (p.realizedPnL ?? 0) > 0
-    ).length;
-    const totalTrades = closedPositions.length;
-    const winRate =
-      totalTrades === 0 ? 0 : (wins / totalTrades) * 100;
-
-    const paperPnL = await getDailyPnL(sessionId);
-
-    session.status = "STOPPED";
-    session.stopTime = new Date().toISOString();
-    session.winRate = winRate;
-    session.paperPnL = paperPnL;
-    session.totalTrades = totalTrades;
-
-    await session.save();
-
-    WebSocketService.emit(sessionId, {
-      type: "SESSION_STOPPED",
-      payload: {
-        sessionId,
-        finalPnL: paperPnL,
-        totalTrades,
-      },
-    });
-
-    logger.info("Monitoring session stopped", {
-      sessionId,
-      totalTrades,
-      winRate,
-      paperPnL,
-    });
-
-    res.json(session.toObject());
-  } catch (error) {
-    next(error);
-  }
-}
-
-/**
- * Handles GET /api/session/active to return the currently running session, if any.
- * This allows the frontend to restore state on page load.
- *
- * @param _req - The incoming request (unused).
- * @param res - The HTTP response used to send the active session or null.
- * @param next - Express next function for error propagation.
- */
-async function handleGetActiveSession(
-  _req: Request,
-  res: Response,
-  next: NextFunction
-): Promise<void> {
-  try {
-    const session = await MonitoringSessionModel.findOne({
-      status: "RUNNING",
-    }).exec();
-    res.json(session ? session.toObject() : null);
-  } catch (error) {
-    next(error);
-  }
-}
-
-/**
- * Handles GET /api/session/:sessionId to return full session details.
- * This includes stored stats on signals, trades, PnL, and lifecycle timestamps.
- *
- * @param req - The HTTP request containing the sessionId path parameter.
- * @param res - The HTTP response used to send the session document.
- * @param next - Express next function for error propagation.
- */
-async function handleGetSessionById(
-  req: Request,
-  res: Response,
-  next: NextFunction
-): Promise<void> {
-  try {
-    const { sessionId } = req.params;
-    const session = await MonitoringSessionModel.findOne({
-      sessionId,
-    }).exec();
-
-    if (!session) {
-      res.status(404).json({ error: "Session not found", code: 404 });
-      return;
-    }
-
-    res.json(session.toObject());
-  } catch (error) {
-    next(error);
-  }
-}
-
-/**
- * Handles GET /api/session/history to list past sessions.
- * Results are ordered by creation time descending and support basic pagination.
- *
- * @param req - The HTTP request containing limit and offset query parameters.
- * @param res - The HTTP response used to send the paginated session list.
- * @param next - Express next function for error propagation.
- */
-async function handleGetSessionHistory(
-  req: Request,
-  res: Response,
-  next: NextFunction
-): Promise<void> {
-  try {
-    const limit = Math.min(
-      Number(req.query.limit ?? 20) || 20,
-      100
-    );
-    const offset = Number(req.query.offset ?? 0) || 0;
-
-    const [sessions, total] = await Promise.all([
-      MonitoringSessionModel.find({})
-        .sort({ createdAt: -1 })
-        .skip(offset)
-        .limit(limit)
-        .exec(),
-      MonitoringSessionModel.countDocuments({}).exec(),
-    ]);
-
-    res.json({
-      sessions: sessions.map((s) => s.toObject()),
-      total,
-    });
-  } catch (error) {
-    next(error);
-  }
-}
-
-router.post("/start", authMiddleware, handleStartSession);
-router.post("/stop", authMiddleware, handleStopSession);
-router.get("/active", authMiddleware, handleGetActiveSession);
-router.get("/history", authMiddleware, handleGetSessionHistory);
-router.get("/:sessionId", authMiddleware, handleGetSessionById);
-
+  res.json(await paperOrchestrator.activeForAccount(accountId));
+}catch(e){next(e);}});
+router.get("/exits/status",async(req,res,next)=>{try{
+  const accountId=req.query.accountId;
+  if(typeof accountId!=="string" || !/^PAPER:[^\s]+$/.test(accountId)){res.status(400).json({error:"EXPLICIT_PAPER_ACCOUNT_REQUIRED"});return;}
+  res.json(await paperExitMonitor.store.states.find({accountId},{projection:{leaseId:0}}).limit(200).toArray());
+}catch(e){next(e);}});
+router.get("/history",async(_req,res,next)=>{try{res.json({sessions:await sessions.find({}).sort({createdAt:-1}).limit(100).lean(),total:await sessions.countDocuments()});}catch(e){next(e);}});
+router.get("/:sessionId/decisions",async(req,res,next)=>{try{res.json(await paperOrchestrator.history.Cycle.find({sessionId:req.params.sessionId,executionMode:"PAPER"}).sort({timestamp:-1}).limit(50).lean());}catch(e){next(e);}});
+router.post("/:sessionId/progress/:cycleId",async(req,res)=>{
+  try{const cycle=await paperOrchestrator.history.Cycle.findOne({sessionId:req.params.sessionId,cycleId:req.params.cycleId,executionMode:"PAPER"});
+    if(!cycle){res.status(404).json({error:"DECISION_NOT_FOUND"});return;}
+    res.json(await paperOrchestrator.progressEntry(req.params.cycleId));}catch(e){res.status(409).json({error:safeCycleError(e)});}
+});
+router.get("/:sessionId",async(req,res,next)=>{try{
+  const session=await sessions.findOne({sessionId:req.params.sessionId}).lean();
+  if(!session){res.status(404).json({error:"SESSION_NOT_FOUND"});return;}
+  res.json({...session,kiteReadiness:kiteSession.status().tokenValid?"CONNECTED":"DISCONNECTED",execution:"PaperBroker",tradingPhase:"PAPER",exits:"DURABLE_PAPER_MONITOR"});
+}catch(e){next(e);}});
 export default router;

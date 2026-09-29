@@ -3,7 +3,7 @@ import { executionScopeSchema, identifierSchema, type ExecutionScope, type Tradi
 import { executionModels } from "../db/executionModels";
 import { assertExecutionIndexes } from "../db/executionIndexes";
 import { loadExecutionChain, requireAggregateVersion } from "../db/executionConcurrency";
-import { closeOrderFinality, dependenciesAreSafe, successfulClose, verifyCloseLedger, recordRows, type LedgerRecord } from "../domain/closeWorkflowEvidence";
+import { closeDependencyRefs, closeOrderFinality, dependenciesAreSafe, successfulClose, verifyCloseLedger, recordRows, type LedgerRecord } from "../domain/closeWorkflowEvidence";
 import { transitionPosition, type PositionState } from "../domain/PositionStateMachine";
 import { transitionIntent } from "../domain/IntentStateMachine";
 import type { Result } from "../domain/execution";
@@ -99,8 +99,8 @@ export class CloseWorkflowService {
             || authorization.policyVersion !== account.get("policyVersion") || reservation.get("policyVersion") !== account.get("policyVersion")
             || intent.get("policyVersion") !== account.get("policyVersion") || authorization.executionEpoch !== account.get("executionEpoch")) continue;
           if (!dependenciesAreSafe(pos, dependencies, orders.map(plain), fills)) continue;
-          const refs = fills.filter(fill => dependencies.includes(String(fill.legId))).map(fill => String(fill.fillId)).sort();
-          // A dependency with no executions cannot justify protection removal in this successful-close slice.
+          const refs = closeDependencyRefs(pos, dependencies, orders.map(plain), fills);
+          // Zero-executed short needs conclusive final entry-order proof instead of a fabricated Fill.
           if (!refs.length) continue;
           child.set({ phase: "READY", dependencyActivation: { positionId, intentId, orderId: child.get("orderId"),
             closeGeneration: intent.get("closeGeneration"), eventId: `${child.get("orderId")}:ORDER_READY`, evidenceRefs: refs } });

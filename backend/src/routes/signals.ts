@@ -29,12 +29,12 @@ async function handleGetSignalsForSession(
     const offset = Number(req.query.offset ?? 0) || 0;
 
     const [signals, total] = await Promise.all([
-      SignalLogModel.find({ sessionId })
+      SignalLogModel.find({ sessionId, executionMode: { $ne: "PAPER" } })
         .sort({ timestamp: -1 })
         .skip(offset)
         .limit(limit)
         .exec(),
-      SignalLogModel.countDocuments({ sessionId }).exec(),
+      SignalLogModel.countDocuments({ sessionId, executionMode: { $ne: "PAPER" } }).exec(),
     ]);
 
     res.json({

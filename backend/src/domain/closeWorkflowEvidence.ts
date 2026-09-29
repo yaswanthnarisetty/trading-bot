@@ -112,3 +112,18 @@ export function successfulClose(position: LedgerRecord, intent: LedgerRecord, or
   return recordRows(intent, "targetLegs").every(target => fills.filter(fill => fill.intentId === intent.intentId && fill.legId === target.legId)
     .reduce((n, fill) => n + BigInt(recordUnits(fill, "quantityUnits")), 0n) === BigInt(recordUnits(target, "targetUnits")));
 }
+
+/** Never-filled short dependencies use conclusively final physical entry identities, not fabricated fills. */
+export function closeDependencyRefs(position: LedgerRecord, dependencies: readonly string[], orders: LedgerRecord[], fills: LedgerRecord[]): string[] {
+  const refs: string[] = [];
+  for (const legId of dependencies) {
+    const own = fills.filter(f => f.legId === legId);
+    if (own.length) { refs.push(...own.map(f => String(f.fillId))); continue; }
+    const leg = recordRows(position, "legs").find(l => l.legId === legId);
+    const entry = orders.filter(o => o.legId === legId && o.intentId === position.entryIntentId);
+    if (!leg || leg.entrySide !== "SELL" || leg.entryFilledUnits !== 0 || leg.exitFilledUnits !== 0 || !entry.length
+      || entry.some(o => closeOrderFinality(o, fills) !== "FINAL")) return [];
+    refs.push(...entry.map(o => String(o.orderId)));
+  }
+  return [...new Set(refs)].sort();
+}

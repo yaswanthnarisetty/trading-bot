@@ -19,12 +19,9 @@ export interface Asset {
   expiryDay: number;
 }
 
-export interface SessionStartResponse {
-  sessionId: string;
-  asset: string;
-  paperCapital: number;
-  dataMode: "LIVE" | "MOCK";
-}
+export type SessionStartResponse = MonitoringSession & {
+  accountId: string; executionMode: "PAPER"; config: { configId: string };
+};
 
 export type SessionSummary = MonitoringSession;
 
@@ -305,23 +302,23 @@ export function getAssets(): Promise<Asset[]> {
 
 /**
  * Starts a new monitoring session for the specified asset.
- * Backend enforces single RUNNING session at a time.
+ * Backend enforces one RUNNING session per account.
  *
  * @param asset - Asset key such as "NIFTY" or "BANKNIFTY".
  * @returns Promise resolving to session start metadata.
  */
 export function startSession(
-  asset: string
+  config: PaperSessionOption
 ): Promise<SessionStartResponse> {
   return request<SessionStartResponse>("/api/session/start", {
     method: "POST",
-    body: JSON.stringify({ asset }),
+    body: JSON.stringify(config),
   });
 }
 
 /**
  * Stops an existing monitoring session and returns its final summary.
- * The backend will close all open positions with EOD semantics.
+ * Stopping evaluation preserves all durable positions and reservations.
  *
  * @param sessionId - Identifier of the running session.
  * @returns Promise resolving to the updated MonitoringSession document.
@@ -341,8 +338,13 @@ export function stopSession(
  *
  * @returns Promise resolving to MonitoringSession or null.
  */
-export function getActiveSession(): Promise<MonitoringSession | null> {
-  return request<MonitoringSession | null>("/api/session/active");
+export function getActiveSession(accountId: string): Promise<MonitoringSession | null> {
+  return request<MonitoringSession | null>(`/api/session/active?accountId=${encodeURIComponent(accountId)}`);
+}
+
+/** Exact polling never falls back to another running session. */
+export function getSession(sessionId: string): Promise<MonitoringSession> {
+  return request<MonitoringSession>(`/api/session/${encodeURIComponent(sessionId)}`);
 }
 
 /**
@@ -541,4 +543,13 @@ export function beginKiteLogin(): Promise<{ loginUrl: string }> {
 }
 export function setKiteDataMode(dataMode: "MOCK" | "KITE_REAL"): Promise<{ dataMode: "MOCK" | "KITE_REAL" }> {
   return request("/api/kite/data-mode", { method: "POST", body: JSON.stringify({ dataMode }) });
+}
+
+export interface PaperSessionOption {
+  configId: string; accountId: string; asset: string; executionMode: "PAPER";
+  dataMode: "KITE_REAL" | "MOCK"; strategyFamily: StrategyFamily; intervalMs: number;
+}
+export function getPaperSessionOptions(): Promise<PaperSessionOption[]> { return request("/api/session/configurations"); }
+export function recoverPaperSession(configId: string): Promise<{status: string}> {
+  return request("/api/session/recover", {method:"POST",body:JSON.stringify({configId})});
 }

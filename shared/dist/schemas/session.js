@@ -7,7 +7,12 @@ const zod_1 = require("zod");
  * This tracks lifecycle, performance, and configuration for a given trading session.
  */
 exports.monitoringSessionSchema = zod_1.z.object({
-    executionMode: zod_1.z.literal("LEGACY_PAPER").optional(),
+    executionMode: zod_1.z.enum(["LEGACY_PAPER", "PAPER"]).optional(),
+    strategyFamily: zod_1.z.enum(["LONG_OPTION", "DEBIT_VERTICAL", "CREDIT_VERTICAL"]).optional(),
+    accountId: zod_1.z.string().optional(),
+    lastCycleOutcome: zod_1.z.string().optional(),
+    blockingReason: zod_1.z.string().optional(),
+    lastCycleAt: zod_1.z.string().optional(),
     sessionId: zod_1.z.string(),
     asset: zod_1.z.string(),
     startTime: zod_1.z.string(),
@@ -19,5 +24,5 @@ exports.monitoringSessionSchema = zod_1.z.object({
     paperPnL: zod_1.z.number(),
     paperCapital: zod_1.z.number(),
     ticksSkipped: zod_1.z.number(),
-    dataMode: zod_1.z.enum(["LIVE", "MOCK"]),
+    dataMode: zod_1.z.enum(["LIVE", "MOCK", "KITE_REAL"]),
 });

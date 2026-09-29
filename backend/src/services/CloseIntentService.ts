@@ -13,7 +13,7 @@ import type { FillEvidence, Result } from "../domain/execution";
 import { brokerOrderRequestSchema } from "../brokers/BrokerAdapter";
 import { submissionFingerprint, validateSubmissionEvidence } from "../brokers/submissionEvidence";
 
-const closePolicySchema = z.object({ kind: z.literal("POSITION_LIMIT_V1"), policyVersion: quantityUnitsSchema,
+const closePolicySchema = z.object({ monitorDecisionId: identifierSchema.optional(), kind: z.literal("POSITION_LIMIT_V1"), policyVersion: quantityUnitsSchema,
   product: identifierSchema, expiresAt: z.date(), legLimits: z.array(z.object({ legId: identifierSchema, limitPriceMinor: nonnegativeMoneyMinorSchema.refine(n => n > 0, "Close LIMIT price must be positive") }).strict()).min(1),
 }).strict();
 type CloseLeg = PositionLegState & { contractKey: string; closeHeldUnits: number; closeHoldIntentId?: string };
@@ -140,7 +140,7 @@ export class CloseIntentService {
     if (fills.some(fill => fill.intentId === entryIntentId && !orders.some(order => order.get("orderId") === fill.orderId))) throw new Error("ENTRY_FILL_OWNERSHIP_MISMATCH");
     if (blockers.length) throw new UnresolvedEntryExposureError(positionId, blockers.sort((a, b) => a.orderId.localeCompare(b.orderId)));
   }
-  async requestClose(positionInput: string, commandInput: string): Promise<CloseRequestResult> {
+  async requestClose(positionInput: string, commandInput: string, guard?: (session: ClientSession) => Promise<void>): Promise<CloseRequestResult> {
     const positionId = identifierSchema.parse(positionInput), commandKey = identifierSchema.parse(commandInput);
     await assertExecutionIndexes(this.connection);
     const session = await this.connection.startSession();
@@ -181,6 +181,7 @@ export class CloseIntentService {
         const rawPolicy = position.get("closePolicy");
         if (!rawPolicy) throw new Error("CLOSE_POLICY_REQUIRED");
         const policy = closePolicySchema.parse(rawPolicy.toObject());
+        if (policy.monitorDecisionId) { if (!guard) throw new Error("EXIT_AUTHORIZATION_REQUIRED"); await guard(session); }
         const now = this.clock();
         if (policy.expiresAt.getTime() <= now.getTime() || policy.policyVersion !== account.get("policyVersion")
           || new Set(policy.legLimits.map(limit => limit.legId)).size !== policy.legLimits.length
@@ -221,12 +222,13 @@ export class CloseIntentService {
             phase: plan.dependencies.length === 0 && account.get("admissionStatus") === "PAPER_READY" ? "READY" : "PLANNED", knowledge: "KNOWN", cancellation: "NONE",
             submissionAuthorization: { reservationId, evidenceRef: intentId, product: policy.product, reservedQuantityUnits: plan.quantityUnits,
               policyVersion: policy.policyVersion, executionEpoch: account.get("executionEpoch"), expiresAt: policy.expiresAt },
-            closePlan: { policy: policy.kind, closeGeneration: generation, dependsOnLegIds: plan.dependencies } }).save({ session });
+            closePlan: { ...(policy.monitorDecisionId ? { monitorDecisionId: policy.monitorDecisionId } : {}), policy: policy.kind, closeGeneration: generation, dependsOnLegIds: plan.dependencies } }).save({ session });
         }
         await this.audit(intent, "INTENT_CREATED", intentId, commandKey, { kind: "REFERENCE", entityId: intentId }, session);
         await this.audit(reservation, "RISK_RESERVED", intentId, commandKey,
           { kind: "RISK", reservationId, marginMinor: 0, exposureMinor: 0 }, session);
         await this.audit(position, "POSITION_CLOSE_REQUESTED", intentId, commandKey, { kind: "STATE_CHANGE", from, to: position.get("lifecycle") }, session);
+        if (policy.monitorDecisionId) await guard!(session);
         return { status: "CREATED", positionId, intentId, reservationId, orderIds: plans.map(plan => plan.orderId).sort() };
       }, { readConcern: { level: "snapshot" }, writeConcern: { w: "majority" } });
     } finally { await session.endSession(); }

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { Connection } from "mongoose";
 import { executionScopeSchema, identifierSchema, type ExecutionScope } from "@trading-bot/shared";
-import { assertIssuedTradeCandidate, type TradeCandidate } from "../domain/strategyEvaluation";
+import { assertIssuedTradeCandidate, candidateMarketEvidenceExpiry, type TradeCandidate } from "../domain/strategyEvaluation";
 import { assertQualifiedInstrument } from "./KiteInstrumentMasterService";
 import { calculateEntryRisk, classifiedEntryPlanSchema } from "../domain/entryRisk";
 import { executionModels } from "../db/executionModels";
@@ -13,7 +13,7 @@ const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(valu
 /** Explicit authority boundary. Issued analytics candidates remain advisory; this
  * PAPER-only adapter persists unreserved economics, never admits or submits them.
  */
-export function candidateEntryPlan(input: unknown, validUntil: Date, now: Date) {
+export function candidateEntryPlan(input: unknown, validUntil: Date, now: Date, entryCutoffAt?: Date) {
   assertIssuedTradeCandidate(input, now.getTime());
   const c: TradeCandidate = input;
   if (c.executionAuthority !== "NONE" || c.version !== "TRADE_CANDIDATE_V2" || c.evaluatorVersion !== "PHASE6A01_V1"
@@ -33,7 +33,9 @@ export function candidateEntryPlan(input: unknown, validUntil: Date, now: Date) 
         expiry: i.expiry, strikeMinor: i.strikeMinor, instrumentType: i.instrumentType, lotSizeUnits: i.lotSizeUnits,
         tickSizeMinor: i.tickSizeMinor, masterFingerprint: i.provenance.sourceFingerprint } };
   });
+  const expiry = candidateMarketEvidenceExpiry(c);
   const plan = classifiedEntryPlanSchema.parse({ kind: "NSE_STRATEGY_LIMIT_V1", product: "INTRADAY", validUntil,
+    marketEvidenceExpiresAt: expiry === null ? null : new Date(expiry), ...(entryCutoffAt ? { entryCutoffAt } : {}),
     family: c.strategyFamily, strategyKind: c.strategyKind, dataMode: c.dataMode, source: c.source, candidateRef,
     analyticsEvidenceId: c.analyticsEvidenceId, evaluatedAt: c.evaluatedAt, candidateVersion: c.version, evaluatorVersion: c.evaluatorVersion, legs });
   const targets = c.legs.map(l => ({ legId: l.role.toLowerCase(), contractKey: l.instrument.contractKey, side: l.side, targetUnits: l.quantityUnits }));
@@ -44,9 +46,9 @@ export class CandidateIntentAdapter {
   constructor(private readonly connection: Connection, scope: ExecutionScope, private readonly clock: () => Date = () => new Date()) {
     this.scope = executionScopeSchema.parse(scope); if (this.scope.executionMode !== "PAPER") throw new Error("PAPER_ONLY");
   }
-  async adapt(candidate: unknown, context: { strategyInstanceId: string; sessionId: string; validUntil: Date }) {
+  async adapt(candidate: unknown, context: { strategyInstanceId: string; sessionId: string; validUntil: Date; entryCutoffAt?: Date; orchestration?: { cycleId: string; sessionId: string; startupId: string } }) {
     const strategyInstanceId = identifierSchema.parse(context.strategyInstanceId), sessionId = identifierSchema.parse(context.sessionId);
-    const now = this.clock(), { plan, targets, requirement } = candidateEntryPlan(candidate, context.validUntil, now);
+    const now = this.clock(), { plan, targets, requirement } = candidateEntryPlan(candidate, context.validUntil, now, context.entryCutoffAt);
     // A changed quote/config within the same strategy decision must conflict, not
     // mint a second economic intent. Evidence remains in the immutable fingerprint.
     const key = hash([this.scope, strategyInstanceId, sessionId, plan.evaluatedAt]);
@@ -66,7 +68,8 @@ export class CandidateIntentAdapter {
       const base = { ...this.scope, schemaVersion: 1, correlationId: key, createdAt: now }, mutable = { ...base, updatedAt: now, version: 0 };
       await new models.StrategySignal({ ...base, signalId, decisionKey: key, strategyInstanceId, sessionId,
         strategyVersion: plan.evaluatorVersion, decisionSlot: plan.evaluatedAt, strategy: plan.strategyKind,
-        decisionEvidenceRefs: [plan.candidateRef, plan.analyticsEvidenceId], expiresAt: requirement.expiresAt }).save({ session });
+        ...(context.orchestration ? { orchestration: context.orchestration } : {}),
+        decisionEvidenceRefs: [plan.candidateRef, plan.analyticsEvidenceId, ...(context.orchestration ? [context.orchestration.cycleId] : [])], expiresAt: requirement.expiresAt }).save({ session });
       await withCandidateWrite(session, requirement.fingerprint, () => new models.OrderIntent({ ...mutable, intentId, commandKey: key,
         purpose: "ENTRY", signalId, state: "CREATED", targetLegs: targets, closeGeneration: 0, policyVersion: account.get("policyVersion"),
         deadline: requirement.expiresAt, entryPlan: plan }).save({ session }));

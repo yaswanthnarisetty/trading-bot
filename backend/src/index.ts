@@ -19,15 +19,7 @@ import cryptoRouter from "./routes/crypto";
 import { WebSocketService } from "./services/WebSocketService";
 import { kiteSession } from "./services/KiteService";
 import { MonitoringSessionModel } from "./models/MonitoringSession";
-import { ALLOWED_ASSETS, type AssetKey } from "./config/assets";
-import {
-  start as startSignalLoop,
-  stop as stopSignalLoop,
-} from "./services/SignalLoopService";
-import {
-  start as startPositionMonitor,
-} from "./services/PositionMonitorService";
-
+import { paperOrchestrator, paperExitMonitor, paperExitScheduler } from "./services/PaperOrchestrationRuntime";
 
 /**
  * Creates and configures the core Express application instance.
@@ -84,31 +76,16 @@ async function bootstrap(): Promise<void> {
   await connectWithRetry();
   await createIndexes();
 
-  // Crash recovery: any session left RUNNING after a restart gets its loops resumed.
-  // State is already in MongoDB — we just need to restart the in-memory timers.
-  // If the asset is no longer valid, mark CRASHED so a new session can be started.
-  const orphaned = await MonitoringSessionModel.find({ status: "RUNNING" }).exec();
-  for (const session of orphaned) {
-    const asset = session.asset;
-    if (!(asset in ALLOWED_ASSETS)) {
-      logger.warn(`⚠️ Orphaned session ${session.sessionId} has unknown asset "${asset}" — marking CRASHED`);
-      session.status = "CRASHED";
-      session.stopTime = new Date().toISOString();
-      await session.save();
-      continue;
-    }
-    try {
-      logger.info(`🔄 Resuming orphaned session ${session.sessionId} (${asset}) after restart`);
-      await startSignalLoop(session.sessionId, asset as AssetKey);
-      startPositionMonitor(session.sessionId);
-    } catch (err) {
-      logger.error(`Failed to resume session ${session.sessionId} — marking CRASHED`, { err });
-      session.status = "CRASHED";
-      session.stopTime = new Date().toISOString();
-      await session.save();
-    }
-  }
+  await paperOrchestrator.initialize();
+  // Restart never resumes entry timers. Existing financial ledgers remain intact;
+  // an explicit recovery proof and explicit session start are required.
+  await MonitoringSessionModel.updateMany({ status: "RUNNING" }, { $set: {
+    status: "CRASHED", stopTime: new Date().toISOString(), blockingReason: "RECOVERY_REQUIRED",
+  } });
 
+  await paperExitMonitor.initialize();
+  // Exposure management is independent of entry activation and survives session STOP.
+  paperExitScheduler.start();
   WebSocketService.init(server);
 
   server.listen(port, () => {

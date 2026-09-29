@@ -31,6 +31,10 @@ const identitySchema = z.object({
 }).strict();
 export const classifiedEntryPlanSchema = z.object({
   kind: z.literal("NSE_STRATEGY_LIMIT_V1"), product: z.literal("INTRADAY"), validUntil: z.date(),
+  // Optional on previously admitted records so their broker/fill truth remains readable.
+  // New classified admissions/claims require it; the adapter always issues it.
+  marketEvidenceExpiresAt: z.date().nullable().optional(),
+  entryCutoffAt: z.date().optional(),
   family: z.enum(["LONG_OPTION", "DEBIT_VERTICAL", "CREDIT_VERTICAL"]),
   strategyKind: z.enum(["LONG_CALL", "LONG_PUT", "BULL_CALL_DEBIT_SPREAD", "BEAR_PUT_DEBIT_SPREAD", "BULL_PUT_CREDIT_SPREAD", "BEAR_CALL_CREDIT_SPREAD"]),
   dataMode: z.enum(["MOCK", "KITE_REAL"]), source: z.enum(["MOCK", "KITE"]),
@@ -47,7 +51,7 @@ const targetsSchema = z.array(z.object({
 export type EntryRiskReason = "RECOVERY_REQUIRED" | "RECONCILIATION_REQUIRED" | "INVALID_RISK_ECONOMICS" | "UNSUPPORTED_RISK_SHAPE" | "RISK_ARITHMETIC_OVERFLOW"
   | "RISK_PER_TRADE_EXCEEDED" | "RISK_CAPACITY_EXCEEDED" | "POSITION_LIMIT_EXCEEDED"
   | "ACCOUNT_NOT_READY" | "RISK_POLICY_REQUIRED" | "INTENT_NOT_FOUND" | "ENTRY_ONLY"
-  | "STALE_EXECUTION_CHAIN" | "RISK_PROJECTION_MISMATCH" | "UNSUPPORTED_ACCOUNT_EXPOSURE"
+  | "MARKET_EVIDENCE_EXPIRED" | "ENTRY_CUTOFF_PASSED" | "STALE_EXECUTION_CHAIN" | "RISK_PROJECTION_MISMATCH" | "UNSUPPORTED_ACCOUNT_EXPOSURE"
   | "KILL_SWITCH_ACTIVE" | "DAILY_LOSS_LIMIT_EXCEEDED" | "DAILY_LOSS_POLICY_REQUIRED" | "TRADING_DAY_CONFIG_REQUIRED" | "TRADING_DAY_REGRESSION";
 export class EntryRiskError extends Error {
   constructor(readonly reason: EntryRiskReason) { super(reason); }
@@ -58,6 +62,19 @@ export function riskAssert(condition: unknown, reason: EntryRiskReason): asserts
 export function checkedRiskUnits(value: bigint): number {
   riskAssert(value >= 0n && value <= BigInt(Number.MAX_SAFE_INTEGER), "RISK_ARITHMETIC_OVERFLOW");
   return Number(value);
+}
+/** NEW admission/claim only. Never call for outcome or fill truth. Both bounds are inclusive. */
+export function assertEntryTemporalAuthorization(input: unknown, now: Date) {
+  // Earlier isolated legacy authorizations predate classified candidate plans.
+  if (input === undefined) return;
+  const plan = entryPlanSchema.parse(input);
+  if (plan.kind !== "NSE_STRATEGY_LIMIT_V1") return;
+  riskAssert(Number.isFinite(now.getTime()), "STALE_EXECUTION_CHAIN");
+  riskAssert(plan.marketEvidenceExpiresAt !== undefined, "INVALID_RISK_ECONOMICS");
+  riskAssert(plan.dataMode === "MOCK" ? plan.marketEvidenceExpiresAt === null : plan.marketEvidenceExpiresAt !== null,
+    "INVALID_RISK_ECONOMICS");
+  riskAssert(plan.marketEvidenceExpiresAt === null || now.getTime() <= plan.marketEvidenceExpiresAt.getTime(), "MARKET_EVIDENCE_EXPIRED");
+  riskAssert(!plan.entryCutoffAt || now.getTime() <= plan.entryCutoffAt.getTime(), "ENTRY_CUTOFF_PASSED");
 }
 export function calculateEntryRisk(targetInput: unknown, planInput: unknown) {
   const targets = targetsSchema.safeParse(targetInput), parsed = entryPlanSchema.safeParse(planInput);
@@ -81,6 +98,7 @@ export function calculateEntryRisk(targetInput: unknown, planInput: unknown) {
   let widthMinor = 0, ceilingPerUnit = 0;
   if (plan.kind === "NSE_STRATEGY_LIMIT_V1") {
     family = plan.family;
+    if (plan.marketEvidenceExpiresAt !== undefined) riskAssert(plan.dataMode === "MOCK" ? plan.marketEvidenceExpiresAt === null : plan.marketEvidenceExpiresAt !== null, "INVALID_RISK_ECONOMICS");
     riskAssert(plan.source === (plan.dataMode === "MOCK" ? "MOCK" : "KITE"), "INVALID_RISK_ECONOMICS");
     for (const leg of plan.legs) {
       const i = leg.identity;

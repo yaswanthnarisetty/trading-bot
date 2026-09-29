@@ -11,7 +11,9 @@
     "test": "TS_NODE_PROJECT=tsconfig.test.json node --require ts-node/register --test --test-concurrency=1 tests/unit/*.test.ts",
     "test:integration": "node scripts/integration.cjs",
     "execution:indexes": "TS_NODE_PROJECT=tsconfig.test.json ts-node src/db/executionIndexCli.ts",
-    "test:build": "npm run build && node --test tests/build/*.test.cjs"
+    "test:build": "npm run build && node --test tests/build/*.test.cjs",
+    "test:smoke:paper": "node scripts/paperSmoke.cjs",
+    "test:smoke:exits": "node scripts/paperExitSmoke.cjs"
   },
   "dependencies": {
     "@trading-bot/shared": "*",

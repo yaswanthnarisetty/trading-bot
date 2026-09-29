@@ -14,9 +14,9 @@ import type {
   MonitoringSession,
 } from "@trading-bot/shared";
 
-type SessionStatus = "IDLE" | "RUNNING" | "STOPPED" | "CRASHED";
+type SessionStatus = "IDLE" | "RUNNING" | "STOPPED" | "CRASHED" | "UNAVAILABLE";
 
-type DataMode = "LIVE" | "MOCK" | null;
+type DataMode = "LIVE" | "MOCK" | "KITE_REAL" | null;
 
 type WebSocketStatus =
   | "CONNECTED"
@@ -27,6 +27,8 @@ type WebSocketStatus =
 export interface AppState {
   session: {
     id: string | null;
+    accountId: string | null;
+    configId: string | null;
     status: SessionStatus;
     asset: string | null;
     startTime: string | null;
@@ -66,7 +68,7 @@ type SessionStartedPayload = {
   sessionId: string;
   asset: string;
   paperCapital: number;
-  dataMode: "LIVE" | "MOCK";
+  dataMode: "LIVE" | "MOCK" | "KITE_REAL";
   startTime: string | null;
 };
 
@@ -83,8 +85,9 @@ type PositionUpdatePayload = {
 
 export type AppAction =
   | { type: "SESSION_STARTED"; payload: SessionStartedPayload }
-  | { type: "SESSION_SYNCED"; payload: MonitoringSession }
+  | { type: "SESSION_SYNCED"; payload: MonitoringSession & { config?: { configId: string } } }
   | { type: "SESSION_STOPPED" }
+  | { type: "SESSION_UNAVAILABLE" }
   | { type: "SIGNAL_RECEIVED"; payload: SignalPayload }
   | { type: "SIGNALS_SYNCED"; payload: SignalPayload[] }
   | { type: "POSITION_OPENED"; payload: OptionsPosition }
@@ -98,6 +101,8 @@ export type AppAction =
 const initialState: AppState = {
   session: {
     id: null,
+    accountId: null,
+    configId: null,
     status: "IDLE",
     asset: null,
     startTime: null,
@@ -135,12 +140,15 @@ const initialState: AppState = {
 export function appReducer(state: AppState, action: AppAction): AppState {
   switch (action.type) {
     case "SESSION_STARTED": {
+      if (state.session.id && state.session.id !== action.payload.sessionId) return state;
       const { sessionId, asset, paperCapital, dataMode, startTime } =
         action.payload;
       return {
         ...state,
         session: {
           id: sessionId,
+          accountId: state.session.accountId,
+          configId: state.session.configId,
           status: "RUNNING",
           asset,
           startTime,
@@ -162,6 +170,8 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         ...state,
         session: {
           id: session.sessionId,
+          accountId: session.accountId ?? null,
+          configId: session.config?.configId ?? null,
           status: session.status,
           asset: session.asset,
           startTime: session.startTime,
@@ -172,6 +182,9 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         },
         paperPnL: session.paperPnL,
       };
+    }
+    case "SESSION_UNAVAILABLE": {
+      return { ...state, session: { ...state.session, status: "UNAVAILABLE" } };
     }
     case "SESSION_STOPPED": {
       return {

@@ -1,3 +1,8 @@
+import { closeDependencyRefs } from "../domain/closeWorkflowEvidence";
+import { exitClaimPermitted } from "./paperExitStore";
+import { assertEntryTemporalAuthorization } from "../domain/entryRisk";
+import { entryCutoffAt } from "../domain/paperOrchestration";
+import { fencePaperSession } from "./paperSessionFence";
 import { candidateWriteAllowed } from "./candidateWrite";
 import { assertEntrySellProtection } from "./entryProtection";
 import { reconciliationWriteAllowed } from "./reconciliationWrite";
@@ -44,7 +49,7 @@ async function validateCloseSubmissionAuthorization(db: NonNullable<Connection["
     intentId: { $in: [...new Set([position.entryIntentId, ...chainOrders.map(child => child.intentId)])] } }, { session }).toArray();
   verifyCloseLedger(position, chainOrders, chainFills, chainIntents);
   const proofRefs = z.array(z.string().min(1)).min(1).parse(activation.evidenceRefs);
-  if (proofRefs.some(ref => !chainFills.some(fill => fill.fillId === ref && dependencies.includes(String(fill.legId)))))
+  if (JSON.stringify([...proofRefs].sort()) !== JSON.stringify(closeDependencyRefs(position, dependencies, chainOrders, chainFills)))
     throw new Error("CLOSE_DEPENDENCY_NOT_AUTHORIZED");
   if (!dependenciesAreSafe(position, dependencies, chainOrders, chainFills)) throw new Error("CLOSE_DEPENDENCY_NOT_AUTHORIZED");
 }
@@ -148,7 +153,13 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
     }
   } else if (name === "execution_intents") {
     if (data.purpose === "ENTRY") {
-      await find("execution_signals", "signalId", data.signalId);
+      const signal = await find("execution_signals", "signalId", data.signalId);
+      if (signal.orchestration && (doc.isNew || ["RISK_PENDING", "RISK_RESERVED"].includes(String(data.state)))) {
+        const cycle = await fencePaperSession(connection, session, scope.accountId, signal.orchestration);
+        equal(JSON.stringify(cycle.decision.strategyResult.candidate.legs.map((l: any) => ({ legId: l.role.toLowerCase(), contractKey: l.instrument.contractKey, side: l.side, targetUnits: l.quantityUnits }))), JSON.stringify(data.targetLegs), "cycle candidate targets");
+        equal((data.entryPlan as any)?.entryCutoffAt?.getTime(), entryCutoffAt(cycle.config, new Date(cycle.timestamp)).getTime(), "cycle entry cutoff");
+        equal(cycle.evaluatedAt, (data.entryPlan as any)?.evaluatedAt, "cycle evaluatedAt");
+      }
       if ((data.entryPlan as { kind?: string } | undefined)?.kind === "NSE_STRATEGY_LIMIT_V1") {
         equal(scope.executionMode, "PAPER", "classified entry mode");
         const requirement = calculateEntryRisk(data.targetLegs, data.entryPlan);
@@ -219,6 +230,12 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
     const initialEntryClaim = scope.executionMode === "PAPER" && intent.purpose === "ENTRY"
       && Boolean(data.submissionClaim) && !previous?.submissionClaim;
     if (initialEntryClaim) {
+      const signal = await find("execution_signals", "signalId", intent.signalId);
+      if (signal.orchestration) {
+        const cycle = await fencePaperSession(connection, session, scope.accountId, signal.orchestration);
+        equal((intent.entryPlan as any)?.entryCutoffAt?.getTime(), entryCutoffAt(cycle.config, new Date(cycle.timestamp)).getTime(), "claim entry cutoff");
+      }
+      assertEntryTemporalAuthorization(intent.entryPlan, new Date((data.submissionClaim as { claimedAt: Date }).claimedAt));
       if (!await reconciliationAdmissionHealthy(connection, session, scope, account)) throw new Error("RECONCILIATION_REQUIRED");
       if (account.killSwitchEnabled) throw new Error("KILL_SWITCH_ACTIVE");
       equal(previous?.phase, "READY", "ENTRY admission requires an existing READY child");
@@ -261,8 +278,9 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
         equal(intent.purpose, "CLOSE", "quantity-authorized child purpose");
         equal(position.activeCloseIntentId, intent.intentId, "quantity-authorized child active close");
         equal(position.closeGeneration, intent.closeGeneration, "quantity-authorized child generation");
-        const plan = z.object({ policy: z.literal("POSITION_LIMIT_V1"), closeGeneration: z.number().int().nonnegative(),
+        const plan = z.object({ monitorDecisionId: z.string().min(1).optional(), policy: z.literal("POSITION_LIMIT_V1"), closeGeneration: z.number().int().nonnegative(),
           dependsOnLegIds: z.array(z.string().min(1)) }).strict().parse(data.closePlan);
+        if (plan.monitorDecisionId && data.submissionClaim && !previous?.submissionClaim && !exitClaimPermitted(session, String(data.orderId))) throw new Error("EXIT_AUTHORIZATION_REQUIRED");
         equal(plan.closeGeneration, intent.closeGeneration, "close child generation");
         const leg = rows(position, "legs").find(l => l.legId === data.legId);
         if (!leg) throw new Error("CLOSE_HOLD_OWNERSHIP_MISMATCH");

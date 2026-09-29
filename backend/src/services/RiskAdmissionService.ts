@@ -10,7 +10,7 @@ import { executionScopeSchema, identifierSchema, type ExecutionScope } from "@tr
 import { executionModels } from "../db/executionModels";
 import { assertExecutionIndexes } from "../db/executionIndexes";
 import { requireAggregateVersion } from "../db/executionConcurrency";
-import { calculateEntryRisk, checkedRiskUnits, entryRiskPolicySchema, EntryRiskError, riskAssert,
+import { assertEntryTemporalAuthorization, calculateEntryRisk, checkedRiskUnits, entryRiskPolicySchema, EntryRiskError, riskAssert,
   verifyEntryReservation, type EntryRiskReason } from "../domain/entryRisk";
 import { assertAccountEntryProjection, loadAccountEntryProjection } from "../db/entryRiskProjection";
 import { transitionIntent } from "../domain/IntentStateMachine";
@@ -48,7 +48,7 @@ export class RiskAdmissionService {
     assertAccountEntryProjection(plain(account), projection);
     return projection;
   }
-  async authorizeEntry(input: string): Promise<EntryAdmissionResult> {
+  async authorizeEntry(input: string, assertQualificationCurrent?: () => void): Promise<EntryAdmissionResult> {
     const intentId = identifierSchema.parse(input);
     await assertExecutionIndexes(this.connection);
     const session = await this.connection.startSession();
@@ -99,6 +99,7 @@ export class RiskAdmissionService {
           && position.get("lifecycle") === "PENDING_ENTRY" && position.get("integrity") === "CONSISTENT"
           && position.get("activeCloseIntentId") === null, "STALE_EXECUTION_CHAIN");
         const now = this.clock(), expiresAt = new Date(Math.min(requirement.expiresAt.getTime(), intent.get("deadline").getTime()));
+        assertEntryTemporalAuthorization(intent.get("entryPlan"), now);
         riskAssert(expiresAt.getTime() > now.getTime() && signal.get("expiresAt").getTime() > now.getTime()
           && intent.get("policyVersion") === account.get("policyVersion"), "STALE_EXECUTION_CHAIN");
         const policy = entryRiskPolicySchema.safeParse(account.get("entryRiskPolicy"));
@@ -115,6 +116,10 @@ export class RiskAdmissionService {
         const slots = held.reservedSlots + held.committedSlots + 1n;
         riskAssert(total <= BigInt(policy.data.maxReservedRiskMinor), "RISK_CAPACITY_EXCEEDED");
         riskAssert(slots <= BigInt(policy.data.maxPositionSlots), "POSITION_LIMIT_EXCEEDED");
+        assertEntryTemporalAuthorization(intent.get("entryPlan"), this.clock());
+        riskAssert(!signal.get("orchestration") || intent.get("entryPlan.dataMode") !== "KITE_REAL"
+          || typeof assertQualificationCurrent === "function", "STALE_EXECUTION_CHAIN");
+        assertQualificationCurrent?.(); // Pure captured ownership check; no broker I/O, including on transaction retry.
         // This first CAS write serializes competing admissions before any authorization.
         account.set({ ...daily, reservedExposureMinor: checkedRiskUnits(pending), reservedMarginMinor: checkedRiskUnits(pending), positionSlots: checkedRiskUnits(slots), committedPositionSlots: checkedRiskUnits(held.committedSlots) });
         await withDayWrite(session, () => this.save(account, session));
@@ -159,6 +164,8 @@ export class RiskAdmissionService {
           eventId: `${reservationId}:TRADING_DAY_ADVANCED`, eventType: "TRADING_DAY_ADVANCED", causationId: intentId,
           reason: "QUALIFIED_LOCAL_DAY", tradingDate: daily.dailyTradingDay, evidenceRefs: [reservationId],
           payload: { kind: "TRADING_DAY", from: fromDay, to: daily.dailyTradingDay, realizedPnlMinor: daily.dailyRealizedPnlMinor } });
+        assertEntryTemporalAuthorization(intent.get("entryPlan"), this.clock());
+        assertQualificationCurrent?.();
         return { status: "AUTHORIZED", intentId, reservationId, orderIds: orderIds.sort(), requiredRiskMinor: requirement.requiredRiskMinor };
       }), { readConcern: { level: "snapshot" }, writeConcern: { w: "majority" } });
     } catch (error) {

@@ -13,11 +13,19 @@ export interface MonitoringSessionDocument
   createdAt: Date;
 }
 
-const MonitoringSessionSchema = new Schema(
+export const MonitoringSessionSchema = new Schema(
   {
     sessionId: { type: String, required: true },
-    executionMode: { type: String, enum: ["LEGACY_PAPER"], default: "LEGACY_PAPER", immutable: true },
+    executionMode: { type: String, enum: ["LEGACY_PAPER", "PAPER"], default: "LEGACY_PAPER", immutable: true },
     asset: { type: String, required: true },
+    accountId: { type: String, immutable: true },
+    startupId: { type: String, immutable: true },
+    config: { type: Schema.Types.Mixed, immutable: true },
+    configFingerprint: { type: String, immutable: true },
+    strategyFamily: { type: String, enum: ["LONG_OPTION", "DEBIT_VERTICAL", "CREDIT_VERTICAL"] },
+    cycleFence: { type: Number, default: 0 },
+    lastCycleAt: Date, lastCycleOutcome: String, blockingReason: String,
+    lastCycleId: String,
     startTime: { type: String, required: true },
     stopTime: { type: String, default: null },
     status: { type: String, enum: ["RUNNING", "STOPPED", "CRASHED"], required: true },
@@ -27,7 +35,7 @@ const MonitoringSessionSchema = new Schema(
     paperPnL: { type: Number, required: true, default: 0 },
     paperCapital: { type: Number, required: true },
     ticksSkipped: { type: Number, required: true, default: 0 },
-    dataMode: { type: String, enum: ["LIVE", "MOCK"], required: true },
+    dataMode: { type: String, enum: ["LIVE", "MOCK", "KITE_REAL"], required: true },
     createdAt: { type: Date, default: Date.now },
   },
   {
@@ -36,6 +44,8 @@ const MonitoringSessionSchema = new Schema(
 );
 
 MonitoringSessionSchema.index({ status: 1 });
+MonitoringSessionSchema.index({ accountId: 1 }, { unique: true, partialFilterExpression: { executionMode: "PAPER", status: "RUNNING" } });
+MonitoringSessionSchema.index({ sessionId: 1 }, { unique: true, partialFilterExpression: { executionMode: "PAPER" } });
 
 /**
  * MonitoringSession model for tracking the lifecycle and performance of trading sessions.

@@ -9,7 +9,8 @@ const root = path.resolve(__dirname, "..");
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function main() {
   const directory = path.join(root, "tests/integration");
-  const files = fs.existsSync(directory) ? fs.readdirSync(directory).filter(f => f.endsWith(".test.ts")).map(f => path.join(directory, f)) : [];
+  const files = fs.existsSync(directory) ? fs.readdirSync(directory).filter(f => f.endsWith(".test.ts")
+    && (!process.env.EXECUTION_TEST_FILE || f === process.env.EXECUTION_TEST_FILE)).map(f => path.join(directory, f)) : [];
   if (!files.length) throw new Error("NOT RUN: integration test files are missing");
   const database = `phase2a_test_${process.pid}_${Date.now()}`;
   let server, temporary, admin, child;
@@ -42,7 +43,8 @@ async function main() {
     if (!primary) throw new Error("NOT RUN: transaction-capable primary unavailable");
     const uri = new URL(base); uri.pathname = `/${database}`;
     console.log("Integration: real Mongo replica-set/sharded primary; isolated temporary test database.");
-    child = spawn(process.execPath, ["--require", "ts-node/register", "--test", "--test-concurrency=1", ...files], {
+    child = spawn(process.execPath, ["--require", "ts-node/register", "--test", "--test-concurrency=1",
+      ...(process.env.EXECUTION_TEST_PATTERN ? [`--test-name-pattern=${process.env.EXECUTION_TEST_PATTERN}`] : []), ...files], {
       cwd: root, stdio: "inherit", env: { ...process.env, TS_NODE_PROJECT: "tsconfig.test.json", EXECUTION_TEST_MONGO_URI: uri.toString() },
     });
     process.exitCode = await new Promise((resolve, reject) => { child.on("error", reject); child.on("exit", code => resolve(code ?? 1)); });

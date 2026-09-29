@@ -27,20 +27,25 @@ export interface SignalLogDocument extends Document {
   timestamp: Date;
 }
 
-const SignalLogSchema = new Schema<SignalLogDocument>(
+export const SignalLogSchema = new Schema(
   {
     sessionId: { type: String, required: true, index: true },
-    executionMode: { type: String, enum: ["LEGACY_PAPER"], default: "LEGACY_PAPER", immutable: true },
+    cycleId: { type: String, immutable: true }, accountId: { type: String, immutable: true },
+    window: { type: String, immutable: true }, startupId: { type: String, immutable: true },
+    configFingerprint: { type: String, immutable: true }, config: { type: Schema.Types.Mixed, immutable: true },
+    outcome: String, reason: String, decision: Schema.Types.Mixed, evaluatedAt: String,
+    intentId: String, positionId: String,
+    executionMode: { type: String, enum: ["LEGACY_PAPER", "PAPER"], default: "LEGACY_PAPER", immutable: true },
     asset: { type: String, required: true },
     ltp: { type: Number },
-    signal: { type: Schema.Types.Mixed, required: true },
+    signal: { type: Schema.Types.Mixed },
     verifierResult: { type: Schema.Types.Mixed, default: null },
-    riskAction: { type: String, enum: ["SUGGEST", "BLOCK"], required: true },
+    riskAction: { type: String, enum: ["SUGGEST", "BLOCK"] },
     blockReason: { type: String, default: null },
-    indicators: { type: Schema.Types.Mixed, required: true },
+    indicators: { type: Schema.Types.Mixed },
     greeksSnapshot: { type: Schema.Types.Mixed, default: null },
-    expiryContext: { type: Schema.Types.Mixed, required: true },
-    dataMode: { type: String, enum: ["LIVE", "MOCK"], required: true },
+    expiryContext: { type: Schema.Types.Mixed },
+    dataMode: { type: String, enum: ["LIVE", "MOCK", "KITE_REAL"], required: true },
     timestamp: { type: Date, default: Date.now, index: -1 },
   },
   {
@@ -50,6 +55,7 @@ const SignalLogSchema = new Schema<SignalLogDocument>(
 
 SignalLogSchema.index({ sessionId: 1, timestamp: -1 });
 SignalLogSchema.index({ asset: 1, timestamp: -1 });
+SignalLogSchema.index({ cycleId: 1 }, { unique: true, partialFilterExpression: { executionMode: "PAPER" } });
 
 /**
  * SignalLog model for persisting every generated signal and its context.

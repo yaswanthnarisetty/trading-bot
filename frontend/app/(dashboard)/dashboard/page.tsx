@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import MockDataBanner from "../../../components/shared/MockDataBanner";
 import ConnectionStatus from "../../../components/shared/ConnectionStatus";
 import SignalCard from "../../../components/dashboard/SignalCard";
@@ -14,15 +14,18 @@ import { useAppContext } from "../../../context/AppContext";
 import { useWebSocket } from "../../../hooks/useWebSocket";
 import { useSessionTimer } from "../../../hooks/useSessionTimer";
 import {
-  getActiveSession,
+  getActiveSession, getSession,
   getAssets,
   getPositions,
   getSignalHistory,
-  startSession,
+  startSession, getPaperSessionOptions, recoverPaperSession, type PaperSessionOption,
   stopSession,
   type Asset,
   type SignalLog,
 } from "../../../lib/api";
+
+import { discoverPaperSession, pollPaperSession, retainPaperSession, stopPaperSession } from "../../../lib/paperSessionControl";
+const selectionKey = "paper-dashboard-selection-v1";
 
 function signalLogToPayload(
   log: SignalLog,
@@ -52,19 +55,34 @@ export default function DashboardPage(): JSX.Element {
   const { connect, disconnect } = useWebSocket();
   const elapsedLabel = useSessionTimer();
 
+  const [paperOptions, setPaperOptions] = useState<PaperSessionOption[]>([]);
+  const [selectedConfig, setSelectedConfig] = useState("");
+  const [sessionMessage, setSessionMessage] = useState("");
+  const [cycleStatus, setCycleStatus] = useState("");
   const [assets, setAssets] = useState<Asset[]>([]);
   const [selectedAsset, setSelectedAsset] = useState<string>("");
   const [isLoadingSession, setIsLoadingSession] = useState(false);
 
+  const selectionVersion = useRef(0);
+
   useEffect(() => {
+    const version = ++selectionVersion.current;
     async function bootstrap() {
       try {
-        const [assetList, active] = await Promise.all([
-          getAssets(),
-          getActiveSession(),
-        ]);
-        setAssets(assetList);
-        if (!selectedAsset && assetList.length > 0) {
+        const [assetList, options] = await Promise.all([getAssets(), getPaperSessionOptions()]);
+        if (version !== selectionVersion.current) return;
+        setAssets(assetList); setPaperOptions(options);
+        const saved = JSON.parse(sessionStorage.getItem(selectionKey) ?? "null");
+        const chosen = options.find(c => c.configId === saved?.configId);
+        let active = null;
+        if (chosen) {
+          setSelectedConfig(chosen.configId); setSelectedAsset(chosen.asset);
+          active = saved?.sessionId
+            ? await pollPaperSession({ sessionId: saved.sessionId, accountId: chosen.accountId, status: "UNKNOWN" }, getSession)
+            : await discoverPaperSession(chosen.accountId, getActiveSession);
+          if (version !== selectionVersion.current) return;
+        }
+        if (!chosen && !selectedAsset && assetList.length > 0) {
           setSelectedAsset(assetList[0]!.key);
         }
         if (active) {
@@ -93,35 +111,62 @@ export default function DashboardPage(): JSX.Element {
           });
         }
       } catch (error) {
-        console.error("Failed to bootstrap dashboard", error);
+        if (version === selectionVersion.current) setSessionMessage("Selected session unavailable. No other account session was selected.");
       }
     }
     void bootstrap();
+    return () => { selectionVersion.current++; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  async function handleStart(): Promise<void> {
-    if (!selectedAsset || state.session.status === "RUNNING") return;
+  useEffect(() => {
+    if (!state.session.id || !state.session.accountId || state.session.status !== "RUNNING") return;
+    let live = true; const version = selectionVersion.current;
+    const selected = { sessionId: state.session.id, accountId: state.session.accountId, status: state.session.status };
+    const refresh = async () => { try {
+      const current = await pollPaperSession(selected, getSession);
+      if (live && version === selectionVersion.current) {
+        dispatch({ type: "SESSION_SYNCED", payload: current });
+        setCycleStatus(`${current.strategyFamily ?? ""} · ${current.dataMode} · ${current.status} · ${current.lastCycleOutcome ?? "WAITING"} · ${current.blockingReason ?? ""}`);
+        if (current.status !== "RUNNING") disconnect();
+      }
+    } catch { if (live && version === selectionVersion.current) { dispatch({ type: "SESSION_UNAVAILABLE" }); disconnect(); setCycleStatus("Selected session unavailable; no alternate session selected"); } } };
+    void refresh(); const timer = setInterval(refresh, 10000);
+    return () => { live = false; clearInterval(timer); };
+  }, [state.session.id, state.session.accountId, state.session.status, dispatch, disconnect]);
+
+  async function selectConfiguration(configId: string): Promise<void> {
+    const version = ++selectionVersion.current;
+    setSelectedConfig(configId); disconnect(); dispatch({ type: "RESET" }); setCycleStatus("");
+    sessionStorage.setItem(selectionKey, JSON.stringify({ configId }));
+    const chosen = paperOptions.find(c => c.configId === configId);
+    if (!chosen) return;
     setIsLoadingSession(true);
     try {
-      await startSession(selectedAsset);
-      const session = await getActiveSession();
-      if (!session) {
-        throw new Error("Session started but active session was not returned");
+      const active = await discoverPaperSession(chosen.accountId, getActiveSession);
+      if (version !== selectionVersion.current) return;
+      if (active) {
+        sessionStorage.setItem(selectionKey, JSON.stringify({ configId, sessionId: active.sessionId }));
+        dispatch({ type: "SESSION_SYNCED", payload: active }); connect(active.sessionId);
       }
-      dispatch({
-        type: "SESSION_STARTED",
-        payload: {
-          sessionId: session.sessionId,
-          asset: session.asset,
-          paperCapital: session.paperCapital,
-          dataMode: session.dataMode,
-          startTime: session.startTime,
-        },
-      });
+    } catch { if (version === selectionVersion.current) setSessionMessage("Account session discovery unavailable"); }
+    finally { if (version === selectionVersion.current) setIsLoadingSession(false); }
+  }
+
+  async function handleStart(): Promise<void> {
+    if (!selectedAsset || state.session.status === "RUNNING") return;
+    selectionVersion.current++;
+    setIsLoadingSession(true);
+    try {
+      const configuration = paperOptions.find(c => c.configId === selectedConfig && c.asset === selectedAsset);
+      if (!configuration) throw new Error("Select an explicitly configured PAPER strategy.");
+      const session = retainPaperSession(await startSession(configuration), configuration.accountId);
+      sessionStorage.setItem(selectionKey, JSON.stringify({ configId: configuration.configId, sessionId: session.sessionId }));
+      setSessionMessage("PAPER entry evaluation started. Durable exit monitoring runs independently when configured.");
+      dispatch({ type: "SESSION_SYNCED", payload: session });
       connect(session.sessionId);
     } catch (error) {
-      console.error("Failed to start session", error);
+      setSessionMessage(error instanceof Error ? error.message : "Session start blocked");
     } finally {
       setIsLoadingSession(false);
     }
@@ -131,9 +176,12 @@ export default function DashboardPage(): JSX.Element {
     if (!state.session.id || state.session.status !== "RUNNING") return;
     setIsLoadingSession(true);
     try {
-      await stopSession(state.session.id);
+      await stopPaperSession({ sessionId: state.session.id, accountId: state.session.accountId ?? undefined,
+        executionMode: "PAPER", status: state.session.status }, stopSession);
+      selectionVersion.current++;
       dispatch({ type: "SESSION_STOPPED" });
       disconnect();
+      setSessionMessage("Evaluation stopped. Existing positions remain open; reservations are retained.");
     } catch (error) {
       console.error("Failed to stop session", error);
     } finally {
@@ -187,6 +235,7 @@ export default function DashboardPage(): JSX.Element {
         }}
       />
 
+      <p role="status" className="text-sm text-amber-300">{sessionMessage || "PAPER entries and independent durable exit monitoring. Stop prevents new entries; it does not imply flatness."} Legacy financial panels below do not represent the durable ledger. {cycleStatus}</p>
       {/* Session Control Toolbar */}
       <section
         className="rounded-2xl p-4"
@@ -207,9 +256,9 @@ export default function DashboardPage(): JSX.Element {
                 background: "rgba(255,255,255,0.05)",
                 border: "1px solid rgba(255,255,255,0.1)",
               }}
-              disabled={isRunning}
+              disabled={isRunning || isLoadingSession}
               value={selectedAsset}
-              onChange={(e) => setSelectedAsset(e.target.value)}
+              onChange={(e) => { setSelectedAsset(e.target.value); void selectConfiguration(""); }}
             >
               {assets.map((asset) => (
                 <option key={asset.key} value={asset.key}>
@@ -219,6 +268,22 @@ export default function DashboardPage(): JSX.Element {
             </select>
           </div>
 
+          <div className="flex flex-col gap-1">
+            <label className="ui-label" htmlFor="paper-configuration">PAPER strategy configuration</label>
+            <select id="paper-configuration" className="rounded-lg min-h-11 px-3 py-2 bg-neutral-900 text-sm"
+              disabled={isRunning || isLoadingSession} value={selectedConfig} onChange={e => { void selectConfiguration(e.target.value); }}>
+              <option value="">Select configuration</option>
+              {paperOptions.filter(c => c.asset === selectedAsset).map(c => <option key={c.configId} value={c.configId}>
+                {c.strategyFamily} · {c.dataMode} · {c.accountId}
+              </option>)}
+            </select>
+          </div>
+          <button type="button" className="min-h-11 px-3 text-sm underline" disabled={isLoadingSession || isRunning || !selectedConfig}
+            onClick={async () => { setIsLoadingSession(true); try {
+              const r = await recoverPaperSession(selectedConfig); setSessionMessage(`Recovery: ${r.status}. Start remains a separate action.`);
+            } catch(e) { setSessionMessage(e instanceof Error ? e.message : "Recovery blocked"); } finally { setIsLoadingSession(false); } }}>
+            Check recovery (read-only broker)
+          </button>
           {/* Start/Stop button */}
           <div className="flex flex-col gap-1">
             <span className="ui-label">Session</span>
@@ -226,7 +291,7 @@ export default function DashboardPage(): JSX.Element {
               type="button"
               onClick={isRunning ? handleStop : handleStart}
               disabled={
-                isLoadingSession || (!selectedAsset && !isRunning)
+                isLoadingSession || ((!selectedAsset || !selectedConfig) && !isRunning)
               }
               className="rounded-lg px-5 py-2 text-xs font-bold uppercase tracking-widest transition-all disabled:opacity-50"
               style={{
