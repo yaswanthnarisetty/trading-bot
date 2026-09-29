@@ -15,7 +15,8 @@ export async function loadRealizedProjection(connection: Connection, session: Cl
     const fills = await db.collection("execution_fills").find({ ...scope, positionId: pos.positionId }, { session }).toArray();
     const intents = await db.collection("execution_intents").find({ ...scope, intentId: { $in: [...new Set([pos.entryIntentId, ...orders.map(o => o.intentId)])] } }, { session }).toArray();
     verifyCloseLedger(pos, orders, fills, intents);
-    const pnl = realizedPosition(pos.entryIntentId, fills);
+    const intent = intents.find(i => i.intentId === pos.entryIntentId)!;
+    const pnl = realizedPosition(pos.entryIntentId, fills, { targetLegs: intent.targetLegs, entryPlan: intent.entryPlan });
     riskAssert(pos.realizedPnlMinor === pnl.realizedPnlMinor
       && pos.legs.every((leg: Row) => leg.realizedPnlMinor === (pnl.legs[leg.legId] ?? 0)), "RISK_PROJECTION_MISMATCH");
     total += BigInt(pnl.realizedPnlMinor); realizations.push(...pnl.realizations);

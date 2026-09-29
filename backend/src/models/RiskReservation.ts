@@ -36,7 +36,12 @@ RiskReservationSchema.pre("validate", function () {
   const exposure = this.get("remainingExposureMinor"), initialExposure = this.get("initialExposureMinor");
   if ((typeof margin === "number" && typeof initialMargin === "number" && margin > initialMargin)
     || (typeof exposure === "number" && typeof initialExposure === "number" && exposure > initialExposure)) {
-    this.invalidate("remainingMarginMinor", "Remaining hold exceeds authorized reservation");
+    // Classified verticals may restore pending risk from actual Fill-backed
+    // proceeds. The mandatory write boundary proves the exact amount; legacy
+    // holds retain their original upper bound.
+    const family = this.get("entryAdmission.family");
+    if (this.get("kind") !== "ENTRY_RISK" || !["DEBIT_VERTICAL", "CREDIT_VERTICAL"].includes(String(family)))
+      this.invalidate("remainingMarginMinor", "Remaining hold exceeds authorized reservation");
   }
   const state = this.get("state");
   if (typeof state === "string" && ["CONSUMED", "RELEASED"].includes(state) && (this.get("remainingMarginMinor") !== 0 || this.get("remainingExposureMinor") !== 0)) {

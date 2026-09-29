@@ -1,7 +1,7 @@
 import type { AssetKey } from "../config/assets";
 import { selectStrategyKind } from "../services/StrategySelector";
 import type { InstrumentDefinition } from "../services/KiteInstrumentMasterService";
-import { assertMarketAnalytics, type AnalyticsOutcome, type MarketAnalyticsSnapshot, type OptionAnalytics } from "./marketAnalytics";
+import { isMarketAnalyticsFresh, assertMarketAnalytics, type AnalyticsOutcome, type MarketAnalyticsSnapshot, type OptionAnalytics } from "./marketAnalytics";
 import { analyticsEvidenceId } from "./analyticsEvidence";
 import { freeze, marketTimestamp } from "./kiteMarketData";
 
@@ -116,6 +116,11 @@ export interface StrategyEvaluationInput {
   readonly evaluatedAt: string;
   /** Logical duplicates in the current evaluation context only; durable admission is elsewhere. */
   readonly priorCandidateKeys?: readonly string[];
+}
+const issuedCandidates = new WeakMap<object, MarketAnalyticsSnapshot>();
+export function assertIssuedTradeCandidate(value: unknown, now?: number): asserts value is TradeCandidate {
+  if (!value || typeof value !== "object" || !issuedCandidates.has(value)) throw new Error("ISSUED_CANDIDATE_REQUIRED");
+  if (now !== undefined && !isMarketAnalyticsFresh(issuedCandidates.get(value)!, now)) throw new Error("STALE_CANDIDATE");
 }
 const hold = (reason: HoldReason): StrategyEvaluationResult => freeze({ action: "HOLD", reason });
 const integer = (n: number) => Number.isSafeInteger(n) && n > 0;
@@ -280,5 +285,6 @@ export function evaluateStrategy(input: StrategyEvaluationInput): StrategyEvalua
   else candidate = { ...base, strategyFamily: family, strategyKind: bull ? "LONG_CALL" : "LONG_PUT", strategy: bull ? "LONG_CALL" : "LONG_PUT",
     widthMinor: null, debitPerUnitMinor: Number(-cash), debitPerLotMinor: Number(-cash * BigInt(lot)),
     maxProfitPerUnitMinor: null, maxProfitPerLotMinor: null };
+  issuedCandidates.set(candidate, snapshot);
   return freeze({ action: "CANDIDATE", candidate });
 }

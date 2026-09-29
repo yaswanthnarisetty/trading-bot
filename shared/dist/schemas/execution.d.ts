@@ -145,6 +145,7 @@ export declare const eventPayloadSchema: z.ZodDiscriminatedUnion<"kind", [z.ZodO
     legId: z.ZodString;
     quantityUnits: z.ZodEffects<z.ZodNumber, number, number>;
     releasedPendingMinor: z.ZodEffects<z.ZodNumber, number, number>;
+    restoredPendingMinor: z.ZodOptional<z.ZodEffects<z.ZodNumber, number, number>>;
     committedPremiumMinor: z.ZodEffects<z.ZodNumber, number, number>;
     remainingPendingMinor: z.ZodEffects<z.ZodNumber, number, number>;
     committedExposureMinor: z.ZodEffects<z.ZodNumber, number, number>;
@@ -160,6 +161,7 @@ export declare const eventPayloadSchema: z.ZodDiscriminatedUnion<"kind", [z.ZodO
     remainingPendingMinor: number;
     committedExposureMinor: number;
     slotTransferred: boolean;
+    restoredPendingMinor?: number | undefined;
 }, {
     kind: "ENTRY_RISK_TRANSFER";
     fillId: string;
@@ -171,6 +173,7 @@ export declare const eventPayloadSchema: z.ZodDiscriminatedUnion<"kind", [z.ZodO
     remainingPendingMinor: number;
     committedExposureMinor: number;
     slotTransferred: boolean;
+    restoredPendingMinor?: number | undefined;
 }>, z.ZodObject<{
     kind: z.ZodLiteral<"REFERENCE">;
     entityId: z.ZodString;
@@ -344,6 +347,7 @@ export declare const tradingEventSchema: z.ZodEffects<z.ZodObject<{
         legId: z.ZodString;
         quantityUnits: z.ZodEffects<z.ZodNumber, number, number>;
         releasedPendingMinor: z.ZodEffects<z.ZodNumber, number, number>;
+        restoredPendingMinor: z.ZodOptional<z.ZodEffects<z.ZodNumber, number, number>>;
         committedPremiumMinor: z.ZodEffects<z.ZodNumber, number, number>;
         remainingPendingMinor: z.ZodEffects<z.ZodNumber, number, number>;
         committedExposureMinor: z.ZodEffects<z.ZodNumber, number, number>;
@@ -359,6 +363,7 @@ export declare const tradingEventSchema: z.ZodEffects<z.ZodObject<{
         remainingPendingMinor: number;
         committedExposureMinor: number;
         slotTransferred: boolean;
+        restoredPendingMinor?: number | undefined;
     }, {
         kind: "ENTRY_RISK_TRANSFER";
         fillId: string;
@@ -370,6 +375,7 @@ export declare const tradingEventSchema: z.ZodEffects<z.ZodObject<{
         remainingPendingMinor: number;
         committedExposureMinor: number;
         slotTransferred: boolean;
+        restoredPendingMinor?: number | undefined;
     }>, z.ZodObject<{
         kind: z.ZodLiteral<"REFERENCE">;
         entityId: z.ZodString;
@@ -485,6 +491,7 @@ export declare const tradingEventSchema: z.ZodEffects<z.ZodObject<{
         remainingPendingMinor: number;
         committedExposureMinor: number;
         slotTransferred: boolean;
+        restoredPendingMinor?: number | undefined;
     } | {
         kind: "REFERENCE";
         entityId: string;
@@ -564,6 +571,7 @@ export declare const tradingEventSchema: z.ZodEffects<z.ZodObject<{
         remainingPendingMinor: number;
         committedExposureMinor: number;
         slotTransferred: boolean;
+        restoredPendingMinor?: number | undefined;
     } | {
         kind: "REFERENCE";
         entityId: string;
@@ -643,6 +651,7 @@ export declare const tradingEventSchema: z.ZodEffects<z.ZodObject<{
         remainingPendingMinor: number;
         committedExposureMinor: number;
         slotTransferred: boolean;
+        restoredPendingMinor?: number | undefined;
     } | {
         kind: "REFERENCE";
         entityId: string;
@@ -722,6 +731,7 @@ export declare const tradingEventSchema: z.ZodEffects<z.ZodObject<{
         remainingPendingMinor: number;
         committedExposureMinor: number;
         slotTransferred: boolean;
+        restoredPendingMinor?: number | undefined;
     } | {
         kind: "REFERENCE";
         entityId: string;

@@ -35,7 +35,7 @@ export async function verifyEntryRiskLedger(connection: Connection, session: Cli
     const leg = verified.requirement.legs.find(leg => leg.legId === fill.legId);
     riskAssert(order && leg && fill.positionId === position.positionId && fill.broker === "PAPER"
       && order.positionId === position.positionId && order.legId === leg.legId && order.contractKey === leg.contractKey
-      && order.side === "BUY" && order.quantityUnits === leg.quantityUnits && order.limitPriceMinor === leg.limitPriceMinor
+      && order.side === leg.side && order.quantityUnits === leg.quantityUnits && order.limitPriceMinor === leg.limitPriceMinor
       && order.generation === verified.admission.generation && order.sliceId === "entry"
       && order.submissionClaim && order.submissionAuthorization?.reservationId === reservation.reservationId
       && fill.brokerNamespace === order.brokerNamespace && fill.brokerOrderId === order.brokerOrderId, "STALE_EXECUTION_CHAIN");

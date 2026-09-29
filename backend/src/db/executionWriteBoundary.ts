@@ -1,3 +1,5 @@
+import { candidateWriteAllowed } from "./candidateWrite";
+import { assertEntrySellProtection } from "./entryProtection";
 import { reconciliationWriteAllowed } from "./reconciliationWrite";
 import { recoveryWriteAllowed } from "./recoveryWrite";
 import { executionHostFor } from "./executionHost";
@@ -20,7 +22,7 @@ import { fillAccounting, type AccountingFill } from "../domain/fillAccounting";
 import { dependenciesAreSafe, verifyCloseLedger } from "../domain/closeWorkflowEvidence";
 import { realizedPosition } from "../domain/realizedRisk";
 import { assertRealizedProjection, dayWriteAllowed, killWriteAllowed, loadRealizedProjection } from "./realizedRiskProjection";
-import { checkedRiskUnits, entryRiskPolicySchema, riskAssert, verifyEntryReservation } from "../domain/entryRisk";
+import { calculateEntryRisk, entryProjectionFromFills, checkedRiskUnits, entryRiskPolicySchema, riskAssert, verifyEntryReservation } from "../domain/entryRisk";
 
 import { assertAccountEntryProjection, loadAccountEntryProjection, verifyEntryRiskLedger } from "./entryRiskProjection";
 
@@ -147,6 +149,11 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
   } else if (name === "execution_intents") {
     if (data.purpose === "ENTRY") {
       await find("execution_signals", "signalId", data.signalId);
+      if ((data.entryPlan as { kind?: string } | undefined)?.kind === "NSE_STRATEGY_LIMIT_V1") {
+        equal(scope.executionMode, "PAPER", "classified entry mode");
+        const requirement = calculateEntryRisk(data.targetLegs, data.entryPlan);
+        if (doc.isNew && !candidateWriteAllowed(session, requirement.fingerprint)) throw new Error("ISSUED_CANDIDATE_ADAPTER_REQUIRED");
+      }
     } else {
       const position = await positionFor(data.positionId);
       for (const leg of rows(data, "targetLegs")) {
@@ -200,6 +207,13 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
   } else if (name === "execution_orders") {
     const { position, intent } = await checkOrder(data);
     const previous = await db.collection(name).findOne({ ...scope, orderId: data.orderId }, { session });
+    const entryPlan = intent.entryPlan as { kind?: string; family?: string; strategyKind?: string; legs: { legId: string; role: string }[] } | undefined;
+    if (entryPlan?.kind === "NSE_STRATEGY_LIMIT_V1") {
+      const classification = z.record(z.unknown()).parse(data.entryClassification);
+      equal(classification.family, entryPlan.family, "immutable entry family");
+      equal(classification.strategyKind, entryPlan.strategyKind, "immutable entry strategy kind");
+      equal(classification.role, entryPlan.legs.find(l => l.legId === data.legId)?.role, "immutable entry role");
+    } else if (data.entryClassification !== undefined) throw new Error("CLASSIFIED_ENTRY_PARENT_REQUIRED");
     // The persisted physical claim separates new dispatch from already-sent truth.
     // Missing optional economics must never select a weaker admission path.
     const initialEntryClaim = scope.executionMode === "PAPER" && intent.purpose === "ENTRY"
@@ -228,6 +242,9 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
         equal((authorization.expiresAt as Date).getTime(), Math.min(requirement.expiresAt.getTime(), (intent.deadline as Date).getTime()), "entry authorization expiry");
         // An initial claim must be backed by the atomically published admission.
         // Once claimed, evidence ingestion never repeats pre-dispatch admission.
+        if (requirement.family && data.side === "SELL" && !previous?.submissionClaim
+          && (data.phase === "READY" || initialEntryClaim))
+          await assertEntrySellProtection(connection, session, scope, data, intent, position, reservation);
         if (initialEntryClaim) {
           assertAccountEntryProjection(account, await loadAccountEntryProjection(connection, session, scope));
           const event = await find("execution_events", "eventId", `${reservation.reservationId}:RISK_RESERVED`);
@@ -337,7 +354,7 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
     checkEvidenceIds(data, fills);
     const entryRisk = await db.collection("execution_reservations").findOne({ ...scope, intentId: data.entryIntentId, kind: "ENTRY_RISK" }, { session });
     if (entryRisk) {
-      const pnl = realizedPosition(text(data, "entryIntentId"), fills);
+      const pnl = realizedPosition(text(data, "entryIntentId"), fills, { targetLegs: intent.targetLegs, entryPlan: intent.entryPlan });
       equal(data.realizedPnlMinor, pnl.realizedPnlMinor, "Fill-derived position P&L");
       for (const leg of rows(data, "legs")) equal(leg.realizedPnlMinor, pnl.legs[text(leg, "legId")] ?? 0, "Fill-derived leg P&L");
     }
@@ -429,9 +446,10 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
       equal(aggregate.intentId, fill.intentId, "risk event Fill intent");
       const intent = await intentFor(fill.intentId), position = await positionFor(fill.positionId);
       const { requirement, projection, fills } = await verifyEntryRiskLedger(connection, session, scope, aggregate, intent, position);
-      const leg = requirement.legs.find(leg => leg.legId === fill.legId)!;
       equal(payload.legId, fill.legId, "risk event leg"); equal(payload.quantityUnits, fill.quantityUnits, "risk event units");
-      equal(payload.releasedPendingMinor, checkedRiskUnits(BigInt(units(fill, "quantityUnits")) * BigInt(leg.limitPriceMinor)), "risk event pending transfer");
+      const previousPending = entryProjectionFromFills(requirement, String(intent.intentId), fills.filter(f => f.fillId !== fill.fillId)).pendingMinor;
+      equal(payload.releasedPendingMinor, Math.max(0, previousPending - projection.pendingMinor), "risk event pending transfer");
+      equal(payload.restoredPendingMinor ?? 0, Math.max(0, projection.pendingMinor - previousPending), "risk event pending retention");
       equal(payload.committedPremiumMinor, checkedRiskUnits(BigInt(units(fill, "quantityUnits")) * BigInt(units(fill, "priceMinor"))), "risk event actual premium");
       equal(payload.remainingPendingMinor, projection.pendingMinor, "risk event remaining pending");
       equal(payload.committedExposureMinor, projection.committedMinor, "risk event committed premium");

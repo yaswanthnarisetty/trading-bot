@@ -9,7 +9,7 @@ import { transitionOrder, type OrderState } from "../domain/OrderStateMachine";
 import { transitionPosition, type PositionState } from "../domain/PositionStateMachine";
 import { fillAccounting } from "../domain/fillAccounting";
 import { dailyPnl, realizedPosition, tradingDay } from "../domain/realizedRisk";
-import { assertRealizedProjection, loadRealizedProjection, withDayWrite } from "../db/realizedRiskProjection";
+import { assertRealizedProjection, loadRealizedProjection, withKillWrite, withDayWrite } from "../db/realizedRiskProjection";
 import { riskAudit } from "./riskAudit";
 import { checkedRiskUnits, entryProjectionFromFills, verifyEntryReservation } from "../domain/entryRisk";
 import { assertAccountEntryProjection, loadAccountEntryProjection } from "../db/entryRiskProjection";
@@ -121,7 +121,9 @@ export class FillProcessor {
         { type: "APPLY_FILL", fill: evidence(fill) }));
       const nextPosition = value(transitionPosition({ ...position.toObject(), fills: oldFills, orders: orders.map(o => o.toObject()) } as PositionState,
         { type: intent.get("purpose") === "ENTRY" ? "ENTRY_FILL" : "EXIT_FILL", fill: evidence(fill) }));
-      const realized = tracksRealized ? realizedPosition(position.get("entryIntentId"), [...oldFills, evidence(fill)]) : undefined;
+      const economicEntry = tracksRealized ? await this.models.OrderIntent.findOne({ ...this.scope, intentId: position.get("entryIntentId") }).session(session).orFail() : undefined;
+      const realized = tracksRealized ? realizedPosition(position.get("entryIntentId"), [...oldFills, evidence(fill)],
+        { targetLegs: economicEntry!.get("targetLegs"), entryPlan: economicEntry!.get("entryPlan") }) : undefined;
       const legs = nextPosition.legs.map(leg => {
         const accounting = fillAccounting(nextPosition.fills.filter(f => f.legId === leg.legId), nextPosition.entryIntentId);
         if (intent.get("purpose") === "ENTRY" || leg.legId !== trade.legId) return { ...leg, ...accounting };
@@ -176,9 +178,29 @@ export class FillProcessor {
           committedExposureMinor: checkedRiskUnits(committed), committedPositionSlots: checkedRiskUnits(committedSlots) });
         await this.save(current, session);
         assertAccountEntryProjection(current.toObject(), await loadAccountEntryProjection(this.connection, session, this.scope));
-        const leg = priorRisk.requirement.legs.find(leg => leg.legId === trade.legId)!;
+        if (priorRisk.requirement.family) {
+          const policy = current.get("entryRiskPolicy"), usage = BigInt(next.pendingMinor) + BigInt(next.committedMinor);
+          const terms = priorRisk.requirement.legs.find(l => l.legId === trade.legId)!;
+          const adverseLimitViolation = trade.side === "BUY" ? trade.priceMinor > terms.limitPriceMinor : trade.priceMinor < terms.limitPriceMinor;
+          const breached = adverseLimitViolation || usage > BigInt(priorRisk.requirement.requiredRiskMinor)
+            || policy && (usage > BigInt(policy.maxRiskPerEntryMinor) || pending + committed > BigInt(policy.maxReservedRiskMinor));
+          if (breached) {
+            const commandId = `${fillId}:ACTUAL_RISK_BREACH`, reason = "REVEALED_ACTUAL_RISK_BREACH";
+            current.set({ killSwitchEnabled: true, killSwitchCommand: { commandId, enabled: true, reason, changedAt: now } });
+            await withKillWrite(session, () => this.save(current, session));
+            await riskAudit(this.models, this.scope, session, now, { eventId: commandId, eventType: "KILL_SWITCH_ENABLED",
+              causationId: fillId, reason, tradingDate: now.toISOString().slice(0, 10), evidenceRefs: [fillId],
+              payload: { kind: "KILL_SWITCH", commandId, enabled: true, reason } });
+          }
+          await riskAudit(this.models, this.scope, session, now, { eventId: `${fillId}:PROTECTION`, eventType: "RISK_RESERVED",
+            causationId: fillId, reason: trade.side === "SELL" ? "MATCHED_VERTICAL_RISK_TRANSFER"
+              : next.progress.find(p => p.legId === trade.legId)!.transferredUnits < priorRisk.requirement.legs.find(l => l.legId === trade.legId)!.quantityUnits
+                ? "PARTIAL_BUY_PROTECTION" : "CONFIRMED_BUY_LONG_EXPOSURE",
+            tradingDate: now.toISOString().slice(0, 10), evidenceRefs: [fillId], payload: { kind: "REFERENCE", entityId: trade.positionId } });
+        }
         riskPayload = { kind: "ENTRY_RISK_TRANSFER", reservationId: entryReservation.get("reservationId"), fillId, legId: trade.legId,
-          quantityUnits: trade.quantityUnits, releasedPendingMinor: checkedRiskUnits(BigInt(trade.quantityUnits) * BigInt(leg.limitPriceMinor)),
+          quantityUnits: trade.quantityUnits, releasedPendingMinor: Math.max(0, priorRisk.projection.pendingMinor - next.pendingMinor),
+          ...(next.pendingMinor > priorRisk.projection.pendingMinor ? { restoredPendingMinor: next.pendingMinor - priorRisk.projection.pendingMinor } : {}),
           committedPremiumMinor: checkedRiskUnits(BigInt(trade.quantityUnits) * BigInt(trade.priceMinor)), remainingPendingMinor: next.pendingMinor,
           committedExposureMinor: next.committedMinor, slotTransferred: next.committedSlots > priorRisk.projection.committedSlots };
       }

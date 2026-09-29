@@ -124,7 +124,7 @@ export class RiskAdmissionService {
           strategyInstanceId: position.get("strategyInstanceId"), instrumentKeys: requirement.legs.map(leg => leg.contractKey), state: "HELD",
           initialMarginMinor: requirement.requiredRiskMinor, remainingMarginMinor: requirement.requiredRiskMinor,
           initialExposureMinor: requirement.requiredRiskMinor, remainingExposureMinor: requirement.requiredRiskMinor,
-          positionSlots: 1, policyVersion: account.get("policyVersion"), entryAdmission: { positionId: position.get("positionId"),
+          positionSlots: 1, policyVersion: account.get("policyVersion"), entryAdmission: { ...(requirement.family ? { family: requirement.family } : {}), positionId: position.get("positionId"),
             economicsFingerprint: requirement.fingerprint, generation: 0, executionEpoch: account.get("executionEpoch"), policyVersion: account.get("policyVersion") } });
         await reservation.save({ session });
         if (intent.get("state") === "CREATED") { this.transition(intent, "RISK_PENDING"); await this.save(intent, session); }
@@ -136,8 +136,10 @@ export class RiskAdmissionService {
             legId: leg.legId, contractKey: leg.contractKey, side: leg.side, quantityUnits: leg.quantityUnits, orderType: "LIMIT", limitPriceMinor: leg.limitPriceMinor, product: requirement.product });
           const { claimId: _claim, orderType: _type, product: _product, ...economics } = request;
           await new this.models.BrokerOrder({ ...base, ...economics,
+            ...(requirement.family ? { entryClassification: { family: requirement.family,
+              strategyKind: intent.get("entryPlan.strategyKind"), role: intent.get("entryPlan.legs").find((l: { legId: string }) => l.legId === leg.legId).role } } : {}),
             sliceId: "entry", generation: 0, brokerNamespace: "PAPER_SIM_V1", requestFingerprint: submissionFingerprint(request),
-            phase: "READY", knowledge: "KNOWN", cancellation: "NONE", filledUnits: 0, lastObservationVersion: 0,
+            phase: leg.side === "SELL" ? "PLANNED" : "READY", knowledge: "KNOWN", cancellation: "NONE", filledUnits: 0, lastObservationVersion: 0,
             submissionAuthorization: { reservationId, evidenceRef: reservationId, product: requirement.product, reservedQuantityUnits: leg.quantityUnits,
               policyVersion: account.get("policyVersion"), executionEpoch: account.get("executionEpoch"), expiresAt } }).save({ session });
           orderIds.push(orderId);
@@ -150,7 +152,7 @@ export class RiskAdmissionService {
         await new this.models.TradingEvent({ ...this.scope, schemaVersion: 1, correlationId: intent.get("correlationId"), createdAt: now,
           eventId: `${reservationId}:RISK_RESERVED`, eventType: "RISK_RESERVED", accountSequence: sequence, tradingDate: now.toISOString().slice(0, 10),
           aggregateType: "OrderIntent", aggregateId: intentId, aggregateVersion: intent.get("version"), causationId: intentId,
-          actor: "RiskAdmissionService", occurredAt: now, recordedAt: now, reason: "BUY_OPTION_PREMIUM_RESERVED",
+          actor: "RiskAdmissionService", occurredAt: now, recordedAt: now, reason: requirement.family ? `${requirement.family}_CEILING_AND_SLOT_RESERVED_BUY_ELIGIBLE` : "BUY_OPTION_PREMIUM_RESERVED",
           evidenceRefs: [reservationId, ...requirement.legs.map(leg => leg.qualificationRef)],
           payload: { kind: "RISK", reservationId, marginMinor: requirement.requiredRiskMinor, exposureMinor: requirement.requiredRiskMinor } }).save({ session });
         if (fromDay !== daily.dailyTradingDay) await riskAudit(this.models, this.scope, session, now, {

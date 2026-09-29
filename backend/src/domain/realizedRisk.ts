@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { identifierSchema, moneyMinorSchema, quantityUnitsSchema, tradingDateSchema } from "@trading-bot/shared";
-import { checkedRiskUnits, riskAssert } from "./entryRisk";
+import { calculateEntryRisk, checkedRiskUnits, riskAssert } from "./entryRisk";
 
 export const tradingCalendarSchema = z.object({ kind: z.literal("LOCAL_DATE_V1"), timeZone: z.string().min(1).refine(zone => {
   try { new Intl.DateTimeFormat("en", { timeZone: zone }).format(new Date(0)); return true; } catch { return false; }
@@ -25,7 +25,8 @@ const economicFill = z.object({ fillId: identifierSchema, intentId: identifierSc
  * every entry paise at full close. Canonical execution-time/trade-identity order
  * assigns residual paise deterministically, independent of delivery order.
  */
-export function realizedPosition(entryIntentId: string, input: readonly unknown[]) {
+export function realizedPosition(entryIntentId: string, input: readonly unknown[], classifiedIntent?: { targetLegs: unknown; entryPlan: unknown }) {
+  const requirement = classifiedIntent ? calculateEntryRisk(classifiedIntent.targetLegs, classifiedIntent.entryPlan) : undefined;
   const fills = z.array(economicFill).parse(input);
   if (new Set(fills.map(f => f.fillId)).size !== fills.length) throw new Error("DUPLICATE_REALIZED_FILL");
   const legs: Record<string, number> = {}, realizations: { fillId: string; executedAt: Date; pnlMinor: number }[] = [];
@@ -33,7 +34,8 @@ export function realizedPosition(entryIntentId: string, input: readonly unknown[
     const own = fills.filter(f => f.legId === legId), entries = own.filter(f => f.intentId === entryIntentId);
     const exits = own.filter(f => f.intentId !== entryIntentId).sort((a, b) => a.executedAt.getTime() - b.executedAt.getTime()
       || a.brokerNamespace.localeCompare(b.brokerNamespace) || a.brokerTradeKey.localeCompare(b.brokerTradeKey));
-    if (entries.some(f => f.side !== "BUY") || exits.some(f => f.side !== "SELL")) throw new Error("UNSUPPORTED_REALIZED_SHAPE");
+    const entrySide = requirement?.family ? requirement.legs.find(l => l.legId === legId)?.side : "BUY";
+    if (!entrySide || entries.some(f => f.side !== entrySide) || exits.some(f => f.side === entrySide)) throw new Error("UNSUPPORTED_REALIZED_SHAPE");
     const units = entries.reduce((n, f) => n + BigInt(f.quantityUnits), 0n);
     const cost = entries.reduce((n, f) => n + BigInt(f.quantityUnits) * BigInt(f.priceMinor), 0n);
     checkedRiskUnits(units); checkedRiskUnits(cost);
@@ -42,7 +44,7 @@ export function realizedPosition(entryIntentId: string, input: readonly unknown[
       closed += BigInt(fill.quantityUnits);
       if (!units || closed > units) throw new Error("REALIZED_OVER_CLOSE");
       const nextCost = cost * closed / units;
-      const value = BigInt(fill.quantityUnits) * BigInt(fill.priceMinor) - (nextCost - allocated);
+      const value = (BigInt(fill.quantityUnits) * BigInt(fill.priceMinor) - (nextCost - allocated)) * (entrySide === "BUY" ? 1n : -1n);
       realizations.push({ fillId: fill.fillId, executedAt: fill.executedAt, pnlMinor: signedMinor(value) });
       allocated = nextCost; pnl += value;
     }

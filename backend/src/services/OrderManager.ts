@@ -1,3 +1,4 @@
+import { riskAudit } from "./riskAudit";
 import { randomUUID } from "node:crypto";
 import { withExecutionHost } from "../db/executionHost";
 import { validateExecutionHost, type ExecutionHostContext } from "../domain/ExecutionHostContext";
@@ -84,7 +85,8 @@ export class OrderManager {
         || intent.get("policyVersion") !== account.get("policyVersion") || reservation.get("policyVersion") !== account.get("policyVersion")
         || authorization.reservedQuantityUnits < order.get("quantityUnits") || !reservation.get("instrumentKeys").includes(order.get("contractKey"))
         || (reservation.get("remainingMarginMinor") === 0 && reservation.get("remainingExposureMinor") === 0
-          && reservation.get("kind") !== "CLOSE_QUANTITY")) throw new Error("AUTHORIZATION_NOT_CURRENT");
+          && reservation.get("kind") !== "CLOSE_QUANTITY"
+          && !(reservation.get("kind") === "ENTRY_RISK" && intent.get("entryPlan.kind") === "NSE_STRATEGY_LIMIT_V1" && order.get("side") === "SELL"))) throw new Error("AUTHORIZATION_NOT_CURRENT");
       const request = brokerOrderRequestSchema.parse({ ...this.scope, orderId, claimId, intentId: order.get("intentId"),
         positionId: order.get("positionId"), legId: order.get("legId"), contractKey: order.get("contractKey"), side: order.get("side"),
         quantityUnits: order.get("quantityUnits"), orderType: "LIMIT", limitPriceMinor: order.get("limitPriceMinor"), product: authorization.product });
@@ -147,6 +149,13 @@ export class OrderManager {
       // All observations (including zero-fill ones) await later consumption; no fill ledger/version advancement here.
       order.set("submissionOutcome", evidence); await this.save(order, session);
       await this.audit(order, eventType, "SUBMITTING", outcome.evidence.reference, session);
+      if (outcome.kind === "REJECTED" && order.get("side") === "SELL") {
+        const intent = await this.models.OrderIntent.findOne({ ...this.scope, intentId: order.get("intentId"), purpose: "ENTRY" }).session(session);
+        if (intent?.get("entryPlan.kind") === "NSE_STRATEGY_LIMIT_V1") await riskAudit(this.models, this.scope, session, this.clock(), {
+          eventId: `${orderId}:STRANDED_LONG`, eventType: "RISK_BLOCKED", causationId: orderId, reason: "STRANDED_LONG_SELL_REJECTED",
+          tradingDate: this.clock().toISOString().slice(0, 10), evidenceRefs: [outcome.evidence.reference],
+          payload: { kind: "REFERENCE", entityId: order.get("positionId") } });
+      }
       return stateOf(order);
     });
   }

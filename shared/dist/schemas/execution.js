@@ -70,6 +70,7 @@ exports.eventPayloadSchema = zod_1.z.discriminatedUnion("kind", [
     zod_1.z.object({
         kind: zod_1.z.literal("ENTRY_RISK_TRANSFER"), reservationId: exports.identifierSchema, fillId: exports.identifierSchema, legId: exports.identifierSchema,
         quantityUnits: exports.quantityUnitsSchema.refine(n => n > 0), releasedPendingMinor: exports.nonnegativeMoneyMinorSchema,
+        restoredPendingMinor: exports.nonnegativeMoneyMinorSchema.optional(),
         committedPremiumMinor: exports.nonnegativeMoneyMinorSchema, remainingPendingMinor: exports.nonnegativeMoneyMinorSchema,
         committedExposureMinor: exports.nonnegativeMoneyMinorSchema, slotTransferred: zod_1.z.boolean(),
     }).strict(),

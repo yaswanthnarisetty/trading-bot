@@ -81,6 +81,7 @@ export const eventPayloadSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("ENTRY_RISK_TRANSFER"), reservationId: identifierSchema, fillId: identifierSchema, legId: identifierSchema,
     quantityUnits: quantityUnitsSchema.refine(n => n > 0), releasedPendingMinor: nonnegativeMoneyMinorSchema,
+    restoredPendingMinor: nonnegativeMoneyMinorSchema.optional(),
     committedPremiumMinor: nonnegativeMoneyMinorSchema, remainingPendingMinor: nonnegativeMoneyMinorSchema,
     committedExposureMinor: nonnegativeMoneyMinorSchema, slotTransferred: z.boolean(),
   }).strict(),

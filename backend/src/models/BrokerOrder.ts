@@ -29,6 +29,11 @@ export const BrokerOrderSchema = executionSchema({
   knowledge: { type: String, enum: knowledgeStateSchema.options, required: true },
   cancellation: { type: String, enum: cancellationStateSchema.options, required: true },
   filledUnits: unitsField(), lastObservationVersion: unitsField(),
+  entryClassification: { type: new Schema({
+    family: { type: String, enum: ["LONG_OPTION", "DEBIT_VERTICAL", "CREDIT_VERTICAL"], required: true },
+    strategyKind: { type: String, enum: ["LONG_CALL", "LONG_PUT", "BULL_CALL_DEBIT_SPREAD", "BEAR_PUT_DEBIT_SPREAD", "BULL_PUT_CREDIT_SPREAD", "BEAR_CALL_CREDIT_SPREAD"], required: true },
+    role: { type: String, enum: ["LONG", "HEDGE", "SHORT"], required: true },
+  }, { _id: false, strict: "throw" }), immutable: true },
   submissionAuthorization: { type: AuthorizationSchema, immutable: true },
   submissionClaim: { type: ClaimSchema },
   submissionOutcome: { type: Schema.Types.Mixed },
@@ -44,7 +49,7 @@ export const BrokerOrderSchema = executionSchema({
   executionEvidenceRefs: { type: [String], default: [] },
 }, "execution_orders");
 identityIndexes(BrokerOrderSchema, "orderId");
-writeOnceFields(BrokerOrderSchema, ["brokerOrderId", "submissionClaim", "submissionOutcome", "closePlan", "dependencyActivation"]);
+writeOnceFields(BrokerOrderSchema, ["entryClassification", "brokerOrderId", "submissionClaim", "submissionOutcome", "closePlan", "dependencyActivation"]);
 monotonicFields(BrokerOrderSchema, ["filledUnits", "lastObservationVersion"]);
 BrokerOrderSchema.index({ intentId: 1, legId: 1, sliceId: 1, generation: 1 }, { unique: true });
 // Not verified from broker contract: namespace must encode verified ID scope before live ingestion.
