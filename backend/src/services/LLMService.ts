@@ -17,6 +17,8 @@ import {
 } from "../config/constants";
 import type { SRContext } from "../utils/indicators";
 import { logger } from "../utils/logger";
+import { PRIMARY_PROMPT_VERSION, VERIFIER_PROMPT_VERSION,
+  type Phase5LLMConfig, type Phase5LLMTransport } from "./Phase5LLMService";
 
 const PRIMARY_ANALYST_SYSTEM_PROMPT = `You are a quantitative options trading analyst for Indian equity markets (NSE/BSE).
 You specialize in NIFTY, BANKNIFTY, and FINNIFTY weekly options spreads.
@@ -492,3 +494,28 @@ export function shouldRunVerifier(
   return false;
 }
 
+/** Phase 5C keeps the deployed model setting while using a separate, strict analyst boundary. */
+export function phase5LegacyCompatibleConfig(): Phase5LLMConfig {
+  return { primaryModel: LLM_MODEL, verifierModel: LLM_MODEL,
+    primaryPromptVersion: PRIMARY_PROMPT_VERSION, verifierPromptVersion: VERIFIER_PROMPT_VERSION,
+    verifierConfidenceThreshold: 0.75, timeoutMs: LLM_TIMEOUT_MS,
+    temperature: LLM_TEMPERATURE, maxOutputTokens: LLM_MAX_TOKENS };
+}
+
+/** Injected adapter around the existing lazy OpenAI client; never used by legacy SignalLoop. */
+export function phase5OpenAITransport(): Phase5LLMTransport {
+  return { async complete(request) {
+    const client = getOpenAIClient();
+    if (!client) throw { code: "MODEL_UNAVAILABLE" };
+    const started = performance.now();
+    const completion = await client.chat.completions.create({
+      model: request.model, temperature: request.temperature, max_tokens: request.maxOutputTokens,
+      messages: [{ role: "system", content: request.systemPrompt },
+        { role: "user", content: request.userPrompt }],
+    }, { signal: request.signal });
+    return { content: completion.choices[0]?.message?.content ?? null, model: completion.model,
+      latencyMs: performance.now() - started,
+      ...(completion.usage ? { usage: { inputTokens: completion.usage.prompt_tokens,
+        outputTokens: completion.usage.completion_tokens } } : {}) };
+  } };
+}

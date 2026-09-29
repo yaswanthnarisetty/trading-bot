@@ -72,8 +72,28 @@ export interface MockAnalyticsInput extends AnalyticsAssumptions {
   readonly options: readonly MockOptionEvidence[];
 }
 const issued = new WeakSet<object>();
+interface RealFreshnessProof {
+  readonly observedAtMs: number;
+  readonly maxAgeMs: number;
+  readonly fetchedAtMs: readonly number[];
+  readonly exchangeAtMs: readonly number[];
+  readonly lastFinalizedAtMs: number;
+  readonly candleIntervalMs: number;
+}
+const realFreshness = new WeakMap<object, RealFreshnessProof>();
 export function assertMarketAnalytics(value: unknown): asserts value is MarketAnalyticsSnapshot {
   if (!value || typeof value !== "object" || !issued.has(value)) throw new Error("ANALYTICS_UNAVAILABLE");
+}
+/** Recheck issued real evidence without trusting caller-supplied timestamps or fetching again. */
+export function isMarketAnalyticsFresh(snapshot: MarketAnalyticsSnapshot, now: number): boolean {
+  assertMarketAnalytics(snapshot);
+  if (snapshot.dataMode === "MOCK") return true;
+  const proof = realFreshness.get(snapshot);
+  if (!proof || !Number.isFinite(now) || now < proof.observedAtMs) return false;
+  const fresh = (timestamp: number, allowance: number) => timestamp <= now && now - timestamp <= allowance;
+  return proof.fetchedAtMs.every(timestamp => fresh(timestamp, proof.maxAgeMs))
+    && proof.exchangeAtMs.every(timestamp => fresh(timestamp, proof.maxAgeMs))
+    && fresh(proof.lastFinalizedAtMs, proof.candleIntervalMs + proof.maxAgeMs);
 }
 const unavailable = (reason: AnalyticsFailure): AnalyticsOutcome => freeze({ available: false, reason });
 const minor = (n: number) => Number.isSafeInteger(n) && n > 0;
@@ -181,6 +201,14 @@ export function buildRealMarketAnalytics(input: RealAnalyticsInput): AnalyticsOu
       interval: input.indexHistory.interval, candles: input.indexHistory.candles, options: optionEvidence });
     if (assembled.available && evaluation - Date.parse(assembled.snapshot.indicators.lastFinalizedAt)
       > intervalMs[input.indexHistory.interval] + input.maxAgeMs) return unavailable("MARKET_DATA_NOT_FRESH");
+    if (assembled.available) realFreshness.set(assembled.snapshot, freeze({
+      observedAtMs: Date.parse(observedAt), maxAgeMs: input.maxAgeMs,
+      fetchedAtMs: [Date.parse(input.indexQuote.fetchedAt), ...input.optionQuotes.map(quote => Date.parse(quote.fetchedAt))],
+      exchangeAtMs: [Date.parse(input.indexQuote.brokerTimestamp!), ...input.optionQuotes.flatMap(quote =>
+        [Date.parse(quote.brokerTimestamp!), Date.parse(quote.lastTradeTimestamp!)])],
+      lastFinalizedAtMs: Date.parse(assembled.snapshot.indicators.lastFinalizedAt),
+      candleIntervalMs: intervalMs[input.indexHistory.interval],
+    }));
     return assembled;
   } catch (error) {
     const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
