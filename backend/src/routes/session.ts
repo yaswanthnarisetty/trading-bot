@@ -17,7 +17,7 @@ import {
   stop as stopPositionMonitor,
 } from "../services/PositionMonitorService";
 import { closePosition, calculateCurrentPnL, getDailyPnL } from "../services/PaperTradeService";
-import { getLTP } from "../services/KiteService";
+import { getLTP, isMock } from "../services/KiteService";
 import { WebSocketService } from "../services/WebSocketService";
 import { logger } from "../utils/logger";
 import type { OptionsPosition } from "@trading-bot/shared";
@@ -54,6 +54,11 @@ async function handleStartSession(
   next: NextFunction
 ): Promise<void> {
   try {
+    // Phase 4B supplies data only; legacy strategy sessions cannot consume KITE_REAL.
+    if (!isMock()) {
+      res.status(409).json({ error: "LEGACY_MARKET_DATA_DISABLED" });
+      return;
+    }
     const assetKey = parseAssetKey(req.body?.asset);
     if (!assetKey) {
       res.status(400).json({ error: "Invalid asset", code: 400 });
@@ -74,7 +79,7 @@ async function handleStartSession(
     const sessionId = uuidv4();
     const nowIso = new Date().toISOString();
     const paperCapital = Number(process.env.PAPER_CAPITAL || 200_000);
-    const dataMode = process.env.KITE_API_KEY ? "LIVE" : "MOCK";
+    const dataMode = "MOCK" as const;
 
     const sessionDoc = await MonitoringSessionModel.create({
       sessionId,
@@ -327,4 +332,3 @@ router.get("/history", authMiddleware, handleGetSessionHistory);
 router.get("/:sessionId", authMiddleware, handleGetSessionById);
 
 export default router;
-

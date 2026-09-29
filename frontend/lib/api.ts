@@ -468,7 +468,8 @@ export function runBacktest(
 }
 
 export interface KiteConfig {
-  tradingPhase: number;
+  tradingPhase: "PAPER";
+  execution: "PaperBroker";
   paperCapital: number;
   minConfidence: number;
   maxPositions: number;
@@ -476,10 +477,11 @@ export interface KiteConfig {
 
 export interface KiteStatus {
   tokenValid: boolean;
-  dataMode: "LIVE" | "MOCK";
+  dataMode: "KITE_REAL" | "MOCK";
+  connectionStatus: "CONNECTED" | "DISCONNECTED" | "SESSION_REQUIRED";
   apiKey: string;
   tokenExpiry: string;
-  loginUrl: string;
+  loginAvailable: boolean;
   message: string;
   config: KiteConfig;
 }
@@ -501,7 +503,7 @@ export function getKiteStatus(): Promise<KiteStatus> {
 
 /**
  * Exchanges a one-time request_token for a fresh Kite access token.
- * The server computes the checksum, updates .env, and re-validates.
+ * The server verifies the profile and retains credentials only in memory.
  *
  * @param requestToken - Token from the Kite login redirect URL query param.
  * @returns Promise resolving to success/failure result.
@@ -511,4 +513,11 @@ export function refreshKiteToken(requestToken: string): Promise<KiteRefreshResul
     method: "POST",
     body: JSON.stringify({ requestToken }),
   });
+}
+
+export function beginKiteLogin(): Promise<{ loginUrl: string }> {
+  return request("/api/kite/login", { method: "POST" });
+}
+export function setKiteDataMode(dataMode: "MOCK" | "KITE_REAL"): Promise<{ dataMode: "MOCK" | "KITE_REAL" }> {
+  return request("/api/kite/data-mode", { method: "POST", body: JSON.stringify({ dataMode }) });
 }

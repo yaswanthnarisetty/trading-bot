@@ -13,11 +13,11 @@ import signalsRouter from "./routes/signals";
 import positionsRouter from "./routes/positions";
 import performanceRouter from "./routes/performance";
 import backtestRouter from "./routes/backtest";
-import kiteRouter from "./routes/kite";
+import kiteRouter, { kiteCallback } from "./routes/kite";
 import authRouter from "./routes/auth.routes";
 import cryptoRouter from "./routes/crypto";
 import { WebSocketService } from "./services/WebSocketService";
-import { isMock, validateToken } from "./services/KiteService";
+import { kiteSession } from "./services/KiteService";
 import { MonitoringSessionModel } from "./models/MonitoringSession";
 import { ALLOWED_ASSETS, type AssetKey } from "./config/assets";
 import {
@@ -57,6 +57,7 @@ function createApp(): express.Express {
   app.use("/api/performance", performanceRouter);
   app.use("/api/backtest", backtestRouter);
   app.use("/api/kite", kiteRouter);
+  app.get("/kite/callback", kiteCallback);
   app.use("/api/auth", authRouter);
   app.use("/api/crypto", cryptoRouter);
   
@@ -78,7 +79,7 @@ async function bootstrap(): Promise<void> {
 
   const port = Number(process.env.PORT || 4000);
   const phase = process.env.TRADING_PHASE || "1";
-  const dataMode = process.env.KITE_API_KEY ? "LIVE" : "MOCK";
+  const dataMode = kiteSession.getMode();
 
   await connectWithRetry();
   await createIndexes();
@@ -119,26 +120,7 @@ async function bootstrap(): Promise<void> {
     });
   });
 
-  // Validate Kite token on startup — non-blocking, server runs regardless of result.
-  if (!isMock()) {
-    validateToken()
-      .then((ok) => {
-        if (ok) {
-          logger.info("Kite API connected ✅");
-        } else {
-          const apiKey = process.env.KITE_API_KEY ?? "";
-          logger.warn(
-            `⚠️ Kite token expired — refresh at kite.trade/connect/login?api_key=${apiKey}`
-          );
-          logger.warn("Falling back to mock data until token is refreshed");
-        }
-      })
-      .catch((err: unknown) => {
-        logger.error("Kite token check threw unexpectedly", { err });
-      });
-  } else {
-    logger.info("KITE_API_KEY not set — running in mock data mode");
-  }
+  logger.info("Kite session requires Settings login; market-data mode is explicit");
 }
 
 void bootstrap();

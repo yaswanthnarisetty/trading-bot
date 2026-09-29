@@ -7,6 +7,12 @@ import { logger } from "../utils/logger";
 
 type Direction = "BULLISH" | "BEARISH" | "NEUTRAL" | "HOLD";
 
+/** Shared pure directional choice. Contract resolution and risk checks happen elsewhere. */
+export function selectStrategyKind(direction: Direction, dte: number, regime: Regime): "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD" | "HOLD" {
+  if (dte < 3 || direction === "HOLD" || direction === "NEUTRAL" || regime === "ranging") return "HOLD";
+  return direction === "BULLISH" ? "BULL_PUT_SPREAD" : "BEAR_CALL_SPREAD";
+}
+
 /**
  * Deterministically maps direction, IV environment, DTE, and regime to a base strategy.
  * This pre-selection runs before the LLM call and serves as a guardrail suggestion.
@@ -23,28 +29,29 @@ export function selectStrategy(
   dte: number,
   regime: Regime
 ): { strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD" | "HOLD"; reason: string } {
-  if (dte < 3) {
+  const strategy = selectStrategyKind(direction, dte, regime);
+  if (strategy === "HOLD" && dte < 3) {
     return {
       strategy: "HOLD",
       reason: "DTE below 3, theta risk too high for new spreads",
     };
   }
 
-  if (direction === "HOLD" || direction === "NEUTRAL") {
+  if (strategy === "HOLD" && (direction === "HOLD" || direction === "NEUTRAL")) {
     return {
       strategy: "HOLD",
       reason: "Direction unclear, staying flat per MVP-1 rules",
     };
   }
 
-  if (regime === "ranging") {
+  if (strategy === "HOLD") {
     return {
       strategy: "HOLD",
       reason: "Ranging regime reduces directional edge, skipping spreads",
     };
   }
 
-  if (direction === "BULLISH") {
+  if (strategy === "BULL_PUT_SPREAD") {
     return {
       strategy: "BULL_PUT_SPREAD",
       reason: `Bullish bias with IV rank ${ivRank.toFixed(
@@ -180,4 +187,3 @@ export function computeSpreadDetails(
 
   return details;
 }
-

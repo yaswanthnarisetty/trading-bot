@@ -1,275 +1,83 @@
-import fs from "fs";
-import path from "path";
-import { Router, type Request, type Response, type NextFunction } from "express";
-import axios from "axios";
-import {
-  generateAccessToken,
-  validateToken,
-  isTokenValid,
-  isMock,
-  getAuthHeader,
-} from "../services/KiteService";
-import { logger } from "../utils/logger";
+import { Router, type Request, type Response } from "express";
+import { kiteSession } from "../services/KiteService";
+import { kiteMarketData } from "../services/KiteMarketDataRuntime";
+import { kiteIndexData } from "../services/KiteIndexDataRuntime";
+import type { KiteSessionService } from "../services/KiteSessionService";
+import type { KiteMarketDataService, HistoricalInterval } from "../services/KiteMarketDataService";
+import type { KiteIndexDataService } from "../services/KiteIndexDataService";
 import { authMiddleware } from "./auth.middleware";
+import { fail, safeMarketError } from "../domain/kiteMarketData";
+import type { AssetKey } from "../config/assets";
 
-const router = Router();
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-/**
- * Returns the token expiry string.
- * Kite tokens are valid until 6:00 AM IST the following day.
- */
-function getTokenExpiry(): string {
-  const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] as const;
-  const MONTHS = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-  ] as const;
-
-  // Compute current IST date, then advance one day
-  const istOffsetMs = 5.5 * 60 * 60 * 1000;
-  const istNow = new Date(Date.now() + istOffsetMs);
-  const tomorrow = new Date(istNow);
-  tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
-
-  const day = DAYS[tomorrow.getUTCDay()];
-  const month = MONTHS[tomorrow.getUTCMonth()];
-  const date = tomorrow.getUTCDate();
-
-  return `6:00 AM IST, ${day} ${month} ${date}`;
+const SETTINGS = "http://localhost:3000/settings";
+/** Public callback uses one-use state minted by authenticated POST /login. */
+export function createKiteCallback(session: KiteSessionService) {
+  return async (req: Request, res: Response): Promise<void> => {
+    res.setHeader("Cache-Control", "no-store"); res.setHeader("Referrer-Policy", "no-referrer");
+    try { await session.callback(req.query); res.redirect(303, `${SETTINGS}?kite=connected`); }
+    catch (error) { res.redirect(303, `${SETTINGS}?kite=error&code=${safeMarketError(error).code}`); }
+  };
 }
-
-// ─── GET /api/kite/status ─────────────────────────────────────────────────────
-
-/**
- * Returns the live Kite token status by calling validateToken().
- *
- * Response:
- *   tokenValid  — whether the current token passes Kite's /user/profile check
- *   dataMode    — "LIVE" when key is set and token valid, "MOCK" otherwise
- *   apiKey      — masked to last 4 chars e.g. "***fre0"
- *   tokenExpiry — "6:00 AM IST, Mon Mar 9"
- *   loginUrl    — Kite OAuth v3 URL for the token refresh flow
- *   message     — human-readable status string
- *   config      — active trading parameters from env
- */
-async function handleStatus(
-  _req: Request,
-  res: Response,
-  next: NextFunction
-): Promise<void> {
-  try {
-    const apiKey = process.env.KITE_API_KEY ?? "";
-    const maskedApiKey =
-      apiKey.length > 4 ? `***${apiKey.slice(-4)}` : apiKey ? "****" : "not set";
-
-    const mock = isMock();
-    let tokenValid = false;
-
-    if (!mock) {
-      tokenValid = await validateToken();
-    }
-
-    const dataMode: "LIVE" | "MOCK" = !mock && tokenValid ? "LIVE" : "MOCK";
-    const loginUrl = apiKey
-      ? `https://kite.zerodha.com/connect/login?v=3&api_key=${apiKey}`
-      : "";
-
-    const message = mock
-      ? "No API key configured — running in mock mode"
-      : tokenValid
-        ? "Token is valid"
-        : "Token is expired or invalid — use the refresh flow below";
-
-    const config = {
-      tradingPhase: Number(process.env.TRADING_PHASE ?? 1),
-      paperCapital: Number(process.env.PAPER_CAPITAL ?? 200000),
-      minConfidence: Number(process.env.MIN_CONFIDENCE ?? 0.65),
-      maxPositions: Number(process.env.MAX_POSITIONS ?? 3),
-    };
-
-    res.json({
-      tokenValid,
-      dataMode,
-      apiKey: maskedApiKey,
-      tokenExpiry: getTokenExpiry(),
-      loginUrl,
-      message,
-      config,
-    });
-  } catch (error) {
-    next(error);
-  }
+export function createKiteRouter(session: KiteSessionService, market: KiteMarketDataService, indices?: KiteIndexDataService) {
+  const router = Router();
+  router.use(authMiddleware, (_req, res, next) => { res.setHeader("Cache-Control", "no-store"); next(); });
+  const action = (fn: (req: Request, res: Response) => Promise<void> | void) => async (req: Request, res: Response) => {
+    try { await fn(req, res); } catch (error) { res.status(400).json({ success: false, error: safeMarketError(error).code }); }
+  };
+  router.get("/status", action(async (_req, res) => {
+    if (session.status().tokenValid) await session.validate();
+    const status = session.status(), key = process.env.KITE_API_KEY ?? "";
+    res.json({ ...status, apiKey: key ? `***${key.slice(-4)}` : "not set", loginAvailable: !!key,
+      message: status.connectionStatus, config: { tradingPhase: "PAPER", execution: "PaperBroker",
+        paperCapital: Number(process.env.PAPER_CAPITAL ?? 200000), minConfidence: Number(process.env.MIN_CONFIDENCE ?? 0.65), maxPositions: Number(process.env.MAX_POSITIONS ?? 3) } });
+  }));
+  router.post("/login", action((_req, res) => { res.json({ loginUrl: session.beginLogin() }); }));
+  router.post("/refresh", action(async (req, res) => { await session.exchange(req.body?.requestToken); res.json({ success: true, message: "Kite session connected" }); }));
+  router.post("/data-mode", action((req, res) => { session.setMode(req.body?.dataMode); res.json({ dataMode: session.getMode() }); }));
+  router.post("/master/refresh", action(async (_req, res) => {
+    const master = await market.refreshMaster(); res.json({ provenance: master.provenance, instrumentCount: master.instruments.length });
+  }));
+  router.get("/instrument-search", action((req, res) => {
+    const master = market.activeMaster();
+    res.json({ provenance: master.provenance, instruments: master.instruments.filter(i =>
+      (!req.query.symbol || i.underlying === req.query.symbol) && (!req.query.expiry || i.expiry === req.query.expiry)
+      && (!req.query.strike || i.strike === req.query.strike)).slice(0, 200) });
+  }));
+  const instrument = (req: Request) => {
+    if (typeof req.query.canonicalId !== "string") return fail("QUALIFIED_INSTRUMENT_REQUIRED");
+    try { return market.activeMaster().getInstrumentByCanonicalId(req.query.canonicalId); }
+    catch (error) { if (error instanceof Error && error.message === "INSTRUMENT_NOT_FOUND") return fail("HISTORICAL_INSTRUMENT_UNAVAILABLE"); throw error; }
+  };
+  router.get("/market-data/quote", action(async (req, res) => {
+    const i = instrument(req), age = typeof req.query.maxAgeMs === "string" ? Number(req.query.maxAgeMs) : NaN;
+    const kind = req.query.kind ?? "QUOTE";
+    if (!["LTP", "OHLC", "QUOTE"].includes(String(kind))) return fail("INVALID_REQUEST");
+    res.json(await (kind === "LTP" ? market.getLtp(i, age) : kind === "OHLC" ? market.getOhlc(i, age) : market.getQuote(i, age)));
+  }));
+  router.get("/market-data/history", action(async (req, res) => {
+    res.json(await market.getHistoricalCandles({ instrument: instrument(req), from: req.query.from as string,
+      to: req.query.to as string, interval: req.query.interval as HistoricalInterval }));
+  }));
+  router.post("/index-master/refresh", action(async (_req, res) => {
+    if (!indices) return fail("INSTRUMENT_MASTER_STALE");
+    const master = await indices.refreshMaster();
+    res.json({ provenance: master.provenance, indices: master.indices });
+  }));
+  const index = (req: Request) => {
+    if (!indices || typeof req.query.underlying !== "string") return fail("QUALIFIED_INSTRUMENT_REQUIRED");
+    return indices.activeMaster().resolve(req.query.underlying as AssetKey);
+  };
+  router.get("/index-data/quote", action(async (req, res) => {
+    if (!indices) return fail("INSTRUMENT_MASTER_STALE");
+    const maxAgeMs = typeof req.query.maxAgeMs === "string" ? Number(req.query.maxAgeMs) : NaN;
+    res.json(await indices.getQuote(index(req), maxAgeMs));
+  }));
+  router.get("/index-data/history", action(async (req, res) => {
+    if (!indices) return fail("INSTRUMENT_MASTER_STALE");
+    res.json(await indices.getHistoricalCandles({ index: index(req), from: req.query.from as string,
+      to: req.query.to as string, interval: req.query.interval as HistoricalInterval }));
+  }));
+  return router;
 }
-
-// ─── POST /api/kite/refresh ───────────────────────────────────────────────────
-
-/**
- * Exchanges a one-time request_token for a fresh Kite access_token.
- *
- * 1. Calls generateAccessToken(requestToken) — computes SHA-256 checksum
- *    and POSTs to https://api.kite.trade/session/token
- * 2. Updates process.env.KITE_ACCESS_TOKEN in memory
- * 3. Persists new token to backend/.env (replaces KITE_ACCESS_TOKEN line)
- * 4. Calls validateToken() to confirm the new token works
- * 5. Returns { success: true, message: "Token refreshed. Valid until <expiry>" }
- *
- * Body: { requestToken: string }
- */
-async function handleRefresh(
-  req: Request,
-  res: Response,
-  next: NextFunction
-): Promise<void> {
-  try {
-    const raw = (req.body as Record<string, unknown>).requestToken;
-    if (typeof raw !== "string" || !raw.trim()) {
-      res.status(400).json({ success: false, error: "requestToken is required" });
-      return;
-    }
-    const requestToken = raw.trim();
-
-    const accessToken = await generateAccessToken(requestToken);
-
-    // Update in-memory env immediately
-    process.env.KITE_ACCESS_TOKEN = accessToken;
-
-    // Persist to .env file so the token survives server restarts
-    const envPath = path.join(process.cwd(), ".env");
-    if (fs.existsSync(envPath)) {
-      let content = fs.readFileSync(envPath, "utf-8");
-      if (/^KITE_ACCESS_TOKEN=.*/m.test(content)) {
-        content = content.replace(
-          /^KITE_ACCESS_TOKEN=.*/m,
-          `KITE_ACCESS_TOKEN=${accessToken}`
-        );
-      } else {
-        content += `\nKITE_ACCESS_TOKEN=${accessToken}`;
-      }
-      fs.writeFileSync(envPath, content, "utf-8");
-      logger.info("KITE_ACCESS_TOKEN written to .env");
-    } else {
-      logger.warn(".env file not found — token updated in memory only");
-    }
-
-    // Confirm the new token passes Kite validation
-    const ok = await validateToken();
-    if (!ok) {
-      res.status(400).json({
-        success: false,
-        error: "Token saved but Kite validation failed — check API key and secret",
-      });
-      return;
-    }
-
-    logger.info("Kite token refreshed and validated successfully");
-    res.json({
-      success: true,
-      message: `Token refreshed. Valid until ${getTokenExpiry()}`,
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "Token refresh failed";
-    logger.error("Kite token refresh failed", { message });
-    res.status(400).json({ success: false, error: message });
-  }
-}
-
-// ─── GET /api/kite/instrument-search ─────────────────────────────────────────
-
-/**
- * Fetches the live Kite NFO instruments CSV and returns matching option contracts.
- * Useful for verifying the exact tradingsymbol format for any expiry date.
- *
- * Query params:
- *   symbol  — underlying name, e.g. "NIFTY" (required)
- *   expiry  — ISO date string, e.g. "2026-03-10" (optional, filters by expiry)
- *   strike  — number, e.g. "24000" (optional, filters by strike)
- *
- * Response: { instruments: Array<{ tradingsymbol, expiry, strike, optionType }> }
- */
-async function handleInstrumentSearch(
-  req: Request,
-  res: Response,
-  next: NextFunction
-): Promise<void> {
-  try {
-    const symbol = typeof req.query.symbol === "string" ? req.query.symbol.toUpperCase() : null;
-    const expiryFilter = typeof req.query.expiry === "string" ? req.query.expiry : null;
-    const strikeFilter = typeof req.query.strike === "string" ? Number(req.query.strike) : null;
-
-    if (!symbol) {
-      res.status(400).json({ error: "symbol query param is required" });
-      return;
-    }
-
-    if (isMock()) {
-      res.status(400).json({ error: "Kite API key not configured — cannot fetch instruments" });
-      return;
-    }
-
-    const response = await axios.get("https://api.kite.trade/instruments/NFO", {
-      headers: { "X-Kite-Version": "3", ...getAuthHeader() },
-      responseType: "text",
-      timeout: 15_000,
-    });
-
-    const csv = response.data as string;
-    const lines = csv.split("\n");
-    // CSV header: instrument_token,exchange_token,tradingsymbol,name,last_price,expiry,strike,...
-    const header = lines[0]?.split(",") ?? [];
-    const col = (name: string) => header.indexOf(name);
-    const colTs   = col("tradingsymbol");
-    const colExp  = col("expiry");
-    const colStr  = col("strike");
-    const colOpt  = col("instrument_type");
-
-    const instruments: Array<{
-      tradingsymbol: string;
-      expiry: string;
-      strike: number;
-      optionType: string;
-    }> = [];
-
-    for (let i = 1; i < lines.length; i++) {
-      const line = lines[i];
-      if (!line?.trim()) continue;
-      const parts = line.split(",");
-      const ts  = parts[colTs]?.trim() ?? "";
-      const exp = parts[colExp]?.trim() ?? "";
-      const str = Number(parts[colStr]?.trim() ?? "0");
-      const opt = parts[colOpt]?.trim() ?? "";
-
-      // Filter by underlying name prefix
-      if (!ts.startsWith(symbol)) continue;
-      // Filter by expiry if provided
-      if (expiryFilter && exp !== expiryFilter) continue;
-      // Filter by strike if provided
-      if (strikeFilter !== null && str !== strikeFilter) continue;
-      // Only options (CE/PE)
-      if (opt !== "CE" && opt !== "PE") continue;
-
-      instruments.push({ tradingsymbol: ts, expiry: exp, strike: str, optionType: opt });
-    }
-
-    instruments.sort((a, b) => a.expiry.localeCompare(b.expiry) || a.strike - b.strike);
-
-    logger.info(`Instrument search: ${instruments.length} results for ${symbol}`, {
-      expiryFilter, strikeFilter,
-    });
-
-    res.json({ instruments: instruments.slice(0, 200) });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    logger.error("Instrument search failed", { message });
-    next(error);
-  }
-}
-
-// ─── Route registration ───────────────────────────────────────────────────────
-
-router.get("/status", authMiddleware, handleStatus);
-router.post("/refresh", authMiddleware, handleRefresh);
-router.get("/instrument-search", authMiddleware, handleInstrumentSearch);
-
-export default router;
+export const kiteCallback = createKiteCallback(kiteSession);
+export default createKiteRouter(kiteSession, kiteMarketData, kiteIndexData);

@@ -4,10 +4,11 @@ import React, { useEffect, useState } from "react";
 import {
   getKiteStatus,
   refreshKiteToken,
+  beginKiteLogin,
+  setKiteDataMode,
   type KiteStatus,
 } from "../../../lib/api";
 
-const KITE_API_KEY = process.env.NEXT_PUBLIC_KITE_API_KEY ?? "";
 
 export default function SettingsPage(): JSX.Element {
   const [status, setStatus] = useState<KiteStatus | null>(null);
@@ -27,6 +28,7 @@ export default function SettingsPage(): JSX.Element {
     try {
       setStatus(await getKiteStatus());
     } catch (e) {
+      setStatus(null);
       setStatusError(
         e instanceof Error ? e.message : "Failed to load Kite status"
       );
@@ -37,14 +39,31 @@ export default function SettingsPage(): JSX.Element {
 
   useEffect(() => {
     void loadStatus();
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("kite") === "error") setRefreshResult({ ok: false, text: "Kite login failed. Open Kite Login to try again." });
+    if (params.has("kite")) window.history.replaceState(null, "", window.location.pathname);
+    const refreshOnFocus = () => { void loadStatus(); };
+    window.addEventListener("focus", refreshOnFocus);
+    return () => window.removeEventListener("focus", refreshOnFocus);
   }, []);
+
+  async function handleLogin(): Promise<void> {
+    try { const { loginUrl } = await beginKiteLogin(); window.location.assign(loginUrl); }
+    catch { setRefreshResult({ ok: false, text: "Unable to start Kite login." }); }
+  }
+  async function handleMode(dataMode: "MOCK" | "KITE_REAL"): Promise<void> {
+    try { await setKiteDataMode(dataMode); await loadStatus(); }
+    catch { setStatusError("Unable to change market-data mode."); }
+  }
 
   async function handleRefresh(): Promise<void> {
     if (!requestToken.trim()) return;
     setRefreshing(true);
     setRefreshResult(null);
     try {
-      const result = await refreshKiteToken(requestToken.trim());
+      const token = requestToken.trim();
+      setRequestToken("");
+      const result = await refreshKiteToken(token);
       if (result.success) {
         setRefreshResult({ ok: true, text: result.message ?? "Token refreshed successfully" });
         setRequestToken("");
@@ -59,6 +78,7 @@ export default function SettingsPage(): JSX.Element {
       });
     } finally {
       setRefreshing(false);
+      await loadStatus();
     }
   }
 
@@ -68,10 +88,6 @@ export default function SettingsPage(): JSX.Element {
   const badgeBg = connected ? "rgba(0,200,83,0.1)" : "rgba(255,23,68,0.1)";
   const badgeBorder = connected ? "rgba(0,200,83,0.28)" : "rgba(255,23,68,0.28)";
 
-  // Build the Kite OAuth v3 login URL
-  const loginUrl = KITE_API_KEY
-    ? `https://kite.zerodha.com/connect/login?v=3&api_key=${KITE_API_KEY}`
-    : (status?.loginUrl ?? "");
 
   return (
     <div className="space-y-4">
@@ -122,17 +138,24 @@ export default function SettingsPage(): JSX.Element {
                 className="text-[0.72rem] font-bold tracking-widest uppercase"
                 style={{ color: badgeColor }}
               >
-                {connected ? "CONNECTED" : "DISCONNECTED"}
+                {status.connectionStatus.replace(/_/g, " ")}
               </span>
             </div>
 
             {/* Details */}
             <div className="flex flex-col gap-1.5 text-[0.7rem] font-mono">
+              <Row label="Trading phase" value="PAPER" />
+              <Row label="Execution" value="PaperBroker" />
               <Row label="Data mode" value={status.dataMode}
-                valueColor={status.dataMode === "LIVE" ? "#00C853" : "#FFB300"} />
+                valueColor={status.dataMode === "KITE_REAL" ? "#00C853" : "#FFB300"} />
               <Row label="API key" value={status.apiKey} />
               <Row label="Token expiry" value={status.tokenExpiry} />
               <Row label="Status" value={status.message} />
+              <label>Market data: <select aria-label="Market data mode" value={status.dataMode}
+                onChange={e => void handleMode(e.target.value as "MOCK" | "KITE_REAL")}
+                className="rounded bg-neutral-900 px-2 py-1">
+                <option value="MOCK">MOCK</option><option value="KITE_REAL">KITE_REAL</option>
+              </select></label>
             </div>
           </div>
         )}
@@ -153,18 +176,17 @@ export default function SettingsPage(): JSX.Element {
           className="mb-5 text-[0.68rem] font-mono"
           style={{ color: "rgba(255,255,255,0.35)" }}
         >
-          Kite access tokens expire daily. Follow these steps to refresh.
+          Login to Zerodha; the backend connects your session and returns you here automatically.
         </div>
 
         {/* Step 1 */}
         <div className="mb-4">
-          <StepLabel n={1} text="Open the Kite login page in a new tab" />
+          <StepLabel n={1} text="Open the Kite login page" />
           <div className="mt-2">
-            {loginUrl ? (
-              <a
-                href={loginUrl}
-                target="_blank"
-                rel="noopener noreferrer"
+            {status?.loginAvailable ? (
+              <button
+                type="button"
+                onClick={() => void handleLogin()}
                 className="inline-block rounded-lg px-5 py-2 text-xs font-bold uppercase tracking-widest transition-all"
                 style={{
                   background: "linear-gradient(135deg, #1565C0, #1976D2)",
@@ -173,7 +195,7 @@ export default function SettingsPage(): JSX.Element {
                 }}
               >
                 Open Kite Login
-              </a>
+              </button>
             ) : (
               <div>
                 <button
@@ -188,46 +210,22 @@ export default function SettingsPage(): JSX.Element {
                   className="ml-3 text-[0.68rem] font-mono"
                   style={{ color: "#FF1744" }}
                 >
-                  Set NEXT_PUBLIC_KITE_API_KEY in frontend .env
+                  Configure Kite authentication on the backend
                 </span>
               </div>
             )}
           </div>
         </div>
 
-        {/* Step 2 */}
-        <div className="mb-4">
-          <StepLabel n={2} text="Login with your Zerodha credentials + OTP, then copy the request_token from the redirect URL" />
-          <div
-            className="mt-2 rounded-lg px-3 py-2.5 text-[0.68rem] font-mono"
-            style={{
-              background: "rgba(255,255,255,0.03)",
-              border: "1px solid rgba(255,255,255,0.07)",
-              color: "rgba(255,255,255,0.45)",
-              lineHeight: 1.8,
-            }}
-          >
-            <div>The redirect URL will look like:</div>
-            <div style={{ color: "#FFB300", marginTop: 2 }}>
-              yourredirect.com
-              <span style={{ color: "#00C853" }}>?request_token=</span>
-              <span style={{ color: "#e0e0e0" }}>XXXXX</span>
-              <span style={{ color: "rgba(255,255,255,0.4)" }}>
-                &action=login&status=success
-              </span>
-            </div>
-            <div style={{ marginTop: 4 }}>
-              Copy the value of <span style={{ color: "#00C853" }}>request_token</span>.
-            </div>
-          </div>
-        </div>
-
+        <p className="mb-4 text-xs text-neutral-400">After authentication, return to Settings automatically. Connecting does not change the selected data mode.</p>
+        <details className="text-sm"><summary>Development fallback: manual request token</summary>
         {/* Step 3 + Refresh button */}
         <div className="mb-2">
-          <StepLabel n={3} text="Paste the request_token below and click Refresh Token" />
+          <StepLabel n={2} text="Paste a request_token only if using the development fallback" />
           <div className="mt-2 flex flex-col gap-2 sm:flex-row sm:items-center">
             <input
-              type="text"
+              type="password"
+              autoComplete="off"
               value={requestToken}
               onChange={(e) => setRequestToken(e.target.value)}
               placeholder="Paste request_token here…"
@@ -256,6 +254,7 @@ export default function SettingsPage(): JSX.Element {
           </div>
         </div>
 
+        </details>
         {refreshResult && (
           <div
             className="mt-3 rounded-lg px-3 py-2 text-[0.72rem] font-mono"
@@ -287,13 +286,7 @@ export default function SettingsPage(): JSX.Element {
           <div className="grid grid-cols-2 gap-3 md:grid-cols-3 lg:grid-cols-5">
             <ConfigCard
               label="Trading Phase"
-              value={`${status.config.tradingPhase} (${
-                status.config.tradingPhase === 1
-                  ? "Paper"
-                  : status.config.tradingPhase === 2
-                    ? "Manual"
-                    : "Auto"
-              })`}
+              value="PAPER"
             />
             <ConfigCard
               label="Paper Capital"
@@ -310,7 +303,7 @@ export default function SettingsPage(): JSX.Element {
             <ConfigCard
               label="Data Mode"
               value={status.dataMode}
-              color={status.dataMode === "LIVE" ? "#00C853" : "#FFB300"}
+              color={status.dataMode === "KITE_REAL" ? "#00C853" : "#FFB300"}
             />
           </div>
         </section>
