@@ -1,58 +1,23 @@
-/**
- * Diagnostic: run backtest and print block reason breakdown + P&L.
- */
+/** Explicit fixture smoke. No broker credentials, API calls or financial persistence. */
+import assert from "node:assert/strict";
+import { historicalFixture, fixtureParams } from "../tests/fixtures/historicalReplay";
 import { runHistoricalBacktest } from "../src/services/BacktestService";
 
-const API_KEY      = "1elbgsxv3vhjfre0";
-const ACCESS_TOKEN = "dj77CwtR1rRjA2t1QFSXcbMV2HDfbKE6";
-
 async function run() {
-  const result = await runHistoricalBacktest({
-    asset: "NIFTY",
-    from: "2026-02-02T03:45:00.000Z",
-    to:   "2026-03-09T10:00:00.000Z",
-    interval: "5minute",
-    initialCapital: 200_000,
-    riskPerTradePct: 4,
-    targetProfitPct: 0.5,
-    stopLossPct: 0.5,
-    maxHoldingBars: 12,
-    directionalStopMult: 3.0,
-    apiKey: API_KEY,
-    accessToken: ACCESS_TOKEN,
+  const data = await historicalFixture();
+  const result = await runHistoricalBacktest(fixtureParams(data), {
+    provider: { load: async () => data }, runTimestamp: "2026-09-30T12:00:00.000Z",
   });
-
-  const br = result.blockReasons;
-  const total = result.totalSignals;
-
-  console.log("\n=== BACKTEST BLOCK REASON BREAKDOWN ===");
-  console.log(`Total non-HOLD signals:  ${total}`);
-  console.log(`Trades executed:         ${result.totalTrades}`);
-  console.log(`Total blocked:           ${result.totalBlocked}`);
-  console.log(`Net P&L:                 ₹${result.netPnL.toFixed(0)}`);
-  console.log(`Win rate:                ${result.winRate.toFixed(1)}%`);
-  console.log(`Max DD:                  ₹${result.maxDrawdown.toFixed(0)}`);
-  console.log();
-  console.log("--- Block reasons ---");
-
-  const rows: [string, number][] = [
-    ["opening_volatility",  br.opening_volatility],
-    ["high_volatility_atr", br.high_volatility_atr],
-    ["rsi_exhausted",       br.rsi_exhausted],
-    ["weak_momentum",       br.weak_momentum],
-    ["low_volume",          br.low_volume],
-    ["pcr_extreme",         br.pcr_extreme],
-    ["insufficient_credit", br.insufficient_credit],
-    ["duplicate_strategy",  br.duplicate_strategy],
-    ["same_direction_open", br.same_direction_open],
-    ["daily_limit",         br.daily_limit],
-    ["max_positions",       br.max_positions],
-  ];
-
-  for (const [reason, count] of rows) {
-    const pct = total > 0 ? ((count / total) * 100).toFixed(1) : "0.0";
-    console.log(`  ${reason.padEnd(22)} ${String(count).padStart(4)}  (${pct}%)`);
-  }
+  assert.equal(result.totalTrades, 1);
+  assert.equal(result.netPnL, result.trades.reduce((sum, trade) => sum + trade.pnlMinor, 0) / 100);
+  assert.equal(result.equityCurve[result.equityCurve.length - 1]!.equity, result.finalCapital);
+  assert.ok(result.decisions.every(d => d.evaluatedAt >= result.from && d.evaluatedAt <= result.to));
+  assert.ok(result.trades.every(t => t.entryTimestamp < t.exitTimestamp));
+  console.log(JSON.stringify({ source: result.provider, status: result.status,
+    strategyVersion: result.metadata.strategyEvaluatorVersion, dateRange: [result.from, result.to],
+    decisions: result.decisions.length, trades: result.totalTrades, grossPnL: result.grossPnL,
+    slippage: result.slippageCost, pnlExcludingCharges: result.netPnL, finalCapital: result.finalCapital,
+    finalEquity: result.equityCurve[result.equityCurve.length - 1]!.equity,
+    firstDecision: result.decisions[0], trade: result.trades[0] }, null, 2));
 }
-
-run().catch(console.error);
+run().catch(error => { console.error(error instanceof Error ? error.message : "BACKTEST_SMOKE_FAILED"); process.exitCode = 1; });

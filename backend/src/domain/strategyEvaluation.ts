@@ -4,6 +4,8 @@ import type { InstrumentDefinition } from "../services/KiteInstrumentMasterServi
 import { assertMarketAnalytics, type AnalyticsOutcome, type MarketAnalyticsSnapshot, type OptionAnalytics } from "./marketAnalytics";
 import { freeze, marketTimestamp } from "./kiteMarketData";
 
+export const STRATEGY_EVALUATOR_VERSION = "PHASE5B_V1";
+
 export type HoldReason = "INVALID_INPUT" | "REAL_DATA_REQUIRED" | "MARKET_DATA_NOT_FRESH"
   | "INSUFFICIENT_HISTORY" | "ANALYTICS_UNAVAILABLE" | "NO_DIRECTION" | "CONFIDENCE_TOO_LOW"
   | "ATR_GATE" | "RSI_GATE" | "VOLUME_GATE" | "OPENING_BLOCK" | "MARKET_CLOSED"
@@ -75,7 +77,7 @@ export interface StrategyEvaluationInput {
 const hold = (reason: HoldReason): StrategyEvaluationResult => freeze({ action: "HOLD", reason });
 const integer = (n: number) => Number.isSafeInteger(n) && n > 0;
 const finite = (n: number) => Number.isFinite(n);
-function validConfig(c: StrategyQualityConfig): boolean {
+export function validStrategyQualityConfig(c: StrategyQualityConfig): boolean {
   return typeof c.version === "string" && /^[A-Za-z0-9._:-]{1,80}$/.test(c.version)
     && finite(c.minConfidence) && c.minConfidence >= 0 && c.minConfidence <= 1
     && finite(c.maxAtrPoints) && c.maxAtrPoints > 0 && finite(c.minVolumeRatio) && c.minVolumeRatio >= 0
@@ -112,7 +114,7 @@ export function evaluateStrategy(input: StrategyEvaluationInput): StrategyEvalua
   let evaluatedAt: string;
   try { evaluatedAt = marketTimestamp(input.evaluatedAt); } catch { return hold("INVALID_INPUT"); }
   const proposal = input.proposal, c = input.config;
-  if (!proposal || !c || !validConfig(c) || evaluatedAt !== snapshot.evaluatedAt
+  if (!proposal || !c || !validStrategyQualityConfig(c) || evaluatedAt !== snapshot.evaluatedAt
     || !finite(proposal.confidence) || proposal.confidence < 0 || proposal.confidence > 1
     || !/^\d{4}-\d{2}-\d{2}$/.test(proposal.expiry)) return hold("INVALID_INPUT");
   if (proposal.direction === "HOLD") return hold("NO_DIRECTION");

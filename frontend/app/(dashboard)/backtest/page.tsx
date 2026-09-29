@@ -17,7 +17,6 @@ const INTERVALS: BacktestInterval[] = [
   "15minute",
   "30minute",
   "60minute",
-  "day",
 ];
 
 function toInputDateTimeValue(date: Date): string {
@@ -77,7 +76,7 @@ export default function BacktestPage(): JSX.Element {
         interval,
         from: fromDate.toISOString(),
         to: toDate.toISOString(),
-        initialCapital: Number(initialCapital) || 200_000,
+        initialCapital: Number(initialCapital),
       });
       setResult(data);
       setBackendReachable(true);
@@ -112,7 +111,7 @@ export default function BacktestPage(): JSX.Element {
           className="mb-3 text-[0.68rem] font-mono"
           style={{ color: "rgba(255,255,255,0.35)" }}
         >
-          Uses Kite Connect API
+          Research replay requires a configured historical option archive. P&amp;L excludes brokerage and taxes.
         </div>
         <div
           className="mb-3 text-[0.7rem] font-mono"
@@ -251,9 +250,12 @@ export default function BacktestPage(): JSX.Element {
 
       {result && (
         <>
+          {result.status === "INCOMPLETE" && (
+            <p className="text-xs text-amber-400">Incomplete historical evidence. Results show realized P&amp;L only; unresolved positions are not treated as closed.</p>
+          )}
           <section className="grid grid-cols-2 gap-3 md:grid-cols-4">
             <StatCard
-              label="Net P&L"
+              label="P&L excluding charges"
               value={`${result.netPnL >= 0 ? "+" : ""}₹${result.netPnL.toFixed(2)}`}
               color={result.netPnL >= 0 ? "#00C853" : "#FF1744"}
             />
@@ -265,7 +267,7 @@ export default function BacktestPage(): JSX.Element {
             />
             <StatCard label="Trades" value={`${result.totalTrades}`} />
             <StatCard
-              label="Max Drawdown"
+              label="Realized Drawdown"
               value={`₹${result.maxDrawdown.toFixed(2)}`}
               color="#FFB300"
             />

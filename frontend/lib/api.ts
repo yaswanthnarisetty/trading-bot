@@ -131,8 +131,7 @@ export type BacktestInterval =
   | "10minute"
   | "15minute"
   | "30minute"
-  | "60minute"
-  | "day";
+  | "60minute";
 
 export interface BacktestTrade {
   tradeId: string;
@@ -152,7 +151,7 @@ export interface BacktestTrade {
   maxProfit: number;
   maxLoss: number;
   pnl: number;
-  exitReason: "TARGET_HIT" | "STOP_HIT" | "TIME_EXIT" | "END_OF_DATA";
+  exitReason: "TARGET_HIT" | "STOP_HIT" | "DIRECTIONAL_STOP" | "TIME_EXIT" | "EOD_CLOSE" | "END_OF_DATA";
 }
 
 export interface BacktestBlockReasons {
@@ -165,7 +164,14 @@ export interface BacktestBlockReasons {
 }
 
 export interface BacktestResult {
-  provider: "KITE";
+  provider: "FIXTURE" | "KITE_ARCHIVE";
+  dataMode: "HISTORICAL_REPLAY";
+  status: "COMPLETE" | "INCOMPLETE";
+  missingExitObservations: number;
+  missingEntryObservations: number;
+  completeness: { version: "REPLAY_COMPLETENESS_V1"; missingCandleCoverage: number;
+    truncatedCoverage: boolean; missingRequiredOptionObservations: number;
+    unavailableRequiredAnalytics: number; incompleteContractUniverse: number };
   asset: string;
   interval: BacktestInterval;
   from: string;
@@ -455,7 +461,7 @@ export function closePosition(
  * Runs historical backtest simulation for a selected asset and date range.
  * Useful for analysis when live market is closed.
  *
- * @param input - Backtest configuration and optional Kite credentials.
+ * @param input - Replay configuration; historical archive selection is server-owned.
  * @returns Promise resolving to full backtest result set.
  */
 export function runBacktest(
