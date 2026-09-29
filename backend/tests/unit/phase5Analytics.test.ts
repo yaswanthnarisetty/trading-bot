@@ -151,11 +151,16 @@ for (const [label, overrides, reason] of [
   ["RSI", { config: { ...config, bullishRsiMax: 50 } }, "RSI_GATE"],
   ["volume", { config: { ...config, minVolumeRatio: 100 } }, "VOLUME_GATE"],
   ["opening", { evaluatedAt: "2026-09-29T03:50:00Z" }, "INVALID_INPUT"],
-  ["unsupported preference", { proposal: { direction: "BULLISH", confidence: 0.8, expiry: "2026-10-06", preferredStrategy: "BEAR_CALL_SPREAD" } }, "STRATEGY_NOT_SUPPORTED"],
   ["no expiry", { proposal: { direction: "BULLISH", confidence: 0.8, expiry: "2026-10-13" } }, "NO_QUALIFIED_CONTRACT"],
 ] as const) test(`strategy ${label} is stable ${reason}`, async () => {
   const result = await mockEvaluation(overrides as Partial<StrategyEvaluationInput>);
   assert.deepEqual(result, { action: "HOLD", reason });
+});
+test("legacy model preference is non-authoritative metadata", async () => {
+  const result = await mockEvaluation({ proposal: { direction: "BULLISH", confidence: 0.8,
+    expiry: "2026-10-06", preferredStrategy: "BEAR_CALL_SPREAD" } });
+  assert.equal(result.action, "CANDIDATE");
+  if (result.action === "CANDIDATE") assert.equal(result.candidate.strategyFamily, "CREDIT_VERTICAL");
 });
 test("missing exact short and hedge cannot be synthesized from a symbol", async () => {
   const input = await mockInput();

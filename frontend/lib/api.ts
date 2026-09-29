@@ -133,9 +133,19 @@ export type BacktestInterval =
   | "30minute"
   | "60minute";
 
+export type StrategyFamily = "LONG_OPTION" | "DEBIT_VERTICAL" | "CREDIT_VERTICAL";
+export type StrategyKind = "LONG_CALL" | "LONG_PUT" | "BULL_CALL_DEBIT_SPREAD" | "BEAR_PUT_DEBIT_SPREAD"
+  | "BULL_PUT_CREDIT_SPREAD" | "BEAR_CALL_CREDIT_SPREAD";
+
 export interface BacktestTrade {
   tradeId: string;
-  strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
+  strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD" | StrategyKind;
+  strategyFamily: StrategyFamily;
+  strategyKind: StrategyKind;
+  legs: Array<{ side: "BUY" | "SELL"; canonicalId: string; instrumentToken: string; strike: number;
+    quantityUnits: number; entryFillMinor: number; exitFillMinor: number }>;
+  capitalReserved: number;
+  entryDebit: number | null;
   entryTimestamp: string;
   exitTimestamp: string;
   entrySpot: number;
@@ -143,12 +153,12 @@ export interface BacktestTrade {
   barsHeld: number;
   lots: number;
    optionType: "CALL" | "PUT";
-   sellStrike: number;
+   sellStrike: number | null;
    buyStrike: number;
-   width: number;
-   credit: number;
+   width: number | null;
+   credit: number | null;
    breakeven: number;
-  maxProfit: number;
+  maxProfit: number | null;
   maxLoss: number;
   pnl: number;
   exitReason: "TARGET_HIT" | "STOP_HIT" | "DIRECTIONAL_STOP" | "TIME_EXIT" | "EOD_CLOSE" | "END_OF_DATA";
@@ -164,6 +174,8 @@ export interface BacktestBlockReasons {
 }
 
 export interface BacktestResult {
+  strategyFamily: StrategyFamily;
+  peakCapitalReserved: number;
   provider: "FIXTURE" | "KITE_ARCHIVE";
   dataMode: "HISTORICAL_REPLAY";
   status: "COMPLETE" | "INCOMPLETE";
@@ -195,6 +207,9 @@ export interface BacktestResult {
 }
 
 export interface BacktestRunInput {
+  strategyFamily?: StrategyFamily;
+  stopLossPctOfPremium?: number;
+  takeProfitPctOfPremium?: number;
   asset: string;
   from: string;
   to: string;

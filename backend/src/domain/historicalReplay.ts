@@ -7,10 +7,10 @@ import { freeze, marketTimestamp } from "./kiteMarketData";
 import { computeValidatedIndicators, type AnalyticsCandle } from "./validatedIndicators";
 import { buildMockMarketAnalytics, type AnalyticsOutcome } from "./marketAnalytics";
 import { analyticsEvidenceId } from "./analyticsEvidence";
-import { evaluateStrategy, validStrategyQualityConfig, type StrategyQualityConfig,
+import { evaluateStrategy, validStrategyQualityConfig, resolvedStrategyConfig, verticalContractQueries, inLongSelectionUniverse, type StrategyQualityConfig,
   type DirectionalProposal } from "./strategyEvaluation";
 
-export const REPLAY_VERSION = "NSE_HISTORICAL_REPLAY_V1";
+export const REPLAY_VERSION = "NSE_HISTORICAL_REPLAY_V2";
 export const PROPOSAL_VERSION = "EMA_ALIGNMENT_V1";
 export const intervalMinutes = { minute: 1, "3minute": 3, "5minute": 5, "10minute": 10,
   "15minute": 15, "30minute": 30, "60minute": 60 } as const;
@@ -26,14 +26,17 @@ const hundredths = (value: number) => Number.isSafeInteger(Math.round(value * 10
   && Math.abs(value * 100 - Math.round(value * 100)) < 0.00001;
 const qualityKeys = new Set(["version", "minConfidence", "maxAtrPoints", "minVolumeRatio", "bullishRsiMax",
   "bearishRsiMin", "openingBlockMinutes", "minDteDays", "strikeStepMinor", "widthMinor", "shortOffsetMinor",
-  "minDepthUnits", "maxBidAskSpreadMinor", "minCreditMinor"]);
+  "minDepthUnits", "maxBidAskSpreadMinor", "minCreditMinor", "strategyFamily", "longOptionSelection", "debitLongOffsetMinor"]);
 const requestSchema = z.object({
   asset: z.enum(["NIFTY", "BANKNIFTY", "FINNIFTY"]), from: timestamp, to: timestamp,
+  strategyFamily: z.enum(["LONG_OPTION", "DEBIT_VERTICAL", "CREDIT_VERTICAL"]).default("CREDIT_VERTICAL"),
   interval: z.enum(["minute", "3minute", "5minute", "10minute", "15minute", "30minute", "60minute"]).default("5minute"),
   initialCapital: z.number().finite().min(1).max(1_000_000_000).refine(hundredths).default(200_000),
   riskPerTradePct: z.number().finite().min(0.01).max(10).refine(hundredths).default(4),
   targetProfitPct: z.number().finite().min(0.01).max(1).refine(hundredths).default(0.5),
   stopLossPct: z.number().finite().min(0.01).max(1).refine(hundredths).default(0.5),
+  stopLossPctOfPremium: z.number().finite().min(0.01).max(1).refine(hundredths).default(0.5),
+  takeProfitPctOfPremium: z.number().finite().min(0.01).max(10).refine(hundredths).default(0.5),
   maxHoldingBars: z.number().int().min(1).max(500).default(12),
   maxPositions: z.number().int().min(1).max(10).default(3),
   maxDailyTrades: z.number().int().min(1).max(100).default(3),
@@ -54,12 +57,14 @@ export function normalizeBacktestParams(input: unknown): ReplayConfig {
   if (!parsed.success) throw new BacktestError("INVALID_BACKTEST_CONFIG");
   const p = parsed.data;
   const width = p.asset === "BANKNIFTY" ? 20000 : p.asset === "FINNIFTY" ? 5000 : 10000;
-  return freeze({ ...p, strategyConfig: { ...(p.strategyConfig ?? {
+  const quality: StrategyQualityConfig = p.strategyConfig ?? {
     version: "BACKTEST_QUALITY_V1", minConfidence: 0.65, maxAtrPoints: 70, minVolumeRatio: 0,
     bullishRsiMax: 70, bearishRsiMin: 30, openingBlockMinutes: 15, minDteDays: 3,
     strikeStepMinor: p.asset === "BANKNIFTY" ? 10000 : 5000, widthMinor: width,
     shortOffsetMinor: width, minDepthUnits: 1, maxBidAskSpreadMinor: 1000, minCreditMinor: 2500,
-  }) } });
+  };
+  if (quality.strategyFamily && quality.strategyFamily !== p.strategyFamily) throw new BacktestError("CONFLICTING_STRATEGY_FAMILY");
+  return freeze({ ...p, strategyConfig: resolvedStrategyConfig({ ...quality, strategyFamily: p.strategyFamily }) });
 }
 export function istSession(time: number) {
   const date = new Date(time + 19_800_000);
@@ -241,16 +246,19 @@ function classifyReplayEvidence(replay: PreparedReplay, analytics: AnalyticsOutc
   const nearestMasterExpiry = replay.earliestKnownExpiry(evaluatedAt);
   if (nearestMasterExpiry && nearestMasterExpiry < proposal.expiry)
     return "MISSING_REQUIRED_OPTION_OBSERVATION";
-  if (result.action !== "HOLD" || !["NO_QUALIFIED_CONTRACT", "NO_QUALIFIED_HEDGE", "INVALID_GREEKS"].includes(result.reason))
-    return null;
-  const bull = proposal.direction === "BULLISH", type = bull ? "PE" : "CE";
-  const shortStrike = Math.round((snapshot.spotMinor + (bull ? -config.strategyConfig.shortOffsetMinor
-    : config.strategyConfig.shortOffsetMinor)) / config.strategyConfig.strikeStepMinor) * config.strategyConfig.strikeStepMinor;
-  const hedgeStrike = shortStrike + (bull ? -config.strategyConfig.widthMinor : config.strategyConfig.widthMinor);
-  const required = [shortStrike, hedgeStrike].map(strike => replay.qualifiedOption(proposal.expiry, strike, type));
+  const family = config.strategyFamily;
+  let required: (InstrumentDefinition | undefined)[];
+  if (family === "LONG_OPTION") {
+    required = replay.data.master.instruments.filter(i => inLongSelectionUniverse(i, config.asset, proposal.expiry,
+      proposal.direction as "BULLISH" | "BEARISH", snapshot.spotMinor, config.strategyConfig));
+  } else {
+    if (result.action !== "HOLD" || !["NO_QUALIFIED_CONTRACT", "NO_QUALIFIED_HEDGE", "NO_QUALIFIED_SHORT", "INVALID_GREEKS"].includes(result.reason))
+      return null;
+    required = verticalContractQueries(snapshot.spotMinor, proposal.direction, config.strategyConfig)
+      .map(q => replay.qualifiedOption(proposal.expiry, q.strike, q.type));
+  }
   const observed = new Set(replay.quotesAt(evaluatedAt).map(q => q.canonicalId));
   if (required.some(i => i && !observed.has(i.canonicalId))) return "MISSING_REQUIRED_OPTION_OBSERVATION";
-  if (result.reason !== "INVALID_GREEKS") return null; // The complete master genuinely lacks a required contract.
   const requiredOptions = snapshot.options.filter(o => required.some(i => i?.canonicalId === o.canonicalId));
   const expiryAt = Date.parse(`${proposal.expiry}T10:00:00.000Z`);
   if (requiredOptions.some(o => !o.greeks.available && (o.greeks.reason !== "EXPIRED_OPTION"

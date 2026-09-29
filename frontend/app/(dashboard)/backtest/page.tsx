@@ -7,6 +7,7 @@ import {
   type Asset,
   type BacktestInterval,
   type BacktestResult,
+  type StrategyFamily,
 } from "../../../lib/api";
 
 const INTERVALS: BacktestInterval[] = [
@@ -27,6 +28,7 @@ function toInputDateTimeValue(date: Date): string {
 export default function BacktestPage(): JSX.Element {
   const [assets, setAssets] = useState<Asset[]>([]);
   const [asset, setAsset] = useState("NIFTY");
+  const [strategyFamily, setStrategyFamily] = useState<StrategyFamily>("CREDIT_VERTICAL");
   const [interval, setInterval] = useState<BacktestInterval>("5minute");
   const [from, setFrom] = useState<string>(() =>
     toInputDateTimeValue(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000))
@@ -73,6 +75,7 @@ export default function BacktestPage(): JSX.Element {
 
       const data = await runBacktest({
         asset,
+        strategyFamily,
         interval,
         from: fromDate.toISOString(),
         to: toDate.toISOString(),
@@ -153,6 +156,20 @@ export default function BacktestPage(): JSX.Element {
                   {a.key}
                 </option>
               ))}
+            </select>
+          </label>
+
+          <label className="flex flex-col gap-1">
+            <span className="ui-label">Strategy</span>
+            <select
+              value={strategyFamily}
+              onChange={(e) => setStrategyFamily(e.target.value as StrategyFamily)}
+              className="rounded-lg px-3 py-2 text-xs font-mono text-[#e0e0e0]"
+              style={{ background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)" }}
+            >
+              <option value="LONG_OPTION">Long option</option>
+              <option value="DEBIT_VERTICAL">Debit spread</option>
+              <option value="CREDIT_VERTICAL">Credit spread</option>
             </select>
           </label>
 
@@ -366,11 +383,10 @@ export default function BacktestPage(): JSX.Element {
                           {new Date(trade.exitTimestamp).toLocaleString()}
                         </td>
                         <td className="px-2 py-2 font-mono text-[#d0d0d0]">
-                          {trade.strategy}
+                          {trade.strategyKind}
                         </td>
                         <td className="px-2 py-2 font-mono text-[#d0d0d0]">
-                          {trade.optionType} {trade.sellStrike.toFixed(0)}/
-                          {trade.buyStrike.toFixed(0)} · {trade.lots} lot
+                          {trade.optionType} {trade.legs.map((leg) => `${leg.side} ${leg.strike.toFixed(0)}`).join(" / ")} · {trade.lots} lot
                           {trade.lots > 1 ? "s" : ""}
                         </td>
                         <td className="px-2 py-2 text-right font-mono text-[#d0d0d0]">

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { AssetKey } from "../config/assets";
 import { freeze, marketTimestamp } from "../domain/kiteMarketData";
-import { STRATEGY_EVALUATOR_VERSION, type TradeCandidate } from "../domain/strategyEvaluation";
+import { STRATEGY_EVALUATOR_VERSION, type TradeCandidate, type StrategyFamily, type StrategyKind } from "../domain/strategyEvaluation";
 import { BacktestError, deterministicReplayProposal, evaluateHistoricalBar, istSession,
   normalizeBacktestParams, prepareReplay, REPLAY_VERSION, type BacktestRunParams,
   type HistoricalReplayProvider, type HistoricalOptionQuote, type ReplayProposalSource } from "../domain/historicalReplay";
@@ -10,27 +10,31 @@ export type { BacktestRunParams } from "../domain/historicalReplay";
 
 export const SLIPPAGE_MODEL_VERSION = "ADVERSE_FIXED_PAISE_PER_LEG_V1";
 export interface BacktestTrade {
-  tradeId: string; strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
+  tradeId: string; strategy: TradeCandidate["strategy"]; strategyFamily: StrategyFamily; strategyKind: StrategyKind;
+  legs: Array<{ side: "BUY" | "SELL"; canonicalId: string; instrumentToken: string; strike: number;
+    quantityUnits: number; entryFillMinor: number; exitFillMinor: number }>;
+  capitalReserved: number; entryDebit: number | null;
   entryTimestamp: string; exitTimestamp: string; entrySpot: number; exitSpot: number;
   barsHeld: number; lots: number; quantityUnits: number; optionType: "CALL" | "PUT";
-  sellStrike: number; buyStrike: number; width: number;
+  sellStrike: number | null; buyStrike: number; width: number | null;
   /** Rupees per contract unit (legacy field, now explicit). */
-  credit: number; breakeven: number; maxProfit: number; maxLoss: number; pnl: number;
+  credit: number | null; breakeven: number; maxProfit: number | null; maxLoss: number; pnl: number;
   grossPnL: number; slippageCost: number; pnlMinor: number;
   exitReason: "TARGET_HIT" | "STOP_HIT" | "DIRECTIONAL_STOP" | "TIME_EXIT" | "EOD_CLOSE" | "END_OF_DATA";
-  entryEvidenceId: string; shortCanonicalId: string; hedgeCanonicalId: string; masterFingerprint: string;
-  shortInstrumentToken: string; hedgeInstrumentToken: string;
-  entryShortFillMinor: number; entryHedgeFillMinor: number; exitShortFillMinor: number; exitHedgeFillMinor: number;
+  entryEvidenceId: string; shortCanonicalId?: string; hedgeCanonicalId?: string; masterFingerprint: string;
+  shortInstrumentToken?: string; hedgeInstrumentToken?: string;
+  entryShortFillMinor?: number; entryHedgeFillMinor?: number; exitShortFillMinor?: number; exitHedgeFillMinor?: number;
 }
 export type BacktestBlockReasons = Record<string, number>;
 export interface BacktestDecision {
   evaluatedAt: string; direction: "BULLISH" | "BEARISH" | "HOLD"; confidence: number;
   proposalReason: string; analyticsEvidenceId: string | null;
   strategyAction: "CANDIDATE" | "HOLD"; strategyReason: string;
-  simulationReason: string | null;
+  simulationReason: string | null; strategyFamily: StrategyFamily; strategyKind: StrategyKind | null;
 }
 export interface BacktestResult {
   provider: "FIXTURE" | "KITE_ARCHIVE"; asset: AssetKey; interval: string; from: string; to: string;
+  strategyFamily: StrategyFamily; peakCapitalReserved: number;
   dataMode: "HISTORICAL_REPLAY"; executionAuthority: "NONE"; status: "COMPLETE" | "INCOMPLETE";
   dataPoints: number; initialCapital: number; finalCapital: number; netPnL: number; grossPnL: number;
   slippageCost: number; totalSignals: number; totalBlocked: number; totalTraded: number;
@@ -55,8 +59,8 @@ export interface BacktestResult {
 }
 interface SimPosition {
   id: string; candidate: TradeCandidate; entryIndex: number; entrySpotMinor: number; lots: number;
-  units: bigint; entryCreditMinor: bigint; reserveMinor: bigint; entryAtr: number;
-  entryShortFillMinor: number; entryHedgeFillMinor: number; evidenceId: string;
+  units: bigint; entryCashFlowMinor: bigint; reserveMinor: bigint; entryAtr: number;
+  maxLossMinor: bigint; maxProfitMinor: bigint | null; entryFillsMinor: number[]; evidenceId: string;
 }
 const safe = (value: bigint): number => {
   if (value > BigInt(Number.MAX_SAFE_INTEGER) || value < BigInt(Number.MIN_SAFE_INTEGER)) throw new BacktestError("SIMULATION_MONEY_OVERFLOW");
@@ -85,6 +89,7 @@ export async function runHistoricalBacktest(params: BacktestRunParams, dependenc
   if (!indexes.length) throw new BacktestError("NO_HISTORICAL_BARS_IN_RANGE");
   let equity = BigInt(Math.round(config.initialCapital * 100)), peak = equity, drawdown = 0n;
   let totalSignals = 0, totalBlocked = 0, totalTraded = 0;
+  let peakCapitalReserved = 0n;
   let missingExitObservations = 0, missingEntryObservations = 0;
   let missingRequiredOptionObservations = 0, unavailableRequiredAnalytics = 0, incompleteContractUniverse = 0;
   const trades: BacktestTrade[] = [], decisions: BacktestDecision[] = [];
@@ -97,41 +102,60 @@ export async function runHistoricalBacktest(params: BacktestRunParams, dependenc
   const slip = BigInt(config.slippageMinorPerLeg);
   const close = (pos: SimPosition, quotes: readonly HistoricalOptionQuote[], spot: number, at: string,
     forced?: BacktestTrade["exitReason"]): boolean => {
-    const short = quotes.find(q => q.canonicalId === pos.candidate.short.canonicalId);
-    const hedge = quotes.find(q => q.canonicalId === pos.candidate.hedge.canonicalId);
-    // Never use a future/stale mark, invented price or an unavailable fill to close the book.
-    if (!short || !hedge || BigInt(short.askQuantity) < pos.units || BigInt(hedge.bidQuantity) < pos.units
-      || BigInt(hedge.bidMinor) < slip) { missingExitObservations++; return false; }
-    const rawDebit = BigInt(short.askMinor) - BigInt(hedge.bidMinor);
-    if (rawDebit < 0n || rawDebit > BigInt(pos.candidate.widthMinor)) { missingExitObservations++; return false; }
-    const exitDebit = rawDebit + 2n * slip;
-    const pnl = (pos.entryCreditMinor - exitDebit) * pos.units;
+    const c = pos.candidate;
+    const observations = c.legs.map(leg => quotes.find(q => q.canonicalId === leg.canonicalId));
+    if (observations.some((q, i) => !q || BigInt(c.legs[i]!.side === "BUY" ? q.bidQuantity : q.askQuantity) < pos.units
+      || c.legs[i]!.side === "BUY" && BigInt(q.bidMinor) < slip)) { missingExitObservations++; return false; }
+    const rawExitCash = observations.reduce((sum, q, i) => sum + (c.legs[i]!.side === "BUY"
+      ? BigInt(q!.bidMinor) : -BigInt(q!.askMinor)), 0n);
+    // Debit liquidation is signed executable cash flow, not the expiration payoff.
+    // Overlapping books may require an additional debit to close valid quoted legs.
+    if (c.strategyFamily === "CREDIT_VERTICAL"
+      && (rawExitCash > 0n || rawExitCash < -BigInt(c.widthMinor))) { missingExitObservations++; return false; }
+    const exitCash = rawExitCash - BigInt(c.legs.length) * slip;
+    const pnl = (pos.entryCashFlowMinor + exitCash) * pos.units;
+    const exitFills = observations.map((q, i) => safe(c.legs[i]!.side === "BUY" ? BigInt(q!.bidMinor) - slip : BigInt(q!.askMinor) + slip));
     const held = replay.expectedBarIndex(at) - pos.entryIndex;
     let reason = forced;
-    if (!reason && pnl <= -(pos.reserveMinor * BigInt(Math.round(config.stopLossPct * 100))) / 100n) reason = "STOP_HIT";
+    const stopBase = c.strategyFamily === "CREDIT_VERTICAL" ? pos.reserveMinor : pos.maxLossMinor;
+    const stopFraction = c.strategyFamily === "LONG_OPTION" ? config.stopLossPctOfPremium : config.stopLossPct;
+    const targetBase = c.strategyFamily === "LONG_OPTION" ? pos.maxLossMinor : pos.maxProfitMinor!;
+    const targetFraction = c.strategyFamily === "LONG_OPTION" ? config.takeProfitPctOfPremium : config.targetProfitPct;
+    if (!reason && pnl <= -(stopBase * BigInt(Math.round(stopFraction * 100))) / 100n) reason = "STOP_HIT";
     if (!reason && config.directionalStopMult !== null && held >= config.directionalStopMinBars) {
-      const move = (spot - pos.entrySpotMinor) / 100 * (pos.candidate.strategy === "BULL_PUT_SPREAD" ? 1 : -1);
+      const move = (spot - pos.entrySpotMinor) / 100 * (c.direction === "BULLISH" ? 1 : -1);
       if (move < -pos.entryAtr * config.directionalStopMult) reason = "DIRECTIONAL_STOP";
     }
-    if (!reason && pnl >= pos.entryCreditMinor * pos.units * BigInt(Math.round(config.targetProfitPct * 100)) / 100n) reason = "TARGET_HIT";
+    if (!reason && pnl >= targetBase * BigInt(Math.round(targetFraction * 100)) / 100n) reason = "TARGET_HIT";
     if (!reason && held >= config.maxHoldingBars) reason = "TIME_EXIT";
     if (!reason) return false;
     equity += pnl;
-    if (equity < 0n) throw new BacktestError("SIMULATION_CAPITAL_INVARIANT");
-    const c = pos.candidate;
-    trades.push({ tradeId: pos.id, strategy: c.strategy, entryTimestamp: c.evaluatedAt, exitTimestamp: at,
-      entrySpot: pos.entrySpotMinor / 100, exitSpot: spot / 100, barsHeld: held, lots: pos.lots,
-      quantityUnits: safe(pos.units), optionType: c.strategy === "BULL_PUT_SPREAD" ? "PUT" : "CALL",
-      sellStrike: c.short.instrument.strikeMinor / 100, buyStrike: c.hedge.instrument.strikeMinor / 100,
-      width: c.widthMinor / 100, credit: rupees(pos.entryCreditMinor),
-      breakeven: c.short.instrument.strikeMinor / 100 + (c.strategy === "BULL_PUT_SPREAD" ? -1 : 1) * rupees(pos.entryCreditMinor),
-      maxProfit: rupees(pos.entryCreditMinor * pos.units), maxLoss: rupees(pos.reserveMinor),
-      pnl: rupees(pnl), pnlMinor: safe(pnl), grossPnL: rupees((BigInt(c.creditPerUnitMinor) - rawDebit) * pos.units),
-      slippageCost: rupees(4n * slip * pos.units), exitReason: reason, entryEvidenceId: pos.evidenceId,
-      shortCanonicalId: c.short.canonicalId, hedgeCanonicalId: c.hedge.canonicalId, masterFingerprint: c.optionMasterFingerprint,
-      shortInstrumentToken: c.short.instrument.instrumentToken, hedgeInstrumentToken: c.hedge.instrument.instrumentToken,
-      entryShortFillMinor: pos.entryShortFillMinor, entryHedgeFillMinor: pos.entryHedgeFillMinor,
-      exitShortFillMinor: safe(BigInt(short.askMinor) + slip), exitHedgeFillMinor: safe(BigInt(hedge.bidMinor) - slip) });
+    // Realize valid debit closes even when execution loss exceeds the entry reserve.
+    // Existing capacity checks reject subsequent entries when equity is exhausted.
+    if (equity < 0n && c.strategyFamily !== "DEBIT_VERTICAL") throw new BacktestError("SIMULATION_CAPITAL_INVARIANT");
+    const buyIndex = c.legs.findIndex(l => l.side === "BUY"), sellIndex = c.legs.findIndex(l => l.side === "SELL");
+    const buy = c.legs[buyIndex]!, sell = c.legs[sellIndex];
+    const premium = c.strategyFamily === "CREDIT_VERTICAL" ? pos.entryCashFlowMinor : -pos.entryCashFlowMinor;
+    const breakStrike = c.strategyFamily === "CREDIT_VERTICAL" ? sell!.instrument.strikeMinor : buy.instrument.strikeMinor;
+    trades.push({ tradeId: pos.id, strategy: c.strategy, strategyFamily: c.strategyFamily, strategyKind: c.strategyKind,
+      entryTimestamp: c.evaluatedAt, exitTimestamp: at, entrySpot: pos.entrySpotMinor / 100, exitSpot: spot / 100,
+      barsHeld: held, lots: pos.lots, quantityUnits: safe(pos.units), optionType: buy.instrument.instrumentType === "PE" ? "PUT" : "CALL",
+      sellStrike: sell ? sell.instrument.strikeMinor / 100 : null, buyStrike: buy.instrument.strikeMinor / 100,
+      width: c.widthMinor === null ? null : c.widthMinor / 100,
+      credit: c.strategyFamily === "CREDIT_VERTICAL" ? rupees(premium) : null,
+      entryDebit: c.strategyFamily === "CREDIT_VERTICAL" ? null : rupees(premium * pos.units),
+      breakeven: breakStrike / 100 + (buy.instrument.instrumentType === "CE" ? 1 : -1) * rupees(premium),
+      maxProfit: pos.maxProfitMinor === null ? null : rupees(pos.maxProfitMinor), maxLoss: rupees(pos.maxLossMinor),
+      capitalReserved: rupees(pos.reserveMinor), pnl: rupees(pnl), pnlMinor: safe(pnl),
+      grossPnL: rupees((BigInt(c.entryCashFlowPerUnitMinor) + rawExitCash) * pos.units),
+      slippageCost: rupees(2n * BigInt(c.legs.length) * slip * pos.units), exitReason: reason,
+      entryEvidenceId: pos.evidenceId, masterFingerprint: c.optionMasterFingerprint,
+      legs: c.legs.map((leg, i) => ({ side: leg.side, canonicalId: leg.canonicalId, instrumentToken: leg.instrument.instrumentToken,
+        strike: leg.instrument.strikeMinor / 100, quantityUnits: safe(pos.units), entryFillMinor: pos.entryFillsMinor[i]!, exitFillMinor: exitFills[i]! })),
+      ...(c.strategyFamily === "CREDIT_VERTICAL" ? { shortCanonicalId: c.short.canonicalId, hedgeCanonicalId: c.hedge.canonicalId,
+        shortInstrumentToken: c.short.instrument.instrumentToken, hedgeInstrumentToken: c.hedge.instrument.instrumentToken,
+        entryShortFillMinor: pos.entryFillsMinor[0]!, entryHedgeFillMinor: pos.entryFillsMinor[1]!,
+        exitShortFillMinor: exitFills[0]!, exitHedgeFillMinor: exitFills[1]! } : {}) });
     return true;
   };
   for (const { i, end } of indexes) {
@@ -155,7 +179,8 @@ export async function runHistoricalBacktest(params: BacktestRunParams, dependenc
     const record: BacktestDecision = { evaluatedAt: at, direction: evaluation.proposal.direction,
       confidence: evaluation.proposal.confidence, proposalReason: evaluation.proposalReason,
       analyticsEvidenceId: evaluation.analyticsEvidenceId, strategyAction: evaluation.result.action,
-      strategyReason: evaluation.result.action === "HOLD" ? evaluation.result.reason : "CANDIDATE", simulationReason: null };
+      strategyReason: evaluation.result.action === "HOLD" ? evaluation.result.reason : "CANDIDATE", simulationReason: null,
+      strategyFamily: config.strategyFamily, strategyKind: evaluation.result.action === "CANDIDATE" ? evaluation.result.candidate.strategyKind : null };
     decisions.push(record);
     if (evaluation.proposal.direction !== "HOLD") totalSignals++;
     if (evaluation.result.action === "HOLD") {
@@ -171,27 +196,37 @@ export async function runHistoricalBacktest(params: BacktestRunParams, dependenc
       else if (open.length >= config.maxPositions) blocked = "max_positions";
       else if ((daily.get(session.date) ?? 0) >= config.maxDailyTrades) blocked = "daily_limit";
       else if (openedToday.has(`${session.date}:${c.candidateKey}`)) blocked = "duplicate_strategy";
-      else if (open.some(p => p.candidate.strategy === c.strategy)) blocked = "same_direction_open";
-      const entryCredit = BigInt(c.creditPerUnitMinor) - 2n * slip;
-      const reservePerLot = (BigInt(c.widthMinor) - entryCredit + 2n * slip) * BigInt(c.short.lotSizeUnits);
+      else if (open.some(p => p.candidate.direction === c.direction)) blocked = "same_direction_open";
+      const entryCash = BigInt(c.entryCashFlowPerUnitMinor) - BigInt(c.legs.length) * slip;
+      const lotUnits = BigInt(c.quantityUnits);
+      const lossPerUnit = c.strategyFamily === "CREDIT_VERTICAL" ? BigInt(c.widthMinor) - entryCash + 2n * slip : -entryCash;
+      // Debit vertical closing costs need a simulation buffer; contractual max loss remains debit paid.
+      const reservePerLot = (lossPerUnit + (c.strategyFamily === "DEBIT_VERTICAL" ? 2n * slip : 0n)) * lotUnits;
       const used = open.reduce((sum, pos) => sum + pos.reserveMinor, 0n);
       const available = equity - used;
       const budget = equity * BigInt(Math.round(config.riskPerTradePct * 100)) / 10000n;
       let lots = reservePerLot > 0n ? (budget < available ? budget : available) / reservePerLot : 0n;
-      const short = quotes.find(q => q.canonicalId === c.short.canonicalId)!;
-      const hedge = quotes.find(q => q.canonicalId === c.hedge.canonicalId)!;
-      const depthLots = BigInt(Math.min(short.bidQuantity, hedge.askQuantity)) / BigInt(c.short.lotSizeUnits);
-      if (lots > depthLots) lots = depthLots;
-      if (!blocked && (entryCredit <= 0n || c.short.priceMinor <= config.slippageMinorPerLeg)) blocked = "simulation_cost_rejection";
+      const observations = c.legs.map(leg => quotes.find(q => q.canonicalId === leg.canonicalId)!);
+      const depthLots = observations.reduce((limit, q, i) => {
+        const depth = BigInt(c.legs[i]!.side === "BUY" ? q.askQuantity : q.bidQuantity) / lotUnits;
+        return depth < limit ? depth : limit;
+      }, lots);
+      lots = depthLots;
+      const entryFills = c.legs.map(leg => safe(BigInt(leg.priceMinor) + (leg.side === "BUY" ? slip : -slip)));
+      if (!blocked && (entryFills.some(price => price <= 0) || c.strategyFamily === "CREDIT_VERTICAL" && entryCash <= 0n
+        || c.strategyFamily === "DEBIT_VERTICAL" && -entryCash >= BigInt(c.widthMinor))) blocked = "simulation_cost_rejection";
       if (!blocked && lots < 1n) blocked = "insufficient_simulated_capacity";
       if (blocked) { record.simulationReason = blocked; totalBlocked++; count(blockReasons, blocked); }
       else {
-        const units = lots * BigInt(c.short.lotSizeUnits);
+        const units = lots * lotUnits;
+        const profitPerUnit = c.strategyFamily === "LONG_OPTION" ? null : c.strategyFamily === "CREDIT_VERTICAL" ? entryCash : BigInt(c.widthMinor) + entryCash;
         open.push({ id: `bt-${config.asset}-${at}-${totalTraded + 1}`, candidate: c, entryIndex: replay.expectedBarIndex(at),
-          entrySpotMinor: candle.closeMinor, lots: safe(lots), units, entryCreditMinor: entryCredit,
-          reserveMinor: reservePerLot * lots, entryAtr: evaluation.analytics.available ? evaluation.analytics.snapshot.indicators.values.atr! : 0,
-          entryShortFillMinor: safe(BigInt(c.short.priceMinor) - slip),
-          entryHedgeFillMinor: safe(BigInt(c.hedge.priceMinor) + slip), evidenceId: evaluation.analyticsEvidenceId! });
+          entrySpotMinor: candle.closeMinor, lots: safe(lots), units, entryCashFlowMinor: entryCash,
+          reserveMinor: reservePerLot * lots, maxLossMinor: lossPerUnit * units,
+          maxProfitMinor: profitPerUnit === null ? null : profitPerUnit * units,
+          entryAtr: evaluation.analytics.available ? evaluation.analytics.snapshot.indicators.values.atr! : 0,
+          entryFillsMinor: entryFills, evidenceId: c.analyticsEvidenceId });
+        if (used + reservePerLot * lots > peakCapitalReserved) peakCapitalReserved = used + reservePerLot * lots;
         totalTraded++; daily.set(session.date, (daily.get(session.date) ?? 0) + 1);
         openedToday.add(`${session.date}:${c.candidateKey}`); record.simulationReason = "OPENED";
       }
@@ -204,10 +239,11 @@ export async function runHistoricalBacktest(params: BacktestRunParams, dependenc
   const loss = -trades.filter(t => t.pnlMinor < 0).reduce((n, t) => n + BigInt(t.pnlMinor), 0n);
   const wins = trades.filter(t => t.pnlMinor > 0).length, losses = trades.filter(t => t.pnlMinor < 0).length;
   const netPnL = rupees(equity - BigInt(Math.round(config.initialCapital * 100)));
-  const slippage = trades.reduce((n, t) => n + 4n * slip * BigInt(t.quantityUnits), 0n);
+  const slippage = trades.reduce((n, t) => n + 2n * BigInt(t.legs.length) * slip * BigInt(t.quantityUnits), 0n);
   const runId = createHash("sha256").update(JSON.stringify({ replay: REPLAY_VERSION, strategy: STRATEGY_EVALUATOR_VERSION,
     source: proposalSource.version, data: replay.fingerprint, config })).digest("hex");
-  return freeze({ provider: replay.data.source, asset: config.asset, interval: config.interval, from: config.from, to: config.to,
+  return freeze({ provider: replay.data.source, asset: config.asset, strategyFamily: config.strategyFamily,
+    peakCapitalReserved: rupees(peakCapitalReserved), interval: config.interval, from: config.from, to: config.to,
     dataMode: "HISTORICAL_REPLAY", executionAuthority: "NONE",
     status: open.length || missingExitObservations || missingEntryObservations || replay.missingCandleCoverage
       || replay.truncatedCoverage ? "INCOMPLETE" : "COMPLETE",
