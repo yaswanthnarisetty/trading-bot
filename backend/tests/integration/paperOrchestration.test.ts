@@ -326,3 +326,103 @@ for(const change of ['disconnect','data-mode'] as const)test(`P1 admitted identi
  assert.equal(await models.RiskReservation.countDocuments({state:'HELD'}),1);
  }finally{RiskAdmissionService.prototype.authorizeEntry=original;}
 });
+
+// Monitoring/read-model regression fixtures are isolated real Mongo rows; the
+// terminal-history bulk fixture below tests queries, not financial transitions.
+import { PaperDefaultSessionService, evaluatePaperReadiness, resolvePersonalPaperAccount } from "../../src/services/PaperDefaultSessionService";
+import { completePaperEntryConfig, builtInNiftyPaperConfig } from "../../src/domain/paperMonitoring";
+import { ACTIVE_POSITION_LIMIT } from "../../src/services/PaperDashboardReadService";
+async function monitoringService() {
+ const wire=await realProvider(clock);deps.market=wire.provider;
+ const c={...config('LONG_OPTION'),dataMode:'KITE_REAL' as const};
+ const service=new PaperDefaultSessionService({configurations:async()=>[c],hasExplicitConfiguration:()=>true,
+  accounts:async()=>[{accountId:c.accountId}],start:input=>core.startMonitoring(input),sessionId:s=>String(s.sessionId),schedule:()=>{},
+  readiness:(s,_c,prepare)=>evaluatePaperReadiness({sessionId:s.sessionId,config:s.config},{clock,active:id=>core.active(id),
+   connected:()=>wire.state.connected,mode:()=>wire.state.mode,entryConfig:c=>core.entryConfiguration(c),
+   accountGate:async()=>{},assertReady:c=>core.assertReady(c),recover:async()=>({status:'INCOMPLETE'}),
+   market:(c,refresh)=>refresh?wire.provider.prepare(c):wire.provider.checkReadiness(c)},prepare)});
+ return{service,wire};
+}
+for(const [at,reason] of [['2026-09-29T13:00:00Z','MARKET_CALENDAR_CLOSED'],['2026-09-29T03:50:00Z','OPENING_BLOCK']])
+ test(`real monitoring Start ${reason} creates only a RUNNING session`,async()=>{
+  now=new Date(at);const {service,wire}=await monitoringService(),before=await models.TradingAccount.findOne().lean();
+  const session=await service.start('NIFTY');assert.equal(session.status,'RUNNING');assert.equal(session.entryReady,false);
+  assert.equal(session.entryBlockingReason,reason);assert.deepEqual(wire.paths,[]);await zeroFinancial();
+  assert.deepEqual(await models.TradingAccount.findOne().lean(),before);assert.equal(await core.history.Session.countDocuments(),1);
+ });
+for(const condition of ['stale','monthly','recovery','reconciliation','disconnected'])test(`real monitoring ${condition} preserves session identity without financial writes`,async()=>{
+ const {service,wire}=await monitoringService();
+ if(condition==='stale')wire.state.ageMs=60000;
+ if(condition==='monthly')wire.provider.prepare=async()=>{throw new Error('MONTHLY_METADATA_REQUIRED');};
+ if(condition==='disconnected')wire.state.connected=false;
+ if(condition==='recovery')await new RecoveryBarrierService(connection,f.scope,clock,host).beginRecovery(f.scope.accountId,'recheck');
+ if(condition==='reconciliation')await new ReconciliationService(connection,f.scope,clock,host).reconcileAccount(f.scope.accountId,await brokerSnapshot({time:now,orders:false,trades:false,positions:false,fail:'/orders'}));
+ const before=await models.TradingAccount.findOne().lean();const a=await service.start('NIFTY'),b=await service.start('NIFTY');
+ assert.equal(a.entryReady,false);assert.equal(b.sessionId,a.sessionId);assert.equal(b.status,'RUNNING');
+ assert.equal(await core.history.Session.countDocuments(),1);await zeroFinancial();assert.deepEqual(await models.TradingAccount.findOne().lean(),before);
+});
+test('real monitoring stale-to-ready begins approved evaluation in the same session',async()=>{
+ const {service,wire}=await monitoringService();wire.state.ageMs=60000;const a=await service.start('NIFTY');assert.equal(a.entryReady,false);await zeroFinancial();
+ wire.state.ageMs=0;const b=await service.start('NIFTY');assert.equal(b.entryReady,true);assert.equal(b.sessionId,a.sessionId);
+ const result=await core.runEvaluationCycle(b.sessionId);assert.equal(result.outcome,'ENTRY');assert.equal(await core.history.Session.countDocuments(),1);
+});
+test('real built-in monitoring starts without calendar or guessed Greeks assumptions',async()=>{
+ const c=builtInNiftyPaperConfig(f.scope.accountId);const s=await core.startMonitoring(c);
+ assert.equal(s.status,'RUNNING');await assert.rejects(core.runEvaluationCycle(s.sessionId),/CALENDAR_NOT_READY/);await zeroFinancial();
+ deps.entryConfig=async stored=>completePaperEntryConfig(stored,{calendar:config().calendar,riskFreeRate:.065,riskFreeRateVersion:'EXPLICIT_TEST'});
+ assert.equal((await core.entryConfiguration(s.config)).riskFreeRateVersion,'EXPLICIT_TEST');
+ assert.equal((await core.active(s.sessionId)).get('sessionId'),s.sessionId);
+});
+async function addTerminalHistory(position:Record<string,any>, count=205) {
+ const intent=await models.OrderIntent.findOne({intentId:position.entryIntentId}).lean() as any;
+ const entry=await models.Fill.findOne({intentId:position.entryIntentId}).lean() as any;
+ const positions=[],intents=[],fills=[],exits=[];
+ for(let i=0;i<count;i++){
+  const positionId=`history-${i}`,intentId=`history-intent-${i}`;
+  positions.push({...position,_id:new mongoose.Types.ObjectId(),positionId,entryIntentId:intentId,lifecycle:'CLOSED',integrity:'CONSISTENT',
+   activeCloseIntentId:null,closureEvidenceRefs:['READ_MODEL_FIXTURE'],createdAt:new Date(+now+1000+i),
+   legs:position.legs.map((l:any)=>({...l,exitFilledUnits:l.entryFilledUnits,netQuantityUnits:0}))});
+  intents.push({...intent,_id:new mongoose.Types.ObjectId(),intentId,positionId,signalId:`history-signal-${i}`,commandKey:`history-command-${i}`});
+  fills.push({...entry,_id:new mongoose.Types.ObjectId(),fillId:`history-fill-${i}`,positionId,intentId,brokerTradeKey:`history-trade-${i}`});
+  exits.push({accountId:position.accountId,executionMode:'PAPER',positionId,status:'SETTLED'});
+ }
+ await models.Position.collection.insertMany(positions);await models.OrderIntent.collection.insertMany(intents);await models.Fill.collection.insertMany(fills);
+ await connection.db!.collection('paper_exit_states').insertMany(exits);
+}
+for(const condition of ['OPEN','UNKNOWN','CLOSING','UNSETTLED'])test(`real dashboard retains older ${condition} beyond 200 terminal rows`,async()=>{
+ const {session}=await cycle('LONG_OPTION'),p=await models.Position.findOne().lean() as any;await addTerminalHistory(p);
+ if(condition==='UNKNOWN')await models.BrokerOrder.collection.updateOne({positionId:p.positionId},{$set:{knowledge:'UNKNOWN'}});
+ if(condition==='CLOSING')await models.Position.collection.updateOne({positionId:p.positionId},{$set:{lifecycle:'CLOSING',activeCloseIntentId:'close-fixture'}});
+ if(condition==='UNSETTLED')await models.Position.collection.updateOne({positionId:p.positionId},{$set:{lifecycle:'CLOSED',closureEvidenceRefs:['READ_FIXTURE'],legs:p.legs.map((l:any)=>({...l,exitFilledUnits:l.entryFilledUnits,netQuantityUnits:0}))}});
+ const before=await models.Position.find().lean(),account=await models.TradingAccount.findOne().lean();
+ const v=await readPaperDashboard(connection,session.sessionId,true,host.startupId);
+ assert.equal(v.activePositions.length,1);assert.equal(v.activePositions[0]!.positionId,p.positionId);assert.equal(v.historyPositions.length,200);
+ assert.equal(v.positionsTruncated,true);assert.equal(v.activeTruncated,false);assert.equal(v.exits.activePositionCount,1);
+ if(['UNKNOWN','UNSETTLED'].includes(condition)){assert.equal(v.exits.attentionCount,1);assert.equal(v.exits.status,'ATTENTION');}
+ if(condition==='CLOSING')assert.equal(v.exits.closeInProgress,1);
+ assert.deepEqual(await models.Position.find().lean(),before);assert.deepEqual(await models.TradingAccount.findOne().lean(),account);
+});
+test('real dashboard isolates accounts and excludes zero-fill pending from open exposure',async()=>{
+ const {session}=await cycle('LONG_OPTION'),p=await models.Position.findOne().lean() as any;
+ await models.Position.collection.insertOne({...p,_id:new mongoose.Types.ObjectId(),positionId:'foreign',entryIntentId:'foreign-entry',accountId:'PAPER:foreign'});
+ await models.Position.collection.insertOne({...p,_id:new mongoose.Types.ObjectId(),positionId:'pending',entryIntentId:'pending-entry',lifecycle:'PENDING_ENTRY',legs:p.legs.map((l:any)=>({...l,entryFilledUnits:0}))});
+ await models.BrokerOrder.collection.insertOne({...f.brokerOrder('pending-order'),positionId:'pending',intentId:'pending-entry',knowledge:'UNKNOWN'});
+ const view=await readPaperDashboard(connection,session.sessionId,true,host.startupId);
+ assert.deepEqual(view.activePositions.map(p=>p.positionId),[p.positionId]);assert.equal(view.exits.activePositionCount,1);
+ assert.equal(view.exits.attentionCount,1);assert.equal(view.attentionWorkflows[0]?.positionId,'pending');
+});
+test('real active safety bound reports explicit incomplete attention and unknown counts',async()=>{
+ const {session}=await cycle('LONG_OPTION'),p=await models.Position.findOne().lean() as any;
+ await models.Position.collection.insertMany(Array.from({length:ACTIVE_POSITION_LIMIT},(_,i)=>({...p,_id:new mongoose.Types.ObjectId(),positionId:`active-${i}`,entryIntentId:`active-intent-${i}`})));
+ const view=await readPaperDashboard(connection,session.sessionId,true,host.startupId);
+ assert.equal(view.activeTruncated,true);assert.equal(view.exits.completeness,'TRUNCATED');assert.equal(view.exits.status,'ATTENTION');
+ assert.equal(view.exits.attentionCount,null);assert.equal(view.exits.activePositionCount,null);assert.equal(view.exits.closeInProgress,null);
+});
+
+test('real account auto-resolution selects exactly one eligible PAPER account and never guesses',async()=>{
+ assert.equal(resolvePersonalPaperAccount(await core.eligibleMonitoringAccounts()),f.scope.accountId);
+ await change({admissionStatus:'DISABLED'});assert.throws(()=>resolvePersonalPaperAccount([]),/PAPER_ACCOUNT_REQUIRED/);
+ assert.deepEqual(await core.eligibleMonitoringAccounts(),[]);await change({admissionStatus:'PAPER_READY'});
+ await tx(s=>new models.TradingAccount({...f.account('PAPER:second'),admissionStatus:'PAPER_READY',entryRiskPolicy:policy}).save({session:s}));
+ const accounts=await core.eligibleMonitoringAccounts();assert.equal(accounts.length,2);assert.throws(()=>resolvePersonalPaperAccount(accounts),/PAPER_ACCOUNT_AMBIGUOUS/);
+});

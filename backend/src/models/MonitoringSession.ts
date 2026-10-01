@@ -26,6 +26,8 @@ export const MonitoringSessionSchema = new Schema(
     cycleFence: { type: Number, default: 0 },
     lastCycleAt: Date, lastCycleOutcome: String, blockingReason: String,
     lastCycleId: String,
+    // Operational attempt receipt, never financial authorization or broker evidence.
+    entryPreparation: { type: Schema.Types.Mixed },
     startTime: { type: String, required: true },
     stopTime: { type: String, default: null },
     status: { type: String, enum: ["RUNNING", "STOPPED", "CRASHED"], required: true },

@@ -19,7 +19,22 @@ export interface Asset {
   expiryDay: number;
 }
 
-export type SessionStartResponse = MonitoringSession & {
+type OperationalValue<T> = { status: "VALID" | "UNAVAILABLE"; value: T | null; reason: string | null };
+export interface PaperOperationalDefaults {
+  version: string;
+  greeks: OperationalValue<{ riskFreeRate: number; version: string; source: string; expiryAssumptionVersion: string }>;
+  monthlyExpiry: OperationalValue<{ version: string; source: string; upcoming: string[]; coveredTo: string | null }>;
+  exitPolicy: OperationalValue<{ policyId?: string; takeProfitBps: number; stopLossBps: number; maxHoldingMs: number; eodMinuteIST: number }>;
+}
+export interface PaperEntryReadiness {
+  operationalDefaults?: PaperOperationalDefaults;
+  entryReady: boolean; entryStatus: "READY" | "WAITING"; entryBlockingReason: string | null;
+  lastReadinessAttemptAt?: string | null;
+  readinessAction?: "AUTOMATIC_RETRY" | "OPERATOR_ACTION" | null;
+  calendar?: { status: "OPEN" | "CLOSED_WEEKEND" | "CLOSED_HOLIDAY" | "SPECIAL_SESSION" | "UNAVAILABLE";
+    localDate: string; version: string; sourceReference: string; timeZone: string; coveredFrom: string; coveredTo: string };
+}
+export type SessionStartResponse = MonitoringSession & PaperEntryReadiness & {
   accountId: string; executionMode: "PAPER"; config: { configId: string };
 };
 
@@ -341,8 +356,8 @@ export function getActiveSession(accountId: string): Promise<MonitoringSession |
 }
 
 /** Exact polling never falls back to another running session. */
-export function getSession(sessionId: string): Promise<MonitoringSession> {
-  return request<MonitoringSession>(`/api/session/${encodeURIComponent(sessionId)}`);
+export function getSession(sessionId: string): Promise<MonitoringSession & PaperEntryReadiness> {
+  return request<MonitoringSession & PaperEntryReadiness>(`/api/session/${encodeURIComponent(sessionId)}`);
 }
 
 /**
@@ -498,7 +513,7 @@ export interface KiteConfig {
 
 export interface KiteStatus {
   tokenValid: boolean;
-  dataMode: "KITE_REAL" | "MOCK";
+  dataMode: "KITE_REAL";
   connectionStatus: "CONNECTED" | "DISCONNECTED" | "SESSION_REQUIRED";
   apiKey: string;
   tokenExpiry: string;
@@ -539,13 +554,10 @@ export function refreshKiteToken(requestToken: string): Promise<KiteRefreshResul
 export function beginKiteLogin(): Promise<{ loginUrl: string }> {
   return request("/api/kite/login", { method: "POST" });
 }
-export function setKiteDataMode(dataMode: "MOCK" | "KITE_REAL"): Promise<{ dataMode: "MOCK" | "KITE_REAL" }> {
-  return request("/api/kite/data-mode", { method: "POST", body: JSON.stringify({ dataMode }) });
-}
 
 export interface PaperSessionOption {
   configId: string; accountId: string; asset: string; executionMode: "PAPER";
-  dataMode: "KITE_REAL" | "MOCK"; strategyFamily: StrategyFamily; intervalMs: number;
+  dataMode: "KITE_REAL"; strategyFamily: StrategyFamily; intervalMs: number;
 }
 export function getPaperSessionOptions(): Promise<PaperSessionOption[]> { return request("/api/session/configurations"); }
 export function recoverPaperSession(configId: string): Promise<{status: string}> {
@@ -553,6 +565,7 @@ export function recoverPaperSession(configId: string): Promise<{status: string}>
 }
 
 export interface PaperDefaultSummary {
+  operationalDefaults?: PaperOperationalDefaults;
   asset: "NIFTY"; accountId: string; configId: string; executionMode: "PAPER";
   dataMode: "KITE_REAL"; strategyFamily: "LONG_OPTION"; intervalMs: number;
   entryWindowStartMinuteIST: number; entryCutoffMinuteIST: number; minConfidence: number;
@@ -578,12 +591,18 @@ export interface DurablePaperDecision {
   rationale: string | null; blockingReason: string | null;
 }
 export interface PaperDashboard {
+  observation?: {status:"AVAILABLE" | "UNAVAILABLE"; tradability:"NON_TRADABLE";
+    quote: null | {priceMinor:number; brokerTimestamp:string | null; fetchedAt:string; source:"KITE";
+      freshness:{state:"FRESH" | "STALE" | "UNAVAILABLE"}};
+    greeks:{status:"UNAVAILABLE"; reason:string}} | null;
   session: { sessionId: string; accountId: string; asset: string; status: "RUNNING" | "STOPPED" | "CRASHED";
     executionMode: "PAPER"; dataMode: "KITE_REAL"; strategyFamily: string; intervalMs: number;
     lastCycleAt: string | null; lastCycleOutcome: string | null; blockingReason: string | null;
     config: Pick<PaperDefaultSummary, "configId" | "minConfidence" | "entryWindowStartMinuteIST" | "entryCutoffMinuteIST" | "longOptionSelection"> };
-  positions: DurablePaperPosition[]; positionsTruncated: boolean; decisions: DurablePaperDecision[];
-  exits: { status: "ACTIVE" | "ATTENTION"; active: boolean; closeInProgress: number; attentionCount: number };
+  positions: DurablePaperPosition[]; positionsTruncated: boolean;
+  activePositions: DurablePaperPosition[]; historyPositions: DurablePaperPosition[]; activeTruncated: boolean;
+  attentionWorkflows: {positionId:string; lifecycle:string; reason:string}[]; decisions: DurablePaperDecision[];
+  exits: { status: "ACTIVE" | "ATTENTION"; active: boolean; closeInProgress: number | null; attentionCount: number | null; activePositionCount: number | null; completeness: "COMPLETE" | "TRUNCATED" };
   risk: null | { pendingRiskMinor: number | null; committedRiskMinor: number | null; capacityMinor: number | null;
     availableCapacityMinor: number | null; reservedSlots: number | null; committedSlots: number | null;
     maxPositionSlots: number | null; dailyTradingDay: string | null; dailyRealizedPnlMinor: number | null; killSwitchEnabled: boolean;

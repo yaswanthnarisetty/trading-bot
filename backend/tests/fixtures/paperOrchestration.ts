@@ -29,7 +29,8 @@ import { KiteIndexDataService, qualifyIndexMaster } from "../../src/services/Kit
 import { KiteMarketDataService } from "../../src/services/KiteMarketDataService";
 import { PaperMarketDataProvider } from "../../src/services/PaperMarketDataProvider";
 import type { KiteMarketSession } from "../../src/services/KiteSessionService";
-export async function realProvider(clock:()=>Date=()=>evaluationTime) {
+import { loadKiteOptionMaster } from "../../src/services/KiteMarketDataRuntime";
+export async function realProvider(clock:()=>Date=()=>evaluationTime, operationalDefaults = false) {
   let csv="";const data=await familyFixture(value=>{csv=value;return value;});
   const state={connected:true,mode:"KITE_REAL",ageMs:0,missing:false,exitPrices:{} as Record<string,{bidMinor:number;askMinor:number}>};
   const paths:string[]=[];
@@ -55,7 +56,8 @@ export async function realProvider(clock:()=>Date=()=>evaluationTime) {
     return{status:'success',data:values};
   }};
   const mode=()=>state.mode as 'KITE_REAL';
-  const options=new KiteMarketDataService(wire,()=>new KiteInstrumentMasterService({getInstrumentsCsv:async()=>csv},clock,
+  const options=new KiteMarketDataService(wire,()=>operationalDefaults
+    ? loadKiteOptionMaster({get:async()=>csv},clock,{}) : new KiteInstrumentMasterService({getInstrumentsCsv:async()=>csv},clock,
     [{underlying:'NIFTY',expiry:'2026-10-27',sourceReference:'OFFLINE_CALENDAR'}]).load(),mode,()=>+clock());
   const index=new KiteIndexDataService(wire,async()=>qualifyIndexMaster(csv,clock().toISOString()),mode,()=>+clock());
   const provider=new PaperMarketDataProvider(index,options,{status:()=>({tokenValid:state.connected}),getMode:()=>state.mode},clock);

@@ -20,6 +20,8 @@ import { WebSocketService } from "./services/WebSocketService";
 import { kiteSession } from "./services/KiteService";
 import { MonitoringSessionModel } from "./models/MonitoringSession";
 import { paperOrchestrator, paperExitMonitor, paperExitScheduler } from "./services/PaperOrchestrationRuntime";
+import { bootstrapNsePaperAccount } from "./db/nsePaperStartup";
+import mongoose from "mongoose";
 
 /**
  * Creates and configures the core Express application instance.
@@ -75,6 +77,7 @@ async function bootstrap(): Promise<void> {
 
   await connectWithRetry();
   await createIndexes();
+  await bootstrapNsePaperAccount(mongoose.connection);
 
   await paperOrchestrator.initialize();
   // Restart never resumes entry timers. Existing financial ledgers remain intact;

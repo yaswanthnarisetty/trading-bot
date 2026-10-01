@@ -32,6 +32,9 @@ export class PaperMarketDataProvider implements PaperMarketProvider {
     if(this.session.getMode()!==c.dataMode)throw new Error("DATA_MODE_REQUIRED");
     if(!this.session.status().tokenValid)throw new Error("KITE_SESSION_REQUIRED");
     await Promise.all([this.options.refreshMaster(),this.index.refreshMaster()]);
+    await this.checkReadiness(c);
+  }
+  async checkReadiness(c:Readonly<PaperSessionConfig>) {
     this.assertCurrent(c);
     // Startup must prove current qualified index data, not merely a token map.
     const q=await this.index.getQuote(this.index.activeMaster().resolve(c.asset),c.maxAgeMs);

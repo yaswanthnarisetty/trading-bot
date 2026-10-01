@@ -3,6 +3,8 @@ import { z } from "zod";
 import { identifierSchema } from "@trading-bot/shared";
 import { freeze } from "./kiteMarketData";
 import { validStrategyQualityConfig, type StrategyQualityConfig } from "./strategyEvaluation";
+import { NSE_FO_CALENDAR_2026 } from "../config/nseTradingCalendar";
+import { classifyNseDate, nseCalendarBlock } from "./nseTradingCalendar";
 
 export const paperSessionConfigSchema = z.object({
   configId: identifierSchema, accountId: z.string().regex(/^PAPER:[^\s]+$/).max(200),
@@ -39,7 +41,11 @@ export function entryCutoffAt(c: PaperSessionConfig, at: Date): Date {
 export function entryCalendarBlock(c: PaperSessionConfig, at: Date): string | null {
   const ist = new Date(at.getTime() + 19800000), day = ist.toISOString().slice(0,10);
   const minute = ist.getUTCHours()*60 + ist.getUTCMinutes();
-  if ([0,6].includes(ist.getUTCDay()) || !c.calendar.openDates.includes(day)) return "MARKET_CALENDAR_CLOSED";
+  if (c.calendar.version === NSE_FO_CALENDAR_2026.version) {
+    const blocked = nseCalendarBlock(classifyNseDate(day));
+    if (blocked) return blocked;
+  } else if ([0,6].includes(ist.getUTCDay())) return "MARKET_CALENDAR_CLOSED";
+  if (!c.calendar.openDates.includes(day)) return "MARKET_CALENDAR_CLOSED";
   if (minute < 555 || minute >= c.entryCutoffMinuteIST) return "ENTRY_WINDOW_CLOSED";
   // The approved Phase 5 evaluator alone implements the configured opening block.
   return null;

@@ -24,59 +24,173 @@ PAPER decision rows are excluded from the old signal renderer.
 
 ## Explicit operator setup
 
-1. Use the existing transaction-capable Mongo deployment and provision/verify
-   all approved execution indexes through `execution:indexes` (see
-   `EXECUTION_FOUNDATION.md`). Application startup creates only the new
-   nonfinancial history/session indexes; it does not silently provision the
-   financial ledger or reset account state.
-2. Select an existing, explicitly provisioned `PAPER:*` TradingAccount with
-   broker PAPER, admissionStatus PAPER_READY, the approved entryRiskPolicy,
-   policyVersion, trading-day settings and durable risk controls. This slice
-   neither manufactures capital nor creates an account from browser input.
-3. Opt that account into the approved PAPER_KITE_SHADOW_V1 reference-only
-   reconciliation configuration. Automatic orchestration deliberately requires
-   the current-host recovery barrier; the older isolated-service opt-out is not
-   accepted as automatic session readiness.
-4. Set `NSE_PAPER_CONFIG_FILE` to a server-owned JSON array of configurations.
-   Do not put credentials in that file. Each object must contain:
-   - `configId`, `accountId`, `executionMode: "PAPER"`, `asset` (NIFTY,
-     BANKNIFTY or FINNIFTY), `dataMode: "KITE_REAL"`.
-   - `strategyConfig`: the existing validated StrategyQualityConfig with an
-     explicit LONG_OPTION, DEBIT_VERTICAL or CREDIT_VERTICAL family. No AUTO.
-   - `intervalMs`: 300000–3600000 (default 300000).
-   - `entryCutoffMinuteIST`: 570–915 (default 900, i.e. 15:00 IST).
-   - `calendar: { version, sourceReference, openDates }`: operator-maintained,
-     authoritative NSE open-date allow-list, at most 400 dates. Omitted dates
-     and weekends are closed. No guessed holiday calendar is supplied.
-   - `maxAgeMs`: 1000–60000 (default 30000).
-   - `riskFreeRate`, `riskFreeRateVersion`: explicit existing Greeks assumptions.
-5. Configure the existing Kite monthly-expiry metadata and Phase 5 LLM settings.
-   Complete Kite authentication and choose KITE_REAL separately in Settings.
-6. For the Phase 6C1 Dashboard default, provision exactly one NIFTY / LONG_OPTION /
-   PAPER / KITE_REAL configuration with five-minute cadence, 09:30 IST opening
-   block, 15:00 IST cutoff, the approved 65% confidence and 0.55–0.70 delta
-   selection. The server validates the whole file using `capturePaperConfig`.
-   The account mapping, authoritative market open-date allow-list and versioned
-   risk-free-rate assumption must be explicitly supplied by the operator; the
-   Dashboard never guesses them. Provision a matching validated LONG_OPTION
-   `NSE_PAPER_EXIT_CONFIG_FILE` policy and the existing account risk policy too.
-   Missing or ambiguous prerequisites block Start with a reason code.
-7. Authenticate Kite and select KITE_REAL in Settings, then click Dashboard
-   **Start**. The backend performs approved read-only broker recovery and
-   reconciliation preparation before creating a new PAPER session. A genuine
-   MATCHED proof is required; mismatch or incomplete evidence fails closed.
-   Start never launches the backend process, which must already be running.
+1. Use a transaction-capable Mongo deployment. Application startup ensures and
+   verifies the approved `ALL` execution indexes (BASE plus RECONCILIATION)
+   before touching the PAPER account. It uses the existing index definitions,
+   never drops or replaces healthy indexes, and fails closed on conflicts or
+   insufficient index permissions. `execution:indexes` remains available for
+   explicit preflight/administration (see `EXECUTION_FOUNDATION.md`).
+2. At startup, after BASE and RECONCILIATION execution-index verification,
+   the backend ensures one canonical `PAPER:NSE` TradingAccount. Set `PAPER_CAPITAL`
+   to a positive decimal rupee amount with at most two fractional digits, for
+   example `200000` for ₹2,00,000. The bootstrap stores this as immutable integer
+   `initialCapitalMinor` (20,000,000 paise). A missing/invalid capital or mismatch
+   with an existing account fails startup. It never updates an existing account.
+   Existing canonical accounts without this capital reference are reused
+   unchanged; bootstrap does not backfill or reset them. Their capital reference
+   remains unasserted until separately provisioned through an approved migration.
+3. First creation without `NSE_PAPER_ACCOUNT_CONFIG_FILE` uses the operator-approved
+   backend-owned `NSE_PAPER_POLICY_V1`: 20,000,000 paise capital,
+   `policyVersion: 1`, per-entry risk 800,000 paise, aggregate reserved-risk
+   capacity 2,400,000 paise, three position slots, daily loss 400,000 paise,
+   and `LOCAL_DATE_V1` in `Asia/Kolkata`. `PAPER_CAPITAL` must parse exactly to
+   20,000,000 paise; other amounts fail closed. The internal `brokerAccountRef`
+   is `PAPER:NSE`. No Kite login is needed to create the account. Reference-only
+   reconciliation is bound once to the verified backend Kite profile during
+   recovery; absent authentication leaves ENTRY waiting.
 
-An unconfigured deployment returns an empty configuration list and cannot start.
-The production provider does not implement MOCK; tests/development can explicitly
-inject a MOCK provider into the independently constructed orchestrator. It is never
-a fallback for KITE_REAL. No broker tokens or static option symbols are supplied
-by session configuration.
+   An optional strict `NSE_PAPER_ACCOUNT_CONFIG_FILE` may still supply an explicit
+   full policy and broker reference for advanced provisioning. It is an absolute
+   path to a server-owned JSON object with exactly these fields:
+
+   ```json
+   {
+     "brokerAccountId": "<verified Kite user ID>",
+     "entryRiskPolicy": {
+       "policyVersion": 1,
+       "maxRiskPerEntryMinor": "<approved positive integer paise>",
+       "maxReservedRiskMinor": "<approved positive integer paise>",
+       "maxPositionSlots": "<approved positive integer>",
+       "maxDailyLossMinor": "<approved positive integer paise>"
+     },
+     "riskTradingCalendar": { "kind": "LOCAL_DATE_V1", "timeZone": "<approved IANA timezone>" }
+   }
+   ```
+
+   The placeholders above must be replaced with JSON numbers/strings of the
+   documented types. No durable risk ceiling, Kite account ID or calendar is
+   inferred from legacy/backtest defaults. The policy's aggregate and daily
+   ceilings may not exceed configured capital; per-entry may not exceed aggregate.
+   An invalid supplied file prevents creation; there is no partial merge with
+   built-in policy. The new account is PAPER_READY for monitoring but has no
+   READY recovery or MATCHED reconciliation state. The optional file supplies
+   an explicit reference-only Kite identity; without it, only a profile-verified
+   authenticated backend session can bind that identity later. Approved recovery
+   and reconciliation still gate financial entry. Bootstrap performs no broker
+   request and creates no order or fill.
+4. Normal NIFTY monitoring needs no `NSE_PAPER_CONFIG_FILE`. The backend resolves
+   only `PAPER:NSE`, never an arbitrary eligible account. Zero matches returns
+   PAPER_ACCOUNT_REQUIRED; duplicates return PAPER_ACCOUNT_AMBIGUOUS. Account
+   policy, kill and recovery states still gate ENTRY. The browser sends only
+   `{ "asset": "NIFTY" }`. Start/Stop never creates or resets the account.
+5. The built-in validated profile is NIFTY / LONG_OPTION / PAPER / KITE_REAL,
+   five-minute cadence, 09:30–15:00 IST entries, 65% confidence and the approved
+   0.55–0.70 delta band. Other quality defaults match the approved Phase 5/6
+   defaults. Capital and account risk policy remain separate from the operational profile.
+   An optional `NSE_PAPER_CONFIG_FILE` remains a strict server-owned JSON array
+   of complete PaperSessionConfig objects; the Dashboard NIFTY default must
+   still map `PAPER:NSE`.
+   Invalid/ambiguous overrides fail closed rather than falling back silently.
+6. Covered market dates use the server-owned NSE F&O calendar below. No daily
+   `openDates` file is required. The canonical NIFTY/LONG_OPTION profile now resolves
+   backend version `NIFTY_PAPER_OPERATIONS_20261001_V1`: a fixed 6.5% annual,
+   continuously compounded BSM rate (`NIFTY_FIXED_BSM_RATE_6_5_PERCENT_2026_V1`),
+   ACT/365, zero dividend yield and expiry at 15:30 IST (`NSE_CLOSE_1530_V1`).
+   This is a model policy assumption, not a live RBI/bond quote. The defaults are
+   bounded to 2026 and must be reviewed/versioned with calendar updates.
+   `NSE_PAPER_ENTRY_METADATA_FILE` remains an optional strict server-owned override
+   containing a complete `riskFreeRate`/`riskFreeRateVersion` pair. Explicit files
+   are re-read before evaluation; malformed/partial/unreadable files fail closed.
+   A calendar override must exactly match the server authority. No risk/account,
+   recovery or reconciliation state is inferred from these configuration defaults.
+7. Monthly metadata defaults to independent [NSE/FAOP/68747](https://nsearchives.nseindia.com/content/circulars/FAOP68747.pdf)
+   and [NIFTY contract specifications](https://www.nseindia.com/static/products-services/equity-derivatives-nifty50):
+   last Tuesday, moved back over verified exchange holidays/weekends. Q4 2026 dates
+   are October 27, November 23 and December 29. Qualification remains against the
+   actual current Kite CSV. The default universe is NIFTY contracts within 2026;
+   later contracts and other assets cannot become qualified using this evidence.
+   Optional `KITE_MONTHLY_EXPIRIES_FILE` is a full explicit override; invalid files
+   or missing per-contract evidence block qualification, never trigger fallback.
+   The default `NIFTY_LONG_OPTION_EXITS_V1` applies only to PAPER:NSE/NIFTY/LONG_OPTION:
+   50% actual premium profit/loss thresholds, one-hour maximum holding, 15:20 IST
+   EOD attempt, 30-second quote age and 15-minute close authorization. These are the
+   documented durable-exit terms, not legacy settings. `NSE_PAPER_EXIT_CONFIG_FILE`
+   remains an optional full override, with no silent merge on empty/invalid files.
+   Previously captured position policies remain immutable; CLOSE and retained fills
+   keep their existing rules independently of entry readiness.
+   Default/session status exposes validated assumptions, expiry provenance, upcoming
+   dates, policy IDs and specific configuration errors. VALID configuration does not
+   itself mean entry READY. No daily manual metadata files are required for NIFTY.
+8. With the backend running, authenticate Kite and click
+   Dashboard Start. A durable monitoring session becomes RUNNING even when
+   market/entry prerequisites are unavailable. `entryReady`, `entryStatus` and
+   `entryBlockingReason` are separate from session lifecycle. Start and each
+   scheduler wakeup attempt approved preparation when applicable; only genuine
+   audited recovery and MATCHED reconciliation proof can enable entry.
+   Repeated Start retains the exact session and idempotent timer. Temporary
+   readiness failures never stop/replace it. Persistence/config/mode/account
+   identity failures remain fatal Start errors. Exits remain independent.
+
+GET/status does not recover or reconcile an account and never mutates financial
+records. It checks current readiness through the approved read-only market and
+ledger paths. Closed-market observations retain the broker timestamp and exact
+freshness, carry NON_TRADABLE presentation status, and supply no entry authority.
+The dashboard does not compute stale Greeks using invented or incomplete inputs;
+those remain UNAVAILABLE. Phase 5 strategy freshness is unchanged.
+
+Active/nonterminal positions, held risk and UNKNOWN/unresolved exit workflows
+are queried separately from terminal history. History is bounded at 200. The
+active safety bound is 1000; overflow explicitly reports TRUNCATED/ATTENTION and
+unknown counts instead of presenting zero exposure. No legacy records are joined.
 
 Recovery retains the approved core's limitations. In particular a prior host left
 RECOVERY_REQUIRED cannot be forcibly replaced by this route, and unlinked shadow
 exposure cannot be fabricated into a matching Kite position. Such accounts remain
 blocked for approved operational reconciliation. The route does not reset proofs.
+
+## Automatic calendar and entry preparation
+
+`NSE_FO_TRADING_CALENDAR_V1` / `NSE_FO_2026_20260930_V1` covers only
+2026-01-01 through 2026-12-31 in Asia/Kolkata. Sources verified on 2026-09-30:
+
+- [NSE/FAOP/71777 annual F&O trading holidays](https://nsearchives.nseindia.com/content/circulars/FAOP71777.pdf)
+- [NSE/FAOP/72262 January 15 election holiday](https://nsearchives.nseindia.com/content/circulars/FAOP72262.pdf)
+- [NSE/FAOP/72352 February 1 Budget session](https://nsearchives.nseindia.com/content/circulars/FAOP72352.pdf)
+
+Ordinary covered weekdays excluding these official closures are OPEN. Weekends
+are CLOSED_WEEKEND except explicit special sessions. February 1 uses the official
+regular session hours. November 8 Muhurat is SPECIAL_SESSION but blocks entry:
+its trading times are not qualified by these sources. Outside coverage returns
+UNAVAILABLE / CALENDAR_NOT_READY. Later exchange amendments or a new year require
+an explicitly verified calendar version update, not extrapolation. The legacy
+2026 holiday helper shares this closure dataset; it is not entry authority.
+
+Start persists the monitoring session independently of market date. A closed
+market can remain RUNNING with the independent exit monitor active, while ENTRY
+waits. On an eligible open date/window, Start and the existing five-minute
+scheduler invoke `PaperEntryPreparationService` for that exact current-host
+session. Concurrent callers share one preparation; completed attempts, including
+failures, are throttled to the normal cadence. No extra retry timer is created.
+
+Preparation verifies the authenticated backend Kite profile, binds the canonical
+account's reference identity once if absent, invokes the existing durable recovery
+generation workflow, reads the four approved broker evidence endpoints, and calls
+the existing REFERENCE_ONLY reconciliation service. Only actual MATCHED evidence
+may be passed to approved recovery completion. The core validates host/generation,
+watermarks, ledger fingerprint and audit proof. A receipt on MonitoringSession
+records the last attempt for presentation/throttling; it cannot authorize entry.
+Every readiness result still checks current core recovery/reconciliation, policy,
+kill/daily-loss, explicit Greeks/exit config, monthly qualification and market data.
+
+DISCREPANCY and INCOMPLETE keep the same session WAITING without financial repair.
+Kite disconnect/reconnect is retried on normal cadence in that same session.
+Unrelated manual Kite activity and PAPER fills without explicit broker links keep
+the approved reference-only ownership semantics. GET reads do not prepare or
+write proofs. The dashboard exposes calendar provenance, last attempt and whether
+operator action is required. Normal operation needs no recovery button. Restart
+still invalidates process-local timers and requires the existing explicit Start
+lifecycle; old-host proof never authorizes a new host. CLOSE and confirmed
+post-dispatch fill processing are unaffected by ENTRY waiting.
 
 ## One captured evaluation
 

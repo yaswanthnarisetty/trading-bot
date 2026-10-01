@@ -18,10 +18,14 @@ export class KiteSessionService implements KiteMarketSession {
     private readonly config: () => { apiKey: string; apiSecret: string; expectedAccountId?: string },
     private readonly clock: () => number = Date.now,
     private readonly sleep: (ms: number) => Promise<void> = ms => new Promise(resolve => setTimeout(resolve, ms)),
-    mode: MarketDataMode = "MOCK") { this.mode = mode; }
+    mode: MarketDataMode = "KITE_REAL", private readonly allowMockFixtures = false) {
+    if (mode === "MOCK" && !allowMockFixtures) fail("DATA_MODE_REQUIRED");
+    this.mode = mode;
+  }
   getMode(): MarketDataMode { return this.mode; }
   setMode(mode: unknown): void {
     if (mode !== "MOCK" && mode !== "KITE_REAL") fail("INVALID_REQUEST");
+    if (mode === "MOCK" && !this.allowMockFixtures) fail("DATA_MODE_REQUIRED");
     this.mode = mode as MarketDataMode;
   }
   private current() {

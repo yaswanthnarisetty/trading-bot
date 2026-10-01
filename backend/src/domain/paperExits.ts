@@ -4,6 +4,8 @@ import { fillAccounting } from "./fillAccounting";
 import { freeze } from "./kiteMarketData";
 const integer=z.number().int().min(1).max(Number.MAX_SAFE_INTEGER);
 export const paperExitConfigSchema=z.object({
+ policyId:z.string().regex(/^[A-Z0-9_]{1,100}$/).optional(),
+ underlying:z.enum(['NIFTY','BANKNIFTY','FINNIFTY']).optional(),
  version:z.literal('PAPER_EXIT_V1'),accountId:z.string().regex(/^PAPER:[^\s]+$/),executionMode:z.literal('PAPER'),
  family:z.enum(['LONG_OPTION','DEBIT_VERTICAL','CREDIT_VERTICAL']),dataMode:z.literal('KITE_REAL'),
  takeProfitBps:integer.max(100000),stopLossBps:integer.max(100000),maxHoldingMs:integer.max(86400000),

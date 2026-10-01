@@ -1,4 +1,5 @@
 import { RecoveryBarrierService } from "../../src/services/RecoveryBarrierService";
+import { NIFTY_OPERATIONAL_DEFAULTS } from "../../src/config/niftyOperationalDefaults";
 import { ReconciliationService } from "../../src/services/ReconciliationService";
 import { before,after,beforeEach,test } from "node:test";
 import assert from "node:assert/strict";
@@ -211,4 +212,22 @@ for(const family of ['LONG_OPTION','DEBIT_VERTICAL','CREDIT_VERTICAL'] as const)
  assert.equal((await x.monitor.evaluateOpenPosition(x.positionId)).status,'SETTLED');await settled(x.positionId);
  assert.deepEqual(calls,family==='LONG_OPTION'?['BUY','SELL']:['BUY','SELL','BUY','SELL']);
  const state=await x.monitor.store.states.findOne({positionId:x.positionId});assert.equal(state!.triggerReason,'STOP_LOSS');
+});
+
+test('NIFTY default policy captures once and survives later missing configuration',async()=>{
+ const x=await open();
+ x.exitDeps.configs=async()=>[{...NIFTY_OPERATIONAL_DEFAULTS.exitPolicy,accountId:f.scope.accountId}];
+ assert.equal((await x.monitor.evaluateOpenPosition(x.positionId)).status,'MONITORING');
+ const captured=await x.monitor.store.states.findOne({positionId:x.positionId});
+ assert.equal(captured!.config.policyId,'NIFTY_LONG_OPTION_EXITS_V1');
+ x.exitDeps.configs=async()=>{throw new Error('EXIT_CONFIG_REQUIRED');};x.prices('TP');
+ assert.equal((await x.monitor.evaluateOpenPosition(x.positionId)).status,'SETTLED');await settled(x.positionId);
+ assert.deepEqual((await x.monitor.store.states.findOne({positionId:x.positionId}))!.config,captured!.config);
+});
+test('asset-scoped policy cannot attach to a different underlying',async()=>{
+ const x=await open(),before=calls.length;
+ x.exitDeps.configs=async()=>[{...NIFTY_OPERATIONAL_DEFAULTS.exitPolicy,accountId:f.scope.accountId,underlying:'BANKNIFTY'}];
+ const result=await x.monitor.evaluateOpenPosition(x.positionId);
+ assert.equal(result.status,'ATTENTION');assert.equal(result.reason,'EXIT_CONFIG_REQUIRED');assert.equal(calls.length,before);
+ assert.equal((await models.Position.findOne({positionId:x.positionId}).orFail()).get('lifecycle'),'OPEN');
 });

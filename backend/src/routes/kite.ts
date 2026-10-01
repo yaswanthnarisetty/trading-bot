@@ -33,7 +33,11 @@ export function createKiteRouter(session: KiteSessionService, market: KiteMarket
   }));
   router.post("/login", action((_req, res) => { res.json({ loginUrl: session.beginLogin() }); }));
   router.post("/refresh", action(async (req, res) => { await session.exchange(req.body?.requestToken); res.json({ success: true, message: "Kite session connected" }); }));
-  router.post("/data-mode", action((req, res) => { session.setMode(req.body?.dataMode); res.json({ dataMode: session.getMode() }); }));
+  // Compatibility for older clients: HTTP can never enable an internal fixture mode.
+  router.post("/data-mode", action((req, res) => {
+    if (req.body?.dataMode !== "KITE_REAL") return fail("DATA_MODE_REQUIRED");
+    session.setMode("KITE_REAL"); res.json({ dataMode: session.getMode() });
+  }));
   router.post("/master/refresh", action(async (_req, res) => {
     const master = await market.refreshMaster(); res.json({ provenance: master.provenance, instrumentCount: master.instruments.length });
   }));

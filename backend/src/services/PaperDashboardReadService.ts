@@ -1,10 +1,11 @@
 import type { Connection } from "mongoose";
 import { executionModels } from "../db/executionModels";
 import { classifiedEntryPlanSchema, entryRiskPolicySchema } from "../domain/entryRisk";
-import { capturePaperConfig } from "../domain/paperOrchestration";
+import { captureMonitoringConfig } from "../domain/paperMonitoring";
 import { DEFAULT_LONG_SELECTION } from "../domain/strategyEvaluation";
 import { paperHistoryModels } from "./PaperEntryOrchestrator";
 
+export const ACTIVE_POSITION_LIMIT = 1000;
 type Row = Record<string, any>;
 const text = (value: unknown) => typeof value === "string" ? value : null;
 const integer = (value: unknown) => Number.isSafeInteger(value) ? value as number : null;
@@ -29,7 +30,7 @@ export function projectDurablePaperPosition(position: Row, entryPlan: unknown, f
   const openedAt = entryFills.map(f => +new Date(f.executedAt)).filter(Number.isFinite).sort((a, b) => a - b)[0];
   const closeFills = fills.filter(f => f.positionId === position.positionId && f.accountId === position.accountId
     && f.executionMode === "PAPER" && f.broker === "PAPER" && f.intentId !== position.entryIntentId);
-  const unknown = orders.some(o => o.knowledge === "UNKNOWN");
+  const unknown = orders.some(o => o.knowledge === "UNKNOWN" || o.cancellation === "UNKNOWN");
   const stranded = plan.success && plan.data.family !== "LONG_OPTION"
     && legs.some(l => l.entrySide === "BUY" && l.openUnits > 0)
     && !legs.some(l => l.entrySide === "SELL" && l.filledUnits > 0);
@@ -76,15 +77,38 @@ export async function readPaperDashboard(connection: Connection, sessionId: stri
   const session = await history.Session.findOne({ sessionId, executionMode: "PAPER" }).lean() as Row | null;
   if (!session || !session.accountId) throw new Error("SESSION_NOT_FOUND");
   const accountId = session.accountId as string, scope = { accountId, executionMode: "PAPER" };
-  const config = capturePaperConfig(session.config);
-  const [account, positions, cycles, exits] = await Promise.all([
+  const config = captureMonitoringConfig(session.config);
+  const [account, partition, cycles] = await Promise.all([
     models.TradingAccount.findOne(scope).lean() as Promise<Row | null>,
-    models.Position.find(scope).sort({ createdAt: -1 }).limit(201).lean() as Promise<Row[]>,
+    models.Position.aggregate([
+      { $match: scope },
+      { $lookup: { from: "execution_orders", localField: "positionId", foreignField: "positionId",
+        pipeline: [{ $match: { ...scope, $or: [{knowledge: "UNKNOWN"}, {cancellation: "UNKNOWN"}] } }, { $project: { _id: 1 } }], as: "unknownOrders" } },
+      { $lookup: { from: "paper_exit_states", localField: "positionId", foreignField: "positionId",
+        pipeline: [{ $match: scope }, { $project: { config: 0, leaseId: 0 } }], as: "exitStates" } },
+      { $lookup: { from: "execution_reservations", localField: "entryIntentId", foreignField: "intentId",
+        pipeline: [{ $match: { ...scope, kind: "ENTRY_RISK", state: { $ne: "RELEASED" } } },
+          { $project: { _id: 1 } }], as: "heldRisk" } },
+      { $set: { operationalActive: { $or: [
+        { $not: [{ $in: ["$lifecycle", ["CLOSED", "ABORTED"]] }] },
+        { $ne: ["$integrity", "CONSISTENT"] }, { $gt: [{ $size: "$unknownOrders" }, 0] },
+        { $gt: [{ $size: "$heldRisk" }, 0] },
+        { $anyElementTrue: [{ $map: { input: "$exitStates", as: "exit", in: { $ne: ["$$exit.status", "SETTLED"] } } }] },
+        { $anyElementTrue: [{ $map: { input: "$legs", as: "leg", in: { $ne: ["$$leg.entryFilledUnits", "$$leg.exitFilledUnits"] } } }] },
+        { $and: [{ $eq: ["$lifecycle", "CLOSED"] }, { $eq: [{ $size: { $ifNull: ["$closureEvidenceRefs", []] } }, 0] }] },
+      ] } } },
+      { $facet: {
+        active: [{ $match: { operationalActive: true } }, { $sort: { createdAt: 1, positionId: 1 } }, { $limit: ACTIVE_POSITION_LIMIT + 1 }],
+        history: [{ $match: { operationalActive: false } }, { $sort: { createdAt: -1, positionId: 1 } }, { $limit: 201 }],
+      } },
+    ]) as Promise<Row[]>,
     history.Cycle.find({ ...scope, sessionId }).sort({ timestamp: -1 }).limit(30).lean() as Promise<Row[]>,
-    connection.db!.collection("paper_exit_states").find(scope, { projection: { leaseId: 0, config: 0 } }).limit(200).toArray() as Promise<Row[]>,
   ]);
-  const positionsTruncated = positions.length > 200;
-  const visiblePositions = positions.slice(0, 200);
+  const activeRows: Row[] = partition[0]?.active ?? [], historyRows: Row[] = partition[0]?.history ?? [];
+  const activeTruncated = activeRows.length > ACTIVE_POSITION_LIMIT;
+  const positionsTruncated = historyRows.length > 200;
+  const visibleActive = activeRows.slice(0, ACTIVE_POSITION_LIMIT);
+  const visiblePositions = [...visibleActive, ...historyRows.slice(0, 200)];
   const ids = visiblePositions.map(p => p.positionId), intentIds = visiblePositions.map(p => p.entryIntentId);
   const [fills, intents, orders] = ids.length ? await Promise.all([
     models.Fill.find({ ...scope, positionId: { $in: ids } }).lean() as Promise<Row[]>,
@@ -92,9 +116,16 @@ export async function readPaperDashboard(connection: Connection, sessionId: stri
     models.BrokerOrder.find({ ...scope, positionId: { $in: ids } }).lean() as Promise<Row[]>,
   ]) : [[], [], []] as Row[][];
   const byIntent = new Map(intents.map(i => [i.intentId, i]));
-  const byExit = new Map(exits.map(e => [e.positionId, e]));
-  const durablePositions = visiblePositions.map(p => projectDurablePaperPosition(p, byIntent.get(p.entryIntentId)?.entryPlan,
-    fills, byExit.get(p.positionId) ?? null, orders.filter(o => o.positionId === p.positionId))).filter(p => p !== null);
+  const project = (p: Row) => projectDurablePaperPosition(p, byIntent.get(p.entryIntentId)?.entryPlan,
+    fills, p.exitStates[0] ?? null, orders.filter(o => o.positionId === p.positionId));
+  const activePositions = visibleActive.map(project).filter(p => p !== null);
+  const historyPositions = historyRows.slice(0, 200).map(project).filter(p => p !== null);
+  const projectedIds = new Set(activePositions.map(p => p.positionId));
+  const attentionWorkflows = visibleActive.filter(p => p.unknownOrders.length || p.integrity !== "CONSISTENT"
+    || ["CLOSED","ABORTED"].includes(p.lifecycle) || ["ATTENTION","BLOCKED"].includes(p.exitStates[0]?.status)
+    || !projectedIds.has(p.positionId) && p.legs.some((l:Row) => l.entryFilledUnits > 0));
+  const attentionIds = new Set([...attentionWorkflows.map(p => p.positionId), ...activePositions.filter(p => p.attention).map(p => p.positionId)]);
+  const durablePositions = [...activePositions, ...historyPositions];
   const policy = entryRiskPolicySchema.safeParse(account?.entryRiskPolicy);
   const pending = integer(account?.reservedExposureMinor), committed = integer(account?.committedExposureMinor);
   const cap = policy.success ? policy.data.maxReservedRiskMinor : null;
@@ -109,11 +140,15 @@ export async function readPaperDashboard(connection: Connection, sessionId: stri
         entryWindowStartMinuteIST: 555 + config.strategyConfig.openingBlockMinutes,
         entryCutoffMinuteIST: config.entryCutoffMinuteIST,
         longOptionSelection: config.strategyConfig.longOptionSelection ?? DEFAULT_LONG_SELECTION } },
-    positions: durablePositions, positionsTruncated,
+    positions: durablePositions, positionsTruncated, activePositions, historyPositions, activeTruncated,
+    attentionWorkflows: attentionWorkflows.map(p => ({positionId:p.positionId,lifecycle:p.lifecycle,
+      reason:p.unknownOrders.length ? "UNKNOWN_ORDER_REQUIRES_ATTENTION" : p.exitStates[0]?.reason ?? "UNSETTLED_POSITION"})),
     decisions: cycles.map(projectPaperDecision),
-    exits: { status: exitMonitorActive && !durablePositions.some(p => p.attention) ? "ACTIVE" : "ATTENTION",
-      active: exitMonitorActive, closeInProgress: durablePositions.filter(p => p.closeState === "CLOSING").length,
-      attentionCount: durablePositions.filter(p => p.attention).length },
+    exits: { status: exitMonitorActive && !activeTruncated && !attentionIds.size ? "ACTIVE" : "ATTENTION",
+      active: exitMonitorActive, closeInProgress: activeTruncated ? null : activePositions.filter(p => p.closeState === "CLOSING").length,
+      attentionCount: activeTruncated ? null : attentionIds.size,
+      activePositionCount: activeTruncated ? null : activePositions.length,
+      completeness: activeTruncated ? "TRUNCATED" : "COMPLETE" },
     risk: account ? { pendingRiskMinor: pending, committedRiskMinor: committed, capacityMinor: cap,
       availableCapacityMinor: available !== null && available >= 0n && available <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(available) : null,
       reservedSlots: totalSlots !== null && committedSlots !== null ? totalSlots - committedSlots : null,

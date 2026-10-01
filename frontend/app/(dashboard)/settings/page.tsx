@@ -5,7 +5,6 @@ import {
   getKiteStatus,
   refreshKiteToken,
   beginKiteLogin,
-  setKiteDataMode,
   type KiteStatus,
 } from "../../../lib/api";
 
@@ -50,10 +49,6 @@ export default function SettingsPage(): JSX.Element {
   async function handleLogin(): Promise<void> {
     try { const { loginUrl } = await beginKiteLogin(); window.location.assign(loginUrl); }
     catch { setRefreshResult({ ok: false, text: "Unable to start Kite login." }); }
-  }
-  async function handleMode(dataMode: "MOCK" | "KITE_REAL"): Promise<void> {
-    try { await setKiteDataMode(dataMode); await loadStatus(); }
-    catch { setStatusError("Unable to change market-data mode."); }
   }
 
   async function handleRefresh(): Promise<void> {
@@ -151,11 +146,10 @@ export default function SettingsPage(): JSX.Element {
               <Row label="API key" value={status.apiKey} />
               <Row label="Token expiry" value={status.tokenExpiry} />
               <Row label="Status" value={status.message} />
-              <label>Market data: <select aria-label="Market data mode" value={status.dataMode}
-                onChange={e => void handleMode(e.target.value as "MOCK" | "KITE_REAL")}
-                className="rounded bg-neutral-900 px-2 py-1">
-                <option value="MOCK">MOCK</option><option value="KITE_REAL">KITE_REAL</option>
-              </select></label>
+              <p className="mt-1 max-w-sm text-xs text-neutral-400">
+                NSE prices come from Kite. Connect your Kite session to receive market data.
+                Orders continue to use PAPER execution.
+              </p>
             </div>
           </div>
         )}
@@ -217,7 +211,7 @@ export default function SettingsPage(): JSX.Element {
           </div>
         </div>
 
-        <p className="mb-4 text-xs text-neutral-400">After authentication, return to Settings automatically. Connecting does not change the selected data mode.</p>
+        <p className="mb-4 text-xs text-neutral-400">After authentication, return to Settings automatically. NSE market data uses Kite; execution remains PAPER.</p>
         <details className="text-sm"><summary>Development fallback: manual request token</summary>
         {/* Step 3 + Refresh button */}
         <div className="mb-2">

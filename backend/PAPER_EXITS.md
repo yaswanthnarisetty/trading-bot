@@ -10,7 +10,12 @@ rotating scan prevents a slow position starving every other position.
 
 ## Configuration
 
-Set `NSE_PAPER_EXIT_CONFIG_FILE` to a server-owned JSON array, for example:
+The canonical PAPER:NSE / NIFTY / LONG_OPTION profile uses backend-owned
+`NIFTY_LONG_OPTION_EXITS_V1` with the thresholds below. Its optional `underlying`
+constraint prevents applying it to another asset. Existing captured policies are
+never replaced. Other accounts/families require explicit policies.
+
+An optional `NSE_PAPER_EXIT_CONFIG_FILE` fully replaces defaults with a server-owned JSON array, for example:
 
 ```json
 [{
@@ -31,8 +36,9 @@ Set `NSE_PAPER_EXIT_CONFIG_FILE` to a server-owned JSON array, for example:
 
 Provide one entry per account/family (LONG_OPTION, DEBIT_VERTICAL,
 CREDIT_VERTICAL). This example means 50% actual premium TP/SL, one-hour holding,
-and 15:20 IST EOD. Operators must choose thresholds explicitly; these are not
-inherited from legacy settings. The policy is captured once when a position is
+and 15:20 IST EOD. These are also the versioned NIFTY default terms; they are not
+inherited from legacy settings. Empty, invalid or unrelated override files cannot
+silently activate the built-in policy. The policy is captured once when a position is
 first monitored and cannot be silently replaced by later entry sessions or file
 edits. Missing/invalid configuration blocks new planning/dispatch, but retained
 fills and terminal settlement remain processable. Config can be attached later

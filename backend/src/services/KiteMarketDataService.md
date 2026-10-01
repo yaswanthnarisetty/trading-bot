@@ -64,29 +64,35 @@ Deployment proxies must avoid logging callback query strings.
 Manual /api/kite/refresh remains an authenticated development fallback. Settings
 clears its request-token input before exchange. Normal use requires no copying.
 
-MOCK is the default. Settings explicitly selects MOCK or KITE_REAL with
-POST /api/kite/data-mode; MARKET_DATA_MODE=KITE_REAL can explicitly select it at boot.
-Connecting never changes this choice. Mode changes are process-local. Settings shows
-PAPER, PaperBroker, connection state and data mode separately. Historical stored LIVE
-labels in old shared schemas are retained for compatibility, not emitted by this API.
+KITE_REAL is the only application NSE market-data mode, including when credentials
+are absent or expired. MARKET_DATA_MODE no longer selects MOCK. Settings displays
+the mode as read-only. The compatibility POST /api/kite/data-mode accepts only
+KITE_REAL; it rejects MOCK. Internal test/dev sessions must explicitly opt into
+fixture support in the constructor; no environment or HTTP switch enables it.
+PAPER execution is independent of market-data mode. Historical stored labels remain
+readable for compatibility; broker failures never generate mock evidence.
 
 Legacy KiteService strategy/backtest helpers cannot reach real Kite using hard-coded
 tokens/generated symbols. They remain MOCK-only (legacy history requires a qualified
 instrument and rejects). Selecting KITE_REAL fails these old helpers closed, rather
 than silently creating synthetic data or wiring strategies. Existing backtest UI's
 underlying-based real-data path is consequently unavailable until explicit future
-integration. SignalLoop/PaperTrade/Greeks code is unchanged. Legacy monitoring-session start rejects
-KITE_REAL before Mongo/loop work, and newly started MOCK sessions are labeled MOCK
-regardless of configured credentials. No new automatic orders.
+integration. SignalLoop/PaperTrade/Greeks code is unchanged. The normal monitoring workflow uses only the durable PAPER orchestrator.
 
 ## Master dependency and identity
 
-The approved Phase 4A calendar prerequisite remains: KITE_MONTHLY_EXPIRIES_FILE points
-to a backend-only JSON array of QualifiedMonthlyExpiry records, each containing exact
-underlying, expiry and sourceReference. Populate it from independently verified NSE
-calendar/contract evidence, including holidays and every supported month in the dump.
-Never derive that evidence from the CSV it is checking. Missing/malformed/conflicting
-coverage prevents qualification; do not copy example dates into production blindly.
+NIFTY has backend-owned 2026 monthly metadata from NSE/FAOP/68747 and the verified
+F&O holiday calendar: last Tuesday, shifted to the previous trading day on holidays.
+The default master qualifies only NIFTY contracts within 2026. Other assets and later
+contracts in a full CSV remain outside this explicit qualification scope; the raw
+CSV fingerprint is preserved for cross-checking the independently loaded index master.
+Out-of-coverage dates fail closed. No symbol, token, lot size or price is synthesized.
+
+Optional KITE_MONTHLY_EXPIRIES_FILE replaces the defaults with a strictly validated
+backend JSON array of underlying, expiry and sourceReference records. Its independent
+exchange evidence must cover every supported month/asset in the imported dump.
+Malformed, missing or conflicting evidence fails closed without a default fallback.
+Never infer evidence from the CSV being checked. See PAPER_ORCHESTRATION.md.
 
 POST /api/kite/master/refresh explicitly fetches /instruments through the current
 session and runs Phase 4A qualification. It invalidates an old active master before
@@ -138,11 +144,11 @@ Automated tests inject all broker responses; no real Kite calls. The following i
 an operator to run manually after offline verification, never an automatic test script.
 
 1. Configure backend KITE_API_KEY, KITE_API_SECRET and preferably KITE_USER_ID. Verify
-   the registered callback above. Configure KITE_MONTHLY_EXPIRIES_FILE with independently
-   checked Phase 4A metadata. Restart backend normally, keeping trading sessions stopped.
+   the registered callback above. The bounded NIFTY defaults need no metadata file.
+   Restart backend normally, keeping trading sessions stopped.
 2. Sign into the application. Open Settings → OPEN KITE LOGIN, authenticate normally,
-   return automatically to Settings. Confirm CONNECTED / PAPER / PaperBroker; then
-   explicitly select KITE_REAL. Authentication alone must leave MOCK selected.
+   return automatically to Settings. Confirm CONNECTED / PAPER / PaperBroker / KITE_REAL.
+   There is no market-data mode selector.
 3. After 08:30 IST, invoke authenticated POST /api/kite/master/refresh. Confirm success
    and current retrievedLocalDate, masterVersion and fingerprint. If calendar evidence
    is incomplete, stop and correct the trusted evidence; do not bypass qualification.

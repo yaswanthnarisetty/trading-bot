@@ -144,8 +144,9 @@ Existing opted-out Phase 2 accounts continue with BASE alone, without reconcilia
 collections or migration. Before enabling reconciliation, provision its seven indexes.
 Enabled accounts, reconciliation-dependent writes/gates and ReconciliationService fail
 closed without those indexes. ReconciliationService explicitly requires ALL. Direct record
-and link saves also require reconciliation indexes. No automatic startup provisioning,
-index dropping or constraint weakening is added.
+and link saves also require reconciliation indexes. The later PAPER:NSE application bootstrap
+ensures and verifies ALL before creating its reconciliation-enabled account. This does not
+drop indexes or weaken constraints.
 
 ## Deferred
 

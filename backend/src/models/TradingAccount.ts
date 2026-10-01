@@ -15,6 +15,8 @@ export const TradingAccountSchema = executionSchema({
   reconciliationState: { type: Schema.Types.Mixed },
   recoveryState: { type: Schema.Types.Mixed },
   currency: { type: String, enum: ["INR"], required: true, immutable: true },
+  // Provisioned once in exact INR paise. This is a capital reference, not a mutable cash balance.
+  initialCapitalMinor: { ...moneyField(), required: false, immutable: true },
   admissionStatus: { type: String, enum: ["DISABLED", "RECOVERING", "HALTED", "PAPER_READY"], required: true, default: "DISABLED" },
   // Explicit opt-in for isolated PAPER submission only; no LIVE readiness or credentials.
   policyVersion: unitsField(), executionEpoch: unitsField(),
@@ -31,7 +33,7 @@ export const TradingAccountSchema = executionSchema({
   committedPositionSlots: { ...unitsField(), default: 0 },
   positionSlots: unitsField(), nextEventSequence: unitsField(true),
 }, "execution_accounts");
-writeOnceFields(TradingAccountSchema, ["riskTradingCalendar", "reconciliationConfig"]);
+writeOnceFields(TradingAccountSchema, ["initialCapitalMinor", "riskTradingCalendar", "reconciliationConfig"]);
 TradingAccountSchema.index({ accountId: 1 }, { unique: true });
 TradingAccountSchema.index({ broker: 1, brokerAccountRef: 1, executionMode: 1 }, { unique: true });
 TradingAccountSchema.pre("validate", function () {

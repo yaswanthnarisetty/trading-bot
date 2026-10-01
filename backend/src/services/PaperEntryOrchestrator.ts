@@ -20,6 +20,8 @@ import { OrderManager } from "./OrderManager";
 import { FillProcessor } from "./FillProcessor";
 import { PaperBrokerAdapter } from "../brokers/PaperBrokerAdapter";
 import { evaluateWithPhase5LLM, type Phase5LLMConfig, type Phase5LLMTransport } from "./Phase5LLMService";
+import { captureMonitoringConfig, completePaperEntryConfig, type PaperMonitoringConfig } from "../domain/paperMonitoring";
+import { NSE_PAPER_ACCOUNT_ID } from "./NsePaperAccountService";
 
 export interface PaperMarketProvider {
   prepare(config: Readonly<PaperSessionConfig>): Promise<void>;
@@ -31,6 +33,7 @@ export interface PaperOrchestrationDependencies {
   host: ExecutionHostContext; clock: () => Date; market: PaperMarketProvider;
   transport: Phase5LLMTransport; llmConfig: () => Phase5LLMConfig;
   broker: (scope: ExecutionScope) => PaperBrokerAdapter;
+  entryConfig?: (config: PaperMonitoringConfig) => Promise<PaperSessionConfig>;
 }
 export function paperHistoryModels(connection: Connection) {
   return {
@@ -48,6 +51,16 @@ export class PaperEntryOrchestrator {
     await this.history.Session.createIndexes(); await this.history.Cycle.createIndexes();
   }
   private scope(accountId: string): ExecutionScope { return { accountId, executionMode: "PAPER" }; }
+  async eligibleMonitoringAccounts() {
+    return this.models.TradingAccount.find({executionMode:"PAPER",broker:"PAPER",accountId:{$regex:/^PAPER:[^\s]+$/},
+      admissionStatus:{$in:["PAPER_READY","RECOVERING","HALTED"]}})
+      .select({accountId:1,_id:0}).limit(2).lean<{accountId:string}[]>();
+  }
+  async canonicalMonitoringAccounts() {
+    return this.models.TradingAccount.find({executionMode:"PAPER",broker:"PAPER",accountId:NSE_PAPER_ACCOUNT_ID,
+      admissionStatus:{$in:["PAPER_READY","RECOVERING","HALTED"]}})
+      .select({accountId:1,_id:0}).limit(2).lean<{accountId:string}[]>();
+  }
   async assertReady(config: PaperSessionConfig) {
     await assertPaperHistoryIndexes(this.connection);
     await assertExecutionIndexes(this.connection);
@@ -71,14 +84,39 @@ export class PaperEntryOrchestrator {
     const operation = this.startCaptured(config); this.starting.set(key, operation);
     try { return await operation; } finally { if (this.starting.get(key) === operation) this.starting.delete(key); }
   }
-  private async startCaptured(config: Readonly<PaperSessionConfig>) {
+  /** Monitoring creation proves storage/account ownership, not tradable market readiness. */
+  async startMonitoring(input: unknown): Promise<Record<string, any>> {
+    const config = captureMonitoringConfig(input), pending = this.starting.get(config.accountId);
+    if (config.dataMode !== "KITE_REAL") throw new Error("DATA_MODE_REQUIRED");
+    if (pending) { await pending; return this.startMonitoring(config); }
+    const operation = this.startCaptured(config, true); this.starting.set(config.accountId, operation);
+    try { return await operation; } finally { if (this.starting.get(config.accountId) === operation) this.starting.delete(config.accountId); }
+  }
+  async entryConfiguration(input: unknown) {
+    const config = captureMonitoringConfig(input);
+    const complete = this.deps.entryConfig ? await this.deps.entryConfig(config) : completePaperEntryConfig(config);
+    // A metadata refresh cannot switch the captured account, strategy or execution terms.
+    const withoutMetadata = (c: PaperMonitoringConfig) => ({ ...c, calendar: null, riskFreeRate: null, riskFreeRateVersion: null });
+    if (digest(withoutMetadata(config)) !== digest(withoutMetadata(complete))) throw new Error("SESSION_CONFIG_CONFLICT");
+    return capturePaperConfig(complete);
+  }
+  private async startCaptured(config: Readonly<PaperMonitoringConfig>, monitoring = false) {
+    if (monitoring) {
+      await assertPaperHistoryIndexes(this.connection); await assertExecutionIndexes(this.connection);
+      if (!(await checkTransactionCapability(this.connection)).supported) throw new Error("ACCOUNT_NOT_READY");
+      const account = await this.models.TradingAccount.findOne(this.scope(config.accountId)).lean<{broker:string;admissionStatus:string}>();
+      if (!account || account.broker !== "PAPER" || account.admissionStatus === "DISABLED") throw new Error("PAPER_ACCOUNT_REQUIRED");
+    }
     const existing = await this.history.Session.findOne({ accountId: config.accountId, executionMode: "PAPER", status: "RUNNING" });
     if (existing) {
       if (existing.get("startupId") !== this.deps.host.startupId) throw new Error("RECOVERY_REQUIRED");
       if (existing.get("configFingerprint") !== digest(config)) throw new Error("SESSION_CONFIG_CONFLICT");
       return existing.toObject();
     }
-    await this.assertReady(config); await this.deps.market.prepare(config); this.deps.market.assertCurrent(config);
+    if (!monitoring) {
+      const entry = capturePaperConfig(config);
+      await this.assertReady(entry); await this.deps.market.prepare(entry); this.deps.market.assertCurrent(entry);
+    }
     const now = this.deps.clock();
     try {
       const row = await this.history.Session.create({ sessionId: randomUUID(), accountId: config.accountId, executionMode: "PAPER",
@@ -109,7 +147,7 @@ export class PaperEntryOrchestrator {
     return row;
   }
   async runEvaluationCycle(sessionId: string, requestedAt = this.deps.clock()) {
-    const row = await this.active(sessionId), config = capturePaperConfig(row.get("config"));
+    const row = await this.active(sessionId), config = await this.entryConfiguration(row.get("config"));
     if (this.running.has(config.accountId)) return { cycleId: cycleIdentity(config, requestedAt), outcome: "SKIPPED", reason: "CYCLE_IN_PROGRESS" };
     this.running.add(config.accountId);
     try { return await this.runCaptured(sessionId, config, requestedAt); }
@@ -199,7 +237,10 @@ export class PaperEntryOrchestrator {
       const retained = await processor.processRetained(orderId);
       if (retained.failedTradeKeys.length) { failure="FILL_PROCESSING_REQUIRED"; break; }
       try {
-        const active = await this.active(sessionId), config = capturePaperConfig(active.get("config"));
+        await this.active(sessionId);
+        // An admitted chain keeps its captured complete terms even if optional
+        // monitoring metadata is later absent. Retained truth remains independent.
+        const config = capturePaperConfig(cycle.get("config"));
         if (entryCalendarBlock(config,this.deps.clock())) {failure="ENTRY_WINDOW_CLOSED";continue;}
         if (!original.get("submissionClaim")) {
           // Preserve session/mode gates, but admitted identity no longer depends on the mutable master.

@@ -36,7 +36,12 @@ export async function currentMatchedReconciliation(connection: Connection, sessi
 
 export async function reconciliationAdmissionHealthy(connection: Connection, session: ClientSession, scope: ExecutionScope, account: Record<string, unknown>) {
   await assertAccountReconciliationIndexes(connection, account);
-  if (account.reconciliationConfig === undefined) return account.reconciliationState === undefined && account.recoveryState === undefined;
+  // Canonical NSE PAPER bootstrap may precede Kite login. Its unbound state is
+  // never the legacy reconciliation opt-out for direct financial admission.
+  if (account.reconciliationConfig === undefined) {
+    if (scope.accountId === "PAPER:NSE") throw new EntryRiskError("RECOVERY_REQUIRED");
+    return account.reconciliationState === undefined && account.recoveryState === undefined;
+  }
   assertCurrentRecoveryHost(account, executionHostFor(session));
   const recovery = recoveryStateSchema.safeParse(account.recoveryState);
   if (!recovery.success || recovery.data.status !== "READY" || !connection.db) throw new EntryRiskError("RECOVERY_REQUIRED");

@@ -33,7 +33,7 @@ export function executionModels(connection: Connection) {
     Record<ExecutionEntity, ReturnType<Connection["model"]>>;
 }
 
-/** Explicit provisioning only. createIndexes never drops legacy or existing indexes. */
+/** Explicit invocation only; never runs on module import. createIndexes never drops existing indexes. */
 export async function createExecutionIndexes(connection: Connection, group: ExecutionIndexGroup = "ALL"): Promise<void> {
   if (connection.readyState !== 1) throw new Error("PERSISTENCE_NOT_READY");
   const models = executionModels(connection);

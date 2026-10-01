@@ -16,7 +16,10 @@ Money is safe integer INR paise; quantities are safe integer contract units. Ver
 
 ## Index administration
 
-Normal application startup does not provision execution indexes. These commands do not load the application's `.env`:
+The PAPER:NSE application bootstrap now ensures and verifies the approved `ALL`
+execution-index group before account creation. It creates missing declared indexes
+without dropping or replacing healthy ones; conflicting indexes fail startup.
+These administrative commands remain available and do not load the application's `.env`:
 
 ```sh
 npm run execution:indexes --workspace backend -- list

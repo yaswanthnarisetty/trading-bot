@@ -20,6 +20,7 @@ export interface InstrumentMasterProvenance {
   readonly retrievedLocalDate: string;
   /** CSV has no generation timestamp/trading date. Retrieval date is not that proof. */
   readonly sourceTradingDate: null;
+  readonly qualificationScope?: InstrumentQualificationScope;
 }
 export interface InstrumentDefinition {
   readonly canonicalId: string;
@@ -51,6 +52,12 @@ export interface QualifiedMonthlyExpiry {
   readonly underlying: AssetKey;
   readonly expiry: string;
   readonly sourceReference: string;
+}
+/** Explicit bounded qualification universe. The raw CSV fingerprint stays intact. */
+export interface InstrumentQualificationScope {
+  readonly underlying: AssetKey;
+  readonly coveredFrom: string;
+  readonly coveredTo: string;
 }
 export interface KiteInstrumentMaster {
   readonly provenance: InstrumentMasterProvenance;
@@ -112,7 +119,12 @@ const canonicalId = (u: AssetKey, expiry: string, strikeMinor: number, type: "CE
 export class KiteInstrumentMasterService {
   private readonly monthlyExpiries = new Map<string, string>();
   constructor(private readonly provider: KiteInstrumentCsvProvider, private readonly clock: () => Date = () => new Date(),
-    monthlyExpiries: readonly QualifiedMonthlyExpiry[] = []) {
+    monthlyExpiries: readonly QualifiedMonthlyExpiry[] = [], private readonly scope?: InstrumentQualificationScope) {
+    if (scope) {
+      underlying(scope.underlying);
+      if (expiryDate(scope.coveredFrom) > expiryDate(scope.coveredTo)) invalid("monthlyExpiryMetadata");
+      this.scope = Object.freeze({ ...scope });
+    }
     for (const record of monthlyExpiries) {
       const u = underlying(record.underlying), date = expiryDate(record.expiry);
       if (!date.startsWith("20") || typeof record.sourceReference !== "string" || !record.sourceReference.trim()) invalid("monthlyExpiryMetadata");
@@ -129,7 +141,8 @@ export class KiteInstrumentMasterService {
     const retrievedAt = time.toISOString(), sourceFingerprint = hash(csv);
     const provenance: InstrumentMasterProvenance = Object.freeze({ broker: "KITE", source: "INSTRUMENT_MASTER", endpoint: "/instruments",
       normalizationVersion: 1, masterVersion: `kite-master-v1:${sourceFingerprint}`, sourceFingerprint, retrievedAt,
-      retrievedLocalDate: new Date(time.getTime() + 19800000).toISOString().slice(0, 10), sourceTradingDate: null });
+      retrievedLocalDate: new Date(time.getTime() + 19800000).toISOString().slice(0, 10), sourceTradingDate: null,
+      ...(this.scope ? { qualificationScope: this.scope } : {}) });
     let rows: string[][];
     try { rows = parseInstrumentCsv(csv); } catch { throw new InstrumentMasterError("INVALID_INSTRUMENT_CSV"); }
     const header = rows.shift();
@@ -142,7 +155,9 @@ export class KiteInstrumentMasterService {
       // Filter before parsing unsupported economics. No EQ/FUT/currency/commodity qualification.
       if (row.exchange !== "NFO" || row.segment !== "NFO-OPT" || !["CE", "PE"].includes(row.instrument_type)) continue;
       if (!Object.hasOwnProperty.call(ALLOWED_ASSETS, row.name)) continue;
+      if (this.scope && row.name !== this.scope.underlying) continue;
       const u = underlying(row.name), expiry = expiryDate(row.expiry), type = optionType(row.instrument_type);
+      if (this.scope && (expiry < this.scope.coveredFrom || expiry > this.scope.coveredTo)) continue;
       const strikeMinor = paise(row.strike, "strike"), tickSizeMinor = paise(row.tick_size, "tick_size");
       const lot = integer(row.lot_size, "lot_size");
       if (lot > BigInt(Number.MAX_SAFE_INTEGER)) return invalid("lot_size");

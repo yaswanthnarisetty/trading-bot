@@ -43,7 +43,8 @@ export class PaperExitMonitor {
    const persisted=await this.store.states.findOne({...scope,positionId});
    // Capture once per financial position, independently of entry-session activation/replacement.
    let config=persisted?.config?captureExitConfig(persisted.config):undefined;
-   if(!config){try{const choices=(await this.deps.configs()).filter(c=>c.accountId===scope.accountId&&c.family===plan.family);
+   if(!config){try{const choices=(await this.deps.configs()).filter(c=>c.accountId===scope.accountId&&c.family===plan.family
+     &&(!c.underlying||plan.legs.every(l=>l.identity.underlying===c.underlying)));
      if(choices.length===1)config=captureExitConfig(choices[0]);}catch{/* fail closed below; retained truth still runs */}}
    lease=await this.store.acquire(scope.accountId,positionId,config);if(!lease)return{status:'BUSY',reason:'EVALUATION_IN_PROGRESS'};
    config=lease.config?captureExitConfig(lease.config):config;
@@ -62,13 +63,15 @@ export class PaperExitMonitor {
     const advanced=await workflow.advance(positionId);
     if(advanced.status==='CLOSED'){await new RiskSettlementService(this.connection,scope,this.deps.clock).settleClosedPosition(positionId);return finish('SETTLED','PROVEN_FLAT',{closeIntentId:advanced.intentId});}
     if(!config)return finish('BLOCKED','EXIT_CONFIG_REQUIRED',{closeIntentId:advanced.intentId});
-    if(config.accountId!==scope.accountId||config.family!==plan.family)throw new Error('EXIT_CONFIG_REQUIRED');
+    if(config.accountId!==scope.accountId||config.family!==plan.family
+      ||(config.underlying&&!plan.legs.every(l=>l.identity.underlying===config.underlying)))throw new Error('EXIT_CONFIG_REQUIRED');
     return await this.progress(lease,config,finish);
    }
    const legs=ledger.position.legs as ExitLeg[];
    if(!legs.some(l=>l.entryFilledUnits>l.exitFilledUnits))return finish('IGNORED','NO_EXPOSURE');
    if(!config)throw new Error('EXIT_CONFIG_REQUIRED');
-   if(plan.dataMode!=='KITE_REAL'||config.accountId!==scope.accountId||config.family!==plan.family)throw new Error('REAL_DATA_REQUIRED');
+   if(plan.dataMode!=='KITE_REAL'||config.accountId!==scope.accountId||config.family!==plan.family
+     ||(config.underlying&&!plan.legs.every(l=>l.identity.underlying===config.underlying)))throw new Error('REAL_DATA_REQUIRED');
    const evidence=await this.deps.market.capture(plan,legs,config);evidence.assertCurrent();
    const economics=exitEconomics(ledger.position as {entryIntentId:string;legs:ExitLeg[]},plan,ledger.fills as ExitFill[],[...evidence.prices]);
    const expiry=Math.min(+new Date(ledger.entry.deadline),plan.marketEvidenceExpiresAt?+plan.marketEvidenceExpiresAt:Infinity,plan.entryCutoffAt?+plan.entryCutoffAt:Infinity);

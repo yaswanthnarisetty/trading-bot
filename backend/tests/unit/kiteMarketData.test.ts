@@ -150,12 +150,11 @@ test("historical expired option mapping fails explicitly, never guesses a token"
   assert.equal(f.calls.length, 0);
 });
 test("legacy helpers cannot use generated contracts or fall back to mock in KITE_REAL", async () => {
-  kiteSession.setMode("KITE_REAL");
-  try { for (const fn of [() => fetchLTP("NIFTY"), () => fetchMarketData("NIFTY"), () => fetchOptionChain("NIFTY"), () => fetchOptionLTP("NFO:generated")])
+  assert.equal(kiteSession.getMode(), "KITE_REAL");
+  for (const fn of [() => fetchLTP("NIFTY"), () => fetchMarketData("NIFTY"), () => fetchOptionChain("NIFTY"), () => fetchOptionLTP("NFO:generated")])
     await assert.rejects(fn(), /LEGACY_MARKET_DATA_DISABLED/);
-    await assert.rejects(fetchHistoricalOHLCV("NIFTY", range), /QUALIFIED_INSTRUMENT_REQUIRED/);
-  } finally { kiteSession.setMode("MOCK"); }
-  assert.equal((await fetchMarketData("NIFTY")).dataMode, "MOCK");
+  await assert.rejects(fetchHistoricalOHLCV("NIFTY", range), /QUALIFIED_INSTRUMENT_REQUIRED/);
+  assert.throws(() => kiteSession.setMode("MOCK"), /DATA_MODE_REQUIRED/);
 });
 test("reused token in new snapshot cannot identify the old economic contract", async () => {
   const f = await setup();

@@ -42,7 +42,7 @@ test("automatic callback exchanges once, verifies profile, stores session and re
   assert.equal(r.headers["Referrer-Policy"], "no-referrer"); assert.equal(r.headers["Cache-Control"], "no-store");
   assert.deepEqual(f.calls.map(c => [c.method, c.path]), [["POST", "/session/token"], ["GET", "/user/profile"]]);
   assert.equal(f.session.status().connectionStatus, "CONNECTED"); assert.equal(f.session.status().brokerAccountId, "AB1234");
-  assert.equal(f.session.getMode(), "MOCK"); // Authentication never selects real mode.
+  assert.equal(f.session.getMode(), "KITE_REAL"); // Data policy is independent of authentication.
   assert.equal(f.session.status().execution, "PaperBroker"); assert.equal(f.session.status().tradingPhase, "PAPER");
   assert.equal(f.session.status().tokenExpiry, "2026-09-30T00:30:00.000Z");
   const publicOutput = JSON.stringify([r, f.session.status()]);
@@ -139,9 +139,11 @@ test("session paces concurrent HTTP quote/history requests without retries", asy
   f.failGet({ response: { status: 429 } }); const before = f.calls.length;
   await assert.rejects(f.session.get("/quote"), /RATE_LIMITED/); assert.equal(f.calls.length, before + 1);
 });
-test("data mode is explicit and accepts only MOCK or KITE_REAL", () => {
+test("normal session rejects MOCK and invalid modes without changing authentication", () => {
   const f = setup(); f.session.setMode("KITE_REAL"); assert.equal(f.session.getMode(), "KITE_REAL");
   assert.throws(() => f.session.setMode("LIVE"), /INVALID_REQUEST/); assert.equal(f.session.status().tokenValid, false);
+  assert.throws(() => f.session.setMode("MOCK"), /DATA_MODE_REQUIRED/);
+  assert.equal(f.session.getMode(), "KITE_REAL");
 });
 test("Settings status handler reflects profile-verified session and separate PAPER execution", async () => {
   const f = setup(); await f.session.exchange("request");
@@ -150,7 +152,7 @@ test("Settings status handler reflects profile-verified session and separate PAP
   let body: any;
   await layer.route.stack[0].handle({}, { json(value: unknown) { body = value; } });
   assert.equal(body.connectionStatus, "CONNECTED"); assert.equal(body.config.execution, "PaperBroker"); assert.equal(body.config.tradingPhase, "PAPER");
-  assert.equal(body.dataMode, "MOCK"); assert.equal(JSON.stringify(body).includes("private-access"), false);
+  assert.equal(body.dataMode, "KITE_REAL"); assert.equal(JSON.stringify(body).includes("private-access"), false);
 });
 test("market and session modules have no financial Mongo/execution imports", () => {
   for (const file of ["KiteSessionService.ts", "KiteMarketDataService.ts", "KiteMarketDataRuntime.ts"])
@@ -178,20 +180,20 @@ test("late quote from an invalidated session cannot return as authenticated evid
   await session.exchange("replacement"); release({ data: success({}) });
   await assert.rejects(quote, /SESSION_REQUIRED/); assert.equal(session.status().tokenValid, true);
 });
-test("asset-only start fails closed before database or loop work when the server default is absent", async () => {
+test("asset-only start exposes the stable missing-account reason", async () => {
   const { default: router } = await import("../../src/routes/session");
   const { kiteSession } = await import("../../src/services/KiteService");
   const layer = (router as any).stack.find((entry: any) => entry.route?.path === "/start");
   let status = 0, body: any;
   kiteSession.setMode("KITE_REAL");
-  const savedConfigFile = process.env.NSE_PAPER_CONFIG_FILE;
-  delete process.env.NSE_PAPER_CONFIG_FILE;
+  const { paperDefaultSession } = await import("../../src/services/PaperOrchestrationRuntime");
+  const originalConfig = paperDefaultSession.config;
+  paperDefaultSession.config = async () => { throw new Error("PAPER_ACCOUNT_REQUIRED"); };
   try {
     await layer.route.stack.at(-1).handle({ body: { asset: "NIFTY" } }, {
       status(value: number) { status = value; return this; }, json(value: unknown) { body = value; },
     }, (error: unknown) => { throw error; });
-    assert.equal(status, 409); assert.equal(body.error, "DEFAULT_PAPER_CONFIG_REQUIRED");
-  } finally { kiteSession.setMode("MOCK");
-    if (savedConfigFile === undefined) delete process.env.NSE_PAPER_CONFIG_FILE;
-    else process.env.NSE_PAPER_CONFIG_FILE = savedConfigFile; }
+    assert.equal(status, 409); assert.equal(body.error, "PAPER_ACCOUNT_REQUIRED");
+  } finally {
+    paperDefaultSession.config = originalConfig; }
 });

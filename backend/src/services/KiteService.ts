@@ -16,7 +16,7 @@ const getClient = () => httpClient;
 export const kiteSession = new KiteSessionService(httpClient, () => ({
   apiKey: process.env.KITE_API_KEY ?? "", apiSecret: process.env.KITE_API_SECRET ?? "",
   expectedAccountId: process.env.KITE_USER_ID,
-}), Date.now, undefined, process.env.MARKET_DATA_MODE === "KITE_REAL" ? "KITE_REAL" : "MOCK");
+})); // Application NSE runtime is always KITE_REAL, including without credentials.
 export const isMock = () => kiteSession.getMode() === "MOCK";
 export const isTokenValid = () => kiteSession.status().tokenValid;
 export const getAuthHeader = () => kiteSession.getAuthHeader();

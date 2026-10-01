@@ -1,3 +1,5 @@
+import { NSE_FO_CALENDAR_2026 } from "./nseTradingCalendar";
+
 /**
  * NSE trading holidays for 2025.
  * The market hours guard checks this list before allowing session start.
@@ -23,33 +25,9 @@ export const NSE_HOLIDAYS_2025: string[] = [
   "2025-12-25", // Christmas
 ];
 
-/**
- * NSE trading holidays for 2026.
- * All indices (NIFTY, BANKNIFTY, FINNIFTY) now expire on Tuesday as of Sep 1 2025.
- * If Tuesday is a holiday → expiry shifts to the previous trading day.
- * Key shifts:
- *   Mar 3 (Holi/Tue)  → NIFTY weekly + BANKNIFTY/FINNIFTY March monthly shift to Mar 2
- *   Mar 31 (Eid/Tue)  → NIFTY weekly + BANKNIFTY/FINNIFTY March monthly shift to Mar 30
- *   Oct 20 (Diwali/Tue) → expiry shifts to Oct 19
- *   Apr 14 (Ambedkar/Tue) → expiry shifts to Apr 13
- * Source: https://www.nseindia.com/resources/exchange-communication-holidays
- */
-export const NSE_HOLIDAYS_2026: string[] = [
-  "2026-01-26", // Republic Day (Monday)
-  "2026-02-26", // Mahashivratri (Thursday)
-  "2026-03-03", // Holi (Tuesday) ← NIFTY weekly + BANKNIFTY/FINNIFTY March monthly → Mar 2
-  "2026-03-31", // Id-Ul-Fitr / Eid (Tuesday) ← NIFTY weekly + monthly → Mar 30
-  "2026-04-02", // Ram Navami (Thursday)
-  "2026-04-03", // Good Friday (Friday)
-  "2026-04-14", // Dr. Baba Saheb Ambedkar Jayanti (Tuesday) ← expiry → Apr 13
-  "2026-05-01", // Maharashtra Day (Friday)
-  "2026-08-27", // Ganesh Chaturthi (Thursday)
-  "2026-10-02", // Mahatma Gandhi Jayanti (Friday)
-  "2026-10-20", // Diwali Laxmi Puja (Tuesday) ← expiry → Oct 19
-  "2026-10-21", // Diwali Balipratipada (Wednesday)
-  "2026-11-25", // Prakash Gurpurb Sri Guru Nanak Dev Ji (Wednesday)
-  "2026-12-25", // Christmas (Friday)
-];
+/** Legacy helpers share the verified F&O closure dates. Special-session readiness
+ * and coverage checks belong to domain/nseTradingCalendar. */
+export const NSE_HOLIDAYS_2026: string[] = Object.keys(NSE_FO_CALENDAR_2026.holidays);
 
 /**
  * Merged NSE holiday list covering 2025 and 2026.
