@@ -178,16 +178,20 @@ test("late quote from an invalidated session cannot return as authenticated evid
   await session.exchange("replacement"); release({ data: success({}) });
   await assert.rejects(quote, /SESSION_REQUIRED/); assert.equal(session.status().tokenValid, true);
 });
-test("legacy asset-only start rejects before any financial database or loop work", async () => {
+test("asset-only start fails closed before database or loop work when the server default is absent", async () => {
   const { default: router } = await import("../../src/routes/session");
   const { kiteSession } = await import("../../src/services/KiteService");
   const layer = (router as any).stack.find((entry: any) => entry.route?.path === "/start");
   let status = 0, body: any;
   kiteSession.setMode("KITE_REAL");
+  const savedConfigFile = process.env.NSE_PAPER_CONFIG_FILE;
+  delete process.env.NSE_PAPER_CONFIG_FILE;
   try {
     await layer.route.stack.at(-1).handle({ body: { asset: "NIFTY" } }, {
       status(value: number) { status = value; return this; }, json(value: unknown) { body = value; },
     }, (error: unknown) => { throw error; });
-    assert.equal(status, 409); assert.equal(body.error, "PAPER_ONLY");
-  } finally { kiteSession.setMode("MOCK"); }
+    assert.equal(status, 409); assert.equal(body.error, "DEFAULT_PAPER_CONFIG_REQUIRED");
+  } finally { kiteSession.setMode("MOCK");
+    if (savedConfigFile === undefined) delete process.env.NSE_PAPER_CONFIG_FILE;
+    else process.env.NSE_PAPER_CONFIG_FILE = savedConfigFile; }
 });

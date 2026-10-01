@@ -1,11 +1,29 @@
 import { Router } from "express";
 import { authMiddleware } from "./auth.middleware";
-import { paperExitMonitor,paperConfigurations,paperOrchestrator,paperScheduler,recoverPaperAccount } from "../services/PaperOrchestrationRuntime";
+import { paperDefaultSession,paperExitMonitor,paperExitScheduler,paperConfigurations,paperOrchestrator,paperScheduler,recoverPaperAccount,paperExecutionHost } from "../services/PaperOrchestrationRuntime";
 import { safeCycleError } from "../domain/paperOrchestration";
 import { kiteSession } from "../services/KiteService";
+import { defaultPaperSummary,parseDefaultStartRequest } from "../services/PaperDefaultSessionService";
+import mongoose from "mongoose";
+import { readPaperDashboard } from "../services/PaperDashboardReadService";
 const router=Router();
 router.use(authMiddleware);
 const sessions=paperOrchestrator.history.Session;
+const safeStartError=(error:unknown)=>{
+  const message=error instanceof Error?error.message:"";
+  return ["ASSET_ONLY_START_REQUIRED","DEFAULT_PAPER_ASSET_UNAVAILABLE","DEFAULT_PAPER_CONFIG_REQUIRED","DEFAULT_PAPER_CONFIG_INVALID",
+    "INVALID_PAPER_CONFIG","KITE_SESSION_REQUIRED","DATA_MODE_REQUIRED","ACCOUNT_NOT_READY","KILL_SWITCH_ACTIVE",
+    "RECOVERY_REQUIRED","RECOVERY_ALREADY_REQUIRED","RECOVERY_HOST_MISMATCH","RECONCILIATION_INCOMPLETE",
+    "RECONCILIATION_NOT_MATCHED","RECONCILIATION_REQUIRED","RISK_POLICY_REQUIRED","DAILY_LOSS_LIMIT_EXCEEDED",
+    "TRADING_DAY_CONFIG_REQUIRED","TRADING_DAY_REGRESSION","SESSION_CONFIG_CONFLICT",
+    "MONTHLY_METADATA_REQUIRED","INSTRUMENT_MASTER_STALE","QUALIFIED_INSTRUMENT_REQUIRED","STALE_MARKET_DATA",
+    "EXIT_CONFIG_REQUIRED"].includes(message)
+    ? message : safeCycleError(error);
+};
+router.get("/default/:asset",async(req,res)=>{
+  try{res.json(defaultPaperSummary(await paperDefaultSession.config(req.params.asset)));}
+  catch(e){res.status(409).json({error:safeStartError(e)});}
+});
 router.get("/configurations",async(_req,res)=>{
   try{res.json((await paperConfigurations()).map(c=>({configId:c.configId,accountId:c.accountId,asset:c.asset,
     executionMode:c.executionMode,dataMode:c.dataMode,strategyFamily:c.strategyConfig.strategyFamily,intervalMs:c.intervalMs})));}
@@ -17,13 +35,8 @@ router.post("/recover",async(req,res)=>{
 });
 router.post("/start",async(req,res)=>{
   try{
-    if(req.body?.executionMode!=="PAPER")throw new Error("PAPER_ONLY");
-    const c=(await paperConfigurations()).find(c=>c.configId===req.body?.configId);
-    if(!c||c.asset!==req.body.asset||c.dataMode!==req.body.dataMode||c.strategyConfig.strategyFamily!==req.body.strategyFamily){res.status(400).json({error:"EXPLICIT_PAPER_CONFIGURATION_REQUIRED"});return;}
-    const session=await paperOrchestrator.start(c);
-    paperScheduler.start(c.accountId,session.sessionId,c.intervalMs);
-    res.json(session);
-  }catch(e){res.status(409).json({error:safeCycleError(e)});}
+    res.json(await paperDefaultSession.start(parseDefaultStartRequest(req.body)));
+  }catch(e){res.status(409).json({error:safeStartError(e)});}
 });
 router.post("/stop",async(req,res)=>{
   const id=String(req.body?.sessionId??"");paperScheduler.stop(id);
@@ -43,6 +56,10 @@ router.get("/exits/status",async(req,res,next)=>{try{
 }catch(e){next(e);}});
 router.get("/history",async(_req,res,next)=>{try{res.json({sessions:await sessions.find({}).sort({createdAt:-1}).limit(100).lean(),total:await sessions.countDocuments()});}catch(e){next(e);}});
 router.get("/:sessionId/decisions",async(req,res,next)=>{try{res.json(await paperOrchestrator.history.Cycle.find({sessionId:req.params.sessionId,executionMode:"PAPER"}).sort({timestamp:-1}).limit(50).lean());}catch(e){next(e);}});
+router.get("/:sessionId/dashboard",async(req,res)=>{try{
+  res.json(await readPaperDashboard(mongoose.connection,req.params.sessionId,paperExitScheduler.isRunning(),paperExecutionHost.startupId));
+}catch(e){const missing=e instanceof Error&&e.message==="SESSION_NOT_FOUND";
+  res.status(missing?404:503).json({error:missing?"SESSION_NOT_FOUND":"DASHBOARD_READ_UNAVAILABLE"});}});
 router.post("/:sessionId/progress/:cycleId",async(req,res)=>{
   try{const cycle=await paperOrchestrator.history.Cycle.findOne({sessionId:req.params.sessionId,cycleId:req.params.cycleId,executionMode:"PAPER"});
     if(!cycle){res.status(404).json({error:"DECISION_NOT_FOUND"});return;}

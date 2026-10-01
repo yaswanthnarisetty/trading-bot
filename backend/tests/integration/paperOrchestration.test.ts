@@ -12,6 +12,7 @@ import { PaperBrokerAdapter,type PaperScenario } from "../../src/brokers/PaperBr
 import { RiskControlService } from "../../src/services/RiskControlService";
 import { FillProcessor } from "../../src/services/FillProcessor";
 import { config,evaluationTime,fakeLLM,llmConfig,mockCapture,realProvider } from "../fixtures/paperOrchestration";
+import { readPaperDashboard } from "../../src/services/PaperDashboardReadService";
 import { brokerSnapshot,config as reconciliationConfig } from "../reconciliationFixtures";
 import * as f from "../fixtures";
 const uri=process.env.EXECUTION_TEST_MONGO_URI;
@@ -49,6 +50,25 @@ for(const family of ['LONG_OPTION','DEBIT_VERTICAL','CREDIT_VERTICAL'] as const)
  assert.equal(signal.get('orchestration.cycleId'),history.get('cycleId'));assert.equal(history.get('decision.strategyResult.candidate.strategyFamily'),family);
  assert.equal(history.get('decision.primary.result.model'),'fixture');assert.equal(history.get('decision.dataMode'),'MOCK');
  assert.equal(await connection.db!.collection('options_positions').countDocuments(),0);
+});
+for(const family of ['LONG_OPTION','DEBIT_VERTICAL','CREDIT_VERTICAL'] as const)test(`real Mongo dashboard reads fill-derived ${family} without financial writes`,async()=>{
+ const {session,result}=await cycle(family);assert.equal(result.outcome,'ENTRY');
+ const before=await Promise.all([models.Position.countDocuments(),models.Fill.countDocuments(),models.OrderIntent.countDocuments(),
+  models.TradingEvent.countDocuments()]);
+ const accountVersion=(await models.TradingAccount.findOne(f.scope).orFail()).get('version');
+ const positionVersion=(await models.Position.findOne().orFail()).get('version');
+ const view=await readPaperDashboard(connection,session.sessionId,true,host.startupId);
+ assert.equal(view.session.sessionId,session.sessionId);assert.equal(view.session.accountId,f.scope.accountId);
+ assert.equal(view.session.executionMode,'PAPER');assert.equal(view.session.strategyFamily,family);
+ assert.equal(view.positions.length,1);assert.equal(view.positions[0]!.family,family);
+ assert.equal(view.positions[0]!.legs.length,family==='LONG_OPTION'?1:2);
+ assert.ok(view.positions[0]!.legs.every(l=>l.entryPriceEvidence==='FILL_BACKED'&&l.filledUnits===65));
+ assert.equal(view.decisions[0]!.outcome,'ENTRY');assert.equal(view.decisions[0]!.family,family);
+ assert.equal(view.exits.status,'ACTIVE');assert.equal(view.risk?.recoveryStatus,'READY');
+ assert.deepEqual(await Promise.all([models.Position.countDocuments(),models.Fill.countDocuments(),models.OrderIntent.countDocuments(),
+  models.TradingEvent.countDocuments()]),before);
+ assert.equal((await models.TradingAccount.findOne(f.scope).orFail()).get('version'),accountVersion);
+ assert.equal((await models.Position.findOne().orFail()).get('version'),positionVersion);
 });
 for(const mode of ['LIVE',undefined])test(`real start rejects mode ${mode}`,async()=>{await assert.rejects(core.start({...config(),executionMode:mode}));await zeroFinancial();});
 for(const family of [undefined,'AUTO','BAD'])test(`real start rejects family ${family}`,async()=>{await assert.rejects(core.start({...config(),strategyConfig:{...config().strategyConfig,strategyFamily:family}}));});

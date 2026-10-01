@@ -42,7 +42,9 @@ test('wrong-account and unscoped discovery cannot select or stop another session
 test('dashboard wiring retains start result and uses per-tab exact identity on reload',()=>{
  const page=readFileSync('../frontend/app/(dashboard)/dashboard/page.tsx','utf8');
  const start=page.slice(page.indexOf('async function handleStart'),page.indexOf('async function handleStop'));
- assert.match(start,/retainPaperSession\(await startSession\(configuration\), configuration.accountId\)/);assert.doesNotMatch(start,/getActiveSession/);
- assert.match(page,/pollPaperSession\(selected, getSession\)/);assert.match(page,/sessionStorage\.setItem/);assert.doesNotMatch(page,/getActiveSession\(\)/);
- const route=readFileSync('src/routes/session.ts','utf8');assert.match(route,/activeForAccount\(accountId\)/);assert.match(route,/EXPLICIT_PAPER_ACCOUNT_REQUIRED/);
+ assert.match(start,/retainPaperSession\(await startSession\("NIFTY"\), config.accountId\)/);assert.doesNotMatch(start,/getActiveSession/);
+ assert.match(page,/pollPaperSession\(identity, getSession\)/);assert.match(page,/sessionStorage\.setItem/);assert.doesNotMatch(page,/getActiveSession\(\)/);
+ assert.match(page,/getDefaultPaperConfig\("NIFTY"\)/);assert.doesNotMatch(page,/paper-configuration|recoverPaperSession/);
+ const route=readFileSync('src/routes/session.ts','utf8');assert.match(route,/activeForAccount\(accountId\)/);
+ assert.match(route,/parseDefaultStartRequest\(req.body\)/);assert.match(route,/EXPLICIT_PAPER_ACCOUNT_REQUIRED/);
 });

@@ -307,12 +307,10 @@ export function getAssets(): Promise<Asset[]> {
  * @param asset - Asset key such as "NIFTY" or "BANKNIFTY".
  * @returns Promise resolving to session start metadata.
  */
-export function startSession(
-  config: PaperSessionOption
-): Promise<SessionStartResponse> {
+export function startSession(asset: "NIFTY"): Promise<SessionStartResponse> {
   return request<SessionStartResponse>("/api/session/start", {
     method: "POST",
-    body: JSON.stringify(config),
+    body: JSON.stringify({ asset }),
   });
 }
 
@@ -552,4 +550,48 @@ export interface PaperSessionOption {
 export function getPaperSessionOptions(): Promise<PaperSessionOption[]> { return request("/api/session/configurations"); }
 export function recoverPaperSession(configId: string): Promise<{status: string}> {
   return request("/api/session/recover", {method:"POST",body:JSON.stringify({configId})});
+}
+
+export interface PaperDefaultSummary {
+  asset: "NIFTY"; accountId: string; configId: string; executionMode: "PAPER";
+  dataMode: "KITE_REAL"; strategyFamily: "LONG_OPTION"; intervalMs: number;
+  entryWindowStartMinuteIST: number; entryCutoffMinuteIST: number; minConfidence: number;
+  longOptionSelection: { minAbsDelta: number; maxAbsDelta: number; targetAbsDelta: number; maxStrikeDistanceMinor: number };
+}
+export interface DurablePaperLeg {
+  legId: string; contractKey: string; entrySide: "BUY" | "SELL"; filledUnits: number;
+  exitFilledUnits: number; openUnits: number; entryNotionalMinor: number | null;
+  entryPriceEvidence: "FILL_BACKED" | "UNAVAILABLE";
+}
+export interface DurablePaperPosition {
+  positionId: string; sessionId: string; accountId: string; family: string | null;
+  strategyKind: string | null; underlying: string | null; legs: DurablePaperLeg[];
+  lifecycle: string; integrity: string; openedAt: string | null; closeState: string;
+  closeIntentId: string | null; exitReason: string | null; exitMonitorStatus: string;
+  exitAttentionReason: string | null; unknownOrder: boolean; stranded: boolean; attention: boolean;
+  realizedPnlMinor: number | null; estimatedUnrealizedPnlMinor: null;
+}
+export interface DurablePaperDecision {
+  cycleId: string; evaluatedAt: string | null; direction: string; confidence: number | null;
+  outcome: string; candidate: boolean; family: string | null; strategyKind: string | null;
+  reason: string | null; verifier: { status: string; verdict: string | null; reasonCode: string | null };
+  rationale: string | null; blockingReason: string | null;
+}
+export interface PaperDashboard {
+  session: { sessionId: string; accountId: string; asset: string; status: "RUNNING" | "STOPPED" | "CRASHED";
+    executionMode: "PAPER"; dataMode: "KITE_REAL"; strategyFamily: string; intervalMs: number;
+    lastCycleAt: string | null; lastCycleOutcome: string | null; blockingReason: string | null;
+    config: Pick<PaperDefaultSummary, "configId" | "minConfidence" | "entryWindowStartMinuteIST" | "entryCutoffMinuteIST" | "longOptionSelection"> };
+  positions: DurablePaperPosition[]; positionsTruncated: boolean; decisions: DurablePaperDecision[];
+  exits: { status: "ACTIVE" | "ATTENTION"; active: boolean; closeInProgress: number; attentionCount: number };
+  risk: null | { pendingRiskMinor: number | null; committedRiskMinor: number | null; capacityMinor: number | null;
+    availableCapacityMinor: number | null; reservedSlots: number | null; committedSlots: number | null;
+    maxPositionSlots: number | null; dailyTradingDay: string | null; dailyRealizedPnlMinor: number | null; killSwitchEnabled: boolean;
+    recoveryStatus: string; reconciliationStatus: string };
+}
+export function getDefaultPaperConfig(asset: "NIFTY"): Promise<PaperDefaultSummary> {
+  return request(`/api/session/default/${asset}`);
+}
+export function getPaperDashboard(sessionId: string): Promise<PaperDashboard> {
+  return request(`/api/session/${encodeURIComponent(sessionId)}/dashboard`);
 }

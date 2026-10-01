@@ -52,10 +52,20 @@ PAPER decision rows are excluded from the old signal renderer.
    - `riskFreeRate`, `riskFreeRateVersion`: explicit existing Greeks assumptions.
 5. Configure the existing Kite monthly-expiry metadata and Phase 5 LLM settings.
    Complete Kite authentication and choose KITE_REAL separately in Settings.
-6. Select the configuration and invoke **Check recovery**. The approved read-only
-   Kite adapter fetches broker truth; only genuine MATCHED evidence may complete
-   the current-host barrier. A mismatch/incomplete report never becomes READY.
-7. Start the session explicitly. Authentication alone starts no timer.
+6. For the Phase 6C1 Dashboard default, provision exactly one NIFTY / LONG_OPTION /
+   PAPER / KITE_REAL configuration with five-minute cadence, 09:30 IST opening
+   block, 15:00 IST cutoff, the approved 65% confidence and 0.55–0.70 delta
+   selection. The server validates the whole file using `capturePaperConfig`.
+   The account mapping, authoritative market open-date allow-list and versioned
+   risk-free-rate assumption must be explicitly supplied by the operator; the
+   Dashboard never guesses them. Provision a matching validated LONG_OPTION
+   `NSE_PAPER_EXIT_CONFIG_FILE` policy and the existing account risk policy too.
+   Missing or ambiguous prerequisites block Start with a reason code.
+7. Authenticate Kite and select KITE_REAL in Settings, then click Dashboard
+   **Start**. The backend performs approved read-only broker recovery and
+   reconciliation preparation before creating a new PAPER session. A genuine
+   MATCHED proof is required; mismatch or incomplete evidence fails closed.
+   Start never launches the backend process, which must already be running.
 
 An unconfigured deployment returns an empty configuration list and cannot start.
 The production provider does not implement MOCK; tests/development can explicitly
@@ -163,10 +173,14 @@ session across reload. Stopped/crashed/not-found results never switch accounts.
 Status includes mode, family, last cycle and blocking reason; individual-session
 status also reports Kite connectivity, PaperBroker and deferred exits.
 
-The dashboard adds only configuration selection, recovery/start controls and
-blocking status. Legacy capital/P&L/position widgets are not projections of the
-new execution ledger. Use the decision API and approved ledger records for this
-slice; Phase 6C supplies the replacement panels. Existing exposure remains open.
+The Phase 6C1 Dashboard accepts only an asset in its Start request. The backend
+resolves the validated NIFTY default, and the browser cannot choose family,
+account, risk terms or a config record. The normal dashboard has no configuration
+dropdown or separate recovery click. Exact session identity remains pinned across
+poll, stop and reload. Its primary positions, decisions, exit status and risk
+summary read the durable PAPER ledger; zero-fill pending shells are excluded.
+Performance remains legacy pending Phase 6C2, and Backtest archive behavior is
+unchanged. Existing exposure remains open when entry evaluation stops.
 
 ## Offline verification
 

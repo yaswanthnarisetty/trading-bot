@@ -21,6 +21,10 @@ import { PaperExitScheduler } from "./PaperExitScheduler";
 import { captureExitConfig } from "../domain/paperExits";
 import type { ExecutionScope } from "@trading-bot/shared";
 import { logger } from "../utils/logger";
+import { PaperDefaultSessionService } from "./PaperDefaultSessionService";
+import { entryRiskPolicySchema } from "../domain/entryRisk";
+import { currentDailyState } from "../db/realizedRiskProjection";
+import { dailyLossReached } from "../domain/realizedRisk";
 export const paperExecutionHost=createExecutionHostContext();
 const brokers=new Map<string,PaperBrokerAdapter>();
 export const paperBrokerFor=(scope:ExecutionScope)=>{
@@ -42,11 +46,13 @@ export const paperScheduler=new PaperEvaluationScheduler(id=>paperOrchestrator.r
 export async function paperConfigurations(){
   const file=process.env.NSE_PAPER_CONFIG_FILE;
   if(!file)return [];
-  const raw:unknown=JSON.parse(await readFile(file,"utf8"));
-  if(!Array.isArray(raw)||raw.length>50)throw new Error("INVALID_PAPER_CONFIG");
-  const configs=raw.map(capturePaperConfig);
-  if(new Set(configs.map(c=>c.configId)).size!==configs.length)throw new Error("INVALID_PAPER_CONFIG");
-  return configs;
+  try {
+    const raw:unknown=JSON.parse(await readFile(file,"utf8"));
+    if(!Array.isArray(raw)||raw.length>50)throw new Error("INVALID_PAPER_CONFIG");
+    const configs=raw.map(capturePaperConfig);
+    if(new Set(configs.map(c=>c.configId)).size!==configs.length)throw new Error("INVALID_PAPER_CONFIG");
+    return configs;
+  } catch { throw new Error("INVALID_PAPER_CONFIG"); }
 }
 /** Explicit operator action. No order writes or synthetic reconciliation success. */
 export async function recoverPaperAccount(configId:string){
@@ -67,11 +73,35 @@ export async function recoverPaperAccount(configId:string){
   return recovery.completeRecovery(scope.accountId,result.recordId);
 }
 
+export const paperDefaultSession = new PaperDefaultSessionService({
+  configurations: paperConfigurations,
+  connected: () => kiteSession.status().tokenValid,
+  dataMode: () => kiteSession.getMode(),
+  active: accountId => paperOrchestrator.activeForAccount(accountId),
+  recover: recoverPaperAccount,
+  accountGate: async accountId => {
+    const account = await executionModels(mongoose.connection).TradingAccount.findOne({ accountId, executionMode: "PAPER" });
+    if (!account || account.get("broker") !== "PAPER" || account.get("admissionStatus") !== "PAPER_READY") throw new Error("ACCOUNT_NOT_READY");
+    if (account.get("killSwitchEnabled")) throw new Error("KILL_SWITCH_ACTIVE");
+    const policy = entryRiskPolicySchema.safeParse(account.get("entryRiskPolicy"));
+    if (!policy.success || policy.data.policyVersion !== account.get("policyVersion") || policy.data.maxDailyLossMinor === undefined)
+      throw new Error("RISK_POLICY_REQUIRED");
+    const daily = currentDailyState(account.toObject(), new Date());
+    if (dailyLossReached(daily.dailyRealizedPnlMinor, policy.data.maxDailyLossMinor)) throw new Error("DAILY_LOSS_LIMIT_EXCEEDED");
+    if ((await paperExitConfigurations()).filter(c => c.accountId === accountId && c.family === "LONG_OPTION" && c.dataMode === "KITE_REAL").length !== 1)
+      throw new Error("EXIT_CONFIG_REQUIRED");
+  },
+  start: config => paperOrchestrator.start(config),
+  schedule: (accountId, sessionId, intervalMs) => paperScheduler.start(accountId, sessionId, intervalMs),
+  sessionId: session => String(session.sessionId),
+});
+
 export async function paperExitConfigurations(){
  const file=process.env.NSE_PAPER_EXIT_CONFIG_FILE;if(!file)return [];
- const raw:unknown=JSON.parse(await readFile(file,"utf8"));if(!Array.isArray(raw)||raw.length>150)throw new Error("EXIT_CONFIG_REQUIRED");
- const configs=raw.map(captureExitConfig);
- if(new Set(configs.map(c=>`${c.accountId}:${c.family}`)).size!==configs.length)throw new Error("EXIT_CONFIG_REQUIRED");return configs;
+ try{const raw:unknown=JSON.parse(await readFile(file,"utf8"));if(!Array.isArray(raw)||raw.length>150)throw new Error("EXIT_CONFIG_REQUIRED");
+  const configs=raw.map(captureExitConfig);
+  if(new Set(configs.map(c=>`${c.accountId}:${c.family}`)).size!==configs.length)throw new Error("EXIT_CONFIG_REQUIRED");return configs;
+ }catch{throw new Error("EXIT_CONFIG_REQUIRED");}
 }
 export const paperExitMonitor=new PaperExitMonitor(mongoose.connection,{clock:()=>new Date(),
  market:new PaperExitMarketData(kiteMarketData),configs:paperExitConfigurations,broker:paperBrokerFor});

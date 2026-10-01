@@ -7,6 +7,7 @@ export class PaperExitScheduler {
   if(!Number.isSafeInteger(intervalMs)||intervalMs<1000||intervalMs>60000||!Number.isSafeInteger(concurrency)||concurrency<1||concurrency>8)throw new Error('INVALID_EXIT_CADENCE');
  }
  start(){if(this.running)return;this.running=true;void this.tick();}
+ isRunning(){return this.running;}
  stop(){this.running=false;if(this.timer)clearTimeout(this.timer);this.timer=undefined;}
  async tick(){if(this.scanning)return;this.scanning=true;
   try{const rows=[...(await this.list())].sort((a,b)=>a.positionId<b.positionId?-1:a.positionId>b.positionId?1:0);

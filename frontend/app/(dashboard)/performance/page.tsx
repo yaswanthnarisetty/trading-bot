@@ -18,6 +18,7 @@ interface SessionHistoryItem {
   asset: string;
   startTime: string;
   status: "RUNNING" | "STOPPED";
+  executionMode?: "LEGACY_PAPER" | "PAPER";
 }
 
 async function fetchSessionHistory(): Promise<SessionHistoryItem[]> {
@@ -32,7 +33,7 @@ async function fetchSessionHistory(): Promise<SessionHistoryItem[]> {
     cache: "no-store",
   });
   const body = (await response.json()) as { sessions: SessionHistoryItem[] };
-  return body.sessions;
+  return body.sessions.filter(session => session.executionMode !== "PAPER");
 }
 
 type DateRange = "today" | "week" | "month" | "all";
@@ -288,6 +289,9 @@ export default function PerformancePage(): JSX.Element {
 
   return (
     <div className="space-y-4">
+      <p role="note" className="rounded-xl border border-amber-400/20 bg-amber-400/10 px-4 py-3 text-sm text-amber-200">
+        LEGACY PERFORMANCE — these metrics use legacy paper records. Durable NSE PAPER ledger performance is deferred to Phase 6C2.
+      </p>
       {/* Session selector + date range */}
       <section
         className="rounded-2xl p-4"

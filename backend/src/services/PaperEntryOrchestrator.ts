@@ -84,7 +84,7 @@ export class PaperEntryOrchestrator {
       const row = await this.history.Session.create({ sessionId: randomUUID(), accountId: config.accountId, executionMode: "PAPER",
         startupId: this.deps.host.startupId, config, strategyFamily: config.strategyConfig.strategyFamily, configFingerprint: digest(config), asset: config.asset, dataMode: config.dataMode,
         startTime: now.toISOString(), status: "RUNNING", paperCapital: 0, totalSignals: 0, totalTrades: 0,
-        winRate: 0, paperPnL: 0, ticksSkipped: 0, blockingReason: "EXITS_DEFERRED_TO_PHASE_6B" });
+        winRate: 0, paperPnL: 0, ticksSkipped: 0, blockingReason: "WAITING_FOR_FIRST_CYCLE" });
       return row.toObject();
     } catch (e) {
       if ((e as {code?:number}).code !== 11000) throw e;
