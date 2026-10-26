@@ -4,6 +4,12 @@ import { verifyExecutionIndexes } from "./executionIndexes";
 export type TransactionCapability =
   | { supported: true; reason: "SNAPSHOT_TRANSACTION_VERIFIED" }
   | { supported: false; reason: "DISCONNECTED" | "UNSUPPORTED_TOPOLOGY" | "PROBE_FAILED" };
+const verifiedCapabilities = new WeakMap<object, { connection: Connection; client: unknown; at: number }>();
+export function hasVerifiedTransactionCapability(connection: Connection, capability: TransactionCapability | undefined): boolean {
+  const proof = capability && verifiedCapabilities.get(capability);
+  return capability?.supported === true && proof?.connection === connection && proof.client === connection.getClient()
+    && connection.readyState === 1 && Date.now() - proof.at >= 0 && Date.now() - proof.at <= 60_000;
+}
 
 export function isTransactionTopology(hello: { setName?: string; msg?: string; logicalSessionTimeoutMinutes?: number; maxWireVersion?: number }): boolean {
   return (typeof hello.setName === "string" && hello.setName.length > 0 || hello.msg === "isdbgrid")
@@ -22,7 +28,9 @@ export async function checkTransactionCapability(connection: Connection): Promis
     session.startTransaction({ readConcern: { level: "snapshot" }, writeConcern: { w: "majority" } });
     await connection.db.collection("execution_accounts").findOne({}, { session, maxTimeMS: 2000 });
     await session.abortTransaction();
-    return { supported: true, reason: "SNAPSHOT_TRANSACTION_VERIFIED" };
+    const result = { supported: true as const, reason: "SNAPSHOT_TRANSACTION_VERIFIED" as const };
+    verifiedCapabilities.set(result, { connection, client: connection.getClient(), at: Date.now() });
+    return result;
   } catch {
     return { supported: false, reason: "PROBE_FAILED" };
   } finally {

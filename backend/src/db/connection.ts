@@ -1,4 +1,6 @@
 import mongoose from "mongoose";
+import { setServers } from "node:dns";
+import { isIP } from "node:net";
 import { logger } from "../utils/logger";
 
 /**
@@ -33,6 +35,19 @@ export async function connectWithRetry(
     process.exit(1);
   }
 
+  // MongoDB Atlas mongodb+srv lookups use Node's DNS resolver. A machine with
+  // a broken local SRV resolver may opt into a process-local DNS server without
+  // changing the system network configuration or the database URI.
+  const dnsServers = process.env.MONGODB_DNS_SERVERS;
+  if (dnsServers) {
+    const servers = dnsServers.split(",").map(server => server.trim());
+    if (servers.length > 2 || servers.some(server => !isIP(server))) {
+      logger.error("MONGODB_DNS_SERVERS must contain one or two IP addresses");
+      process.exit(1);
+    }
+    setServers(servers);
+  }
+
   for (let attempt = 1; attempt <= retries; attempt += 1) {
     try {
       await mongoose.connect(uri);
@@ -54,4 +69,3 @@ export async function connectWithRetry(
     }
   }
 }
-

@@ -5,7 +5,8 @@ import https from "node:https";
 import mongoose from "mongoose";
 import { bootstrapNsePaperAccount } from "../../src/db/nsePaperStartup";
 import { createExecutionIndexes, executionModels } from "../../src/db/executionModels";
-import { assertExecutionIndexes, requiredExecutionIndexes, verifyExecutionIndexes } from "../../src/db/executionIndexes";
+import { assertExecutionIndexes, executionIndexProofFor, hasVerifiedExecutionIndexes, requiredExecutionIndexes,
+  verifyExecutionIndexes, withExecutionIndexProofs } from "../../src/db/executionIndexes";
 import { checkTransactionCapability } from "../../src/db/executionReadiness";
 import { ensureNsePaperAccount, NSE_PAPER_ACCOUNT_ID } from "../../src/services/NsePaperAccountService";
 import * as fixture from "../fixtures";
@@ -40,7 +41,10 @@ test("fresh real Mongo startup ensures ALL indexes before canonical PAPER accoun
   let called = 0;
   await bootstrapNsePaperAccount(connection, async ready => {
     called++;
-    await assertExecutionIndexes(ready, "ALL");
+    const proof = await assertExecutionIndexes(ready, "ALL");
+    assert.equal(hasVerifiedExecutionIndexes(ready, proof, "ALL"), true);
+    assert.equal(hasVerifiedExecutionIndexes(ready, proof, "BASE"), false);
+    assert.equal(hasVerifiedExecutionIndexes(ready, { verifiedAt: proof.verifiedAt }, "ALL"), false);
     await ensureNsePaperAccount(ready, env, async () => policy);
   });
   assert.equal(called, 1);
@@ -54,10 +58,32 @@ test("fresh real Mongo startup ensures ALL indexes before canonical PAPER accoun
   assert.equal(await models.TradingEvent.countDocuments(), 0);
 });
 
+test("write proof reuse is limited to its operation, index group, and issued proof", async () => {
+  await bootstrapNsePaperAccount(connection, async () => {});
+  const base = await assertExecutionIndexes(connection);
+  const reconciliation = await assertExecutionIndexes(connection, "RECONCILIATION");
+  const session = await connection.startSession();
+  try {
+    assert.equal(executionIndexProofFor(connection, session), undefined);
+    await assert.rejects(withExecutionIndexProofs(connection, session,
+      { BASE: base, RECONCILIATION: reconciliation }, async () => {
+        assert.equal(executionIndexProofFor(connection, session), base);
+        assert.equal(executionIndexProofFor(connection, session, "RECONCILIATION"), reconciliation);
+        await withExecutionIndexProofs(connection, session, { BASE: { verifiedAt: base.verifiedAt } }, async () => {
+          assert.equal(executionIndexProofFor(connection, session), undefined);
+          assert.equal(executionIndexProofFor(connection, session, "RECONCILIATION"), undefined);
+        });
+        assert.equal(executionIndexProofFor(connection, session), base);
+        throw new Error("abort");
+      }), /abort/);
+    assert.equal(executionIndexProofFor(connection, session), undefined);
+  } finally { await session.endSession(); }
+});
+
 test("normal real Mongo startup with no account policy file creates approved PAPER:NSE once", async () => {
   await bootstrapNsePaperAccount(connection, ready => ensureNsePaperAccount(ready, { PAPER_CAPITAL: "200000" }));
   const account = await models.TradingAccount.findOne().orFail();
-  assert.equal(account.get("entryRiskPolicy.maxRiskPerEntryMinor"), 800000);
+  assert.equal(account.get("entryRiskPolicy.maxRiskPerEntryMinor"), 2000000);
   assert.equal(account.get("entryRiskPolicy.maxReservedRiskMinor"), 2400000);
   assert.equal(account.get("entryRiskPolicy.maxPositionSlots"), 3);
   assert.equal(account.get("entryRiskPolicy.maxDailyLossMinor"), 400000);

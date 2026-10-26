@@ -47,20 +47,23 @@ export class PaperEntryPreparationService {
     if (at > now || now - at > cadence) return { ...parsed.data, status: "WAITING", reason: "READINESS_PREPARATION_REQUIRED" };
     return parsed.data;
   }
-  async prepare(accountId: string, sessionId: string): Promise<PaperPreparation> {
+  async prepare(accountId: string, sessionId: string, validThroughMs?: number): Promise<PaperPreparation> {
+    if (validThroughMs !== undefined && !Number.isFinite(validThroughMs)) throw new Error("INVALID_REQUEST");
     await this.active(accountId, sessionId);
     const pending = this.pending.get(accountId);
     if (pending) {
       if (pending.sessionId !== sessionId) throw new Error("SESSION_CONFIG_CONFLICT");
       return pending.work;
     }
-    const work = this.attempt(accountId, sessionId);
+    const work = this.attempt(accountId, sessionId, validThroughMs);
     this.pending.set(accountId, { sessionId, work });
     try { return await work; } finally { if (this.pending.get(accountId)?.work === work) this.pending.delete(accountId); }
   }
-  private async attempt(accountId: string, sessionId: string): Promise<PaperPreparation> {
+  private async attempt(accountId: string, sessionId: string, validThroughMs?: number): Promise<PaperPreparation> {
     const previous = await this.read(accountId, sessionId);
-    if (previous && previous.reason !== "READINESS_PREPARATION_REQUIRED") return previous;
+    if (previous && previous.reason !== "READINESS_PREPARATION_REQUIRED"
+      && (validThroughMs === undefined || previous.status === "READY"
+        && Date.parse(previous.completedAt) + cadence >= validThroughMs)) return previous;
     const attemptedAt = this.deps.clock().toISOString(), scope = { accountId, executionMode: "PAPER" as const };
     let status: PaperPreparation["status"] = "WAITING", reason: string | null = null;
     try {

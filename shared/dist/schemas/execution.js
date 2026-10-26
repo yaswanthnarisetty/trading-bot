@@ -42,7 +42,7 @@ exports.executionScopeSchema = zod_1.z.object({
 });
 exports.tradingEventTypeSchema = zod_1.z.enum([
     "SIGNAL_CREATED", "INTENT_CREATED", "RISK_BLOCKED", "RISK_RESERVED", "ENTRY_RISK_COMMITTED",
-    "DAILY_PNL_UPDATED", "TRADING_DAY_ADVANCED", "KILL_SWITCH_ENABLED", "KILL_SWITCH_DISABLED", "ENTRY_RISK_SETTLED",
+    "DAILY_PNL_UPDATED", "TRADING_DAY_ADVANCED", "KILL_SWITCH_ENABLED", "KILL_SWITCH_DISABLED", "ENTRY_RISK_SETTLED", "RISK_POLICY_UPDATED",
     "SUBMISSION_CLAIMED", "ORDER_SUBMITTED", "ORDER_ACKNOWLEDGED",
     "ORDER_READY", "ORDER_FINALITY_CONFIRMED", "INTENT_COMPLETED", "RESERVATION_CONSUMED",
     "ORDER_OUTCOME_UNKNOWN", "ORDER_REJECTED", "ORDER_CANCEL_REQUESTED", "ORDER_CANCELLED",
@@ -64,6 +64,9 @@ exports.eventPayloadSchema = zod_1.z.discriminatedUnion("kind", [
     zod_1.z.object({ kind: zod_1.z.literal("TRADING_DAY"), from: exports.tradingDateSchema.nullable(), to: exports.tradingDateSchema,
         realizedPnlMinor: exports.moneyMinorSchema }).strict(),
     zod_1.z.object({ kind: zod_1.z.literal("KILL_SWITCH"), commandId: exports.identifierSchema, enabled: zod_1.z.boolean(), reason: exports.identifierSchema }).strict(),
+    zod_1.z.object({ kind: zod_1.z.literal("RISK_POLICY"), commandId: exports.identifierSchema,
+        fromVersion: exports.quantityUnitsSchema, toVersion: exports.quantityUnitsSchema,
+        fromMaxRiskPerEntryMinor: exports.nonnegativeMoneyMinorSchema, toMaxRiskPerEntryMinor: exports.nonnegativeMoneyMinorSchema }).strict(),
     zod_1.z.object({ kind: zod_1.z.literal("RISK_SETTLEMENT"), positionId: exports.identifierSchema, reservationId: exports.identifierSchema,
         pendingReleasedMinor: exports.nonnegativeMoneyMinorSchema, committedReleasedMinor: exports.nonnegativeMoneyMinorSchema,
         reservedSlotsReleased: exports.quantityUnitsSchema, committedSlotsReleased: exports.quantityUnitsSchema }).strict(),
@@ -106,7 +109,8 @@ exports.tradingEventSchema = zod_1.z.object({
         ctx.addIssue({ code: "custom", message: "Invalid execution scope" });
     }
     const kinds = { DAILY_PNL_UPDATED: "DAILY_PNL", TRADING_DAY_ADVANCED: "TRADING_DAY",
-        KILL_SWITCH_ENABLED: "KILL_SWITCH", KILL_SWITCH_DISABLED: "KILL_SWITCH", ENTRY_RISK_SETTLED: "RISK_SETTLEMENT" };
+        KILL_SWITCH_ENABLED: "KILL_SWITCH", KILL_SWITCH_DISABLED: "KILL_SWITCH", ENTRY_RISK_SETTLED: "RISK_SETTLEMENT",
+        RISK_POLICY_UPDATED: "RISK_POLICY" };
     if (kinds[event.eventType] && (event.payload.kind !== kinds[event.eventType]
         || event.aggregateType !== (event.eventType === "ENTRY_RISK_SETTLED" ? "RiskReservation" : "TradingAccount")))
         ctx.addIssue({ code: "custom", message: "Risk control event requires its typed payload and aggregate" });

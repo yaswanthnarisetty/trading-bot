@@ -5,6 +5,21 @@ import type { PaperSessionConfig } from "../domain/paperOrchestration";
 import type { PaperMarketProvider } from "./PaperEntryOrchestrator";
 import type { KiteIndexDataService } from "./KiteIndexDataService";
 import type { KiteMarketDataService } from "./KiteMarketDataService";
+
+const FIVE_MINUTES_MS = 300_000;
+const INDEX_LOOKBACK_MS = 7 * 86_400_000;
+
+/** End the history request at the next bar boundary. Kite treats `to` as an
+ * exclusive boundary, so ending at the last completed bar's start omits it.
+ * The history reader discards any still-forming bar if a broker includes it. */
+export function completedIndexHistoryRange(now: Date) {
+  const at = now.getTime();
+  if (!Number.isFinite(at)) throw new Error("INVALID_REQUEST");
+  const completedThrough = Math.floor(at / FIVE_MINUTES_MS) * FIVE_MINUTES_MS;
+  return { from: new Date(completedThrough - INDEX_LOOKBACK_MS).toISOString(),
+    to: new Date(completedThrough).toISOString() };
+}
+
 /** Approved read-only service composition. MOCK requires an explicitly injected provider. */
 export class PaperMarketDataProvider implements PaperMarketProvider {
   constructor(private readonly index:KiteIndexDataService, private readonly options:KiteMarketDataService,
@@ -31,7 +46,15 @@ export class PaperMarketDataProvider implements PaperMarketProvider {
     if(c.dataMode!=="KITE_REAL")throw new Error("MOCK_PROVIDER_REQUIRED");
     if(this.session.getMode()!==c.dataMode)throw new Error("DATA_MODE_REQUIRED");
     if(!this.session.status().tokenValid)throw new Error("KITE_SESSION_REQUIRED");
-    await Promise.all([this.options.refreshMaster(),this.index.refreshMaster()]);
+    // Readiness runs before every cycle. Replacing healthy intraday masters here
+    // would also discard the uninterrupted live candle needed by that cycle.
+    let currentMasters = false;
+    try {
+      currentMasters = this.options.activeMaster().provenance.sourceFingerprint
+        === this.index.activeMaster().provenance.sourceFingerprint;
+    } catch { /* Missing or day-stale master: refresh both from the same Kite session. */ }
+    if (!currentMasters) await Promise.all([this.options.refreshMaster(),this.index.refreshMaster()]);
+    this.index.enableRealtimeCandles(this.index.activeMaster().resolve(c.asset));
     await this.checkReadiness(c);
   }
   async checkReadiness(c:Readonly<PaperSessionConfig>) {
@@ -43,8 +66,11 @@ export class PaperMarketDataProvider implements PaperMarketProvider {
   async capture(c:Readonly<PaperSessionConfig>) {
     this.assertCurrent(c);
     const master=this.options.activeMaster(), index=this.index.activeMaster().resolve(c.asset), expiry=this.expiry(c);
-    const end=Math.floor(this.clock().getTime()/1000)*1000;
-    const history=await this.index.getHistoricalCandles({index,interval:"5minute",from:new Date(end-7*86400000).toISOString(),to:new Date(end).toISOString()});
+    this.index.enableRealtimeCandles(index);
+    const range = completedIndexHistoryRange(this.clock());
+    const history=await this.index.getHistoricalCandles({index,interval:"5minute",...range,realtime:true});
+    // Fetch the reference quote after history so its 30-second exchange proof
+    // has as much life as possible through both AI calls and final admission.
     const quote=await this.index.getQuote(index,c.maxAgeMs);
     const queries=[...verticalContractQueries(quote.priceMinor,"BULLISH",c.strategyConfig),...verticalContractQueries(quote.priceMinor,"BEARISH",c.strategyConfig)];
     const instruments=master.instruments.filter(i=>c.strategyConfig.strategyFamily==="LONG_OPTION"

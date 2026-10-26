@@ -1,6 +1,6 @@
-/** No flag, credential or environment variable can enable Delta in Phase 2A. */
+/** No flag, credential or environment variable can enable the legacy Delta path. */
 export function rejectDeltaExecution(): never {
-  throw new Error("DELTA_EXECUTION_DISABLED: NSE execution foundation only");
+  throw new Error("DELTA_EXECUTION_DISABLED: broker-fill ledger and protected exits required");
 }
 
 /** Void signature keeps legacy code typechecked while the runtime boundary always throws. */

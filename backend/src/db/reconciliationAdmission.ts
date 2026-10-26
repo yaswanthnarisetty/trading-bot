@@ -1,4 +1,4 @@
-import { assertExecutionIndexes } from "./executionIndexes";
+import { assertExecutionIndexes, hasVerifiedExecutionIndexes, type VerifiedExecutionIndexes } from "./executionIndexes";
 import type { ClientSession, Connection } from "mongoose";
 import type { ExecutionScope } from "@trading-bot/shared";
 import { reconciliationConfigSchema, reconciliationStateSchema } from "../domain/reconciliation";
@@ -13,9 +13,10 @@ export function assertCurrentRecoveryHost(account: Record<string, unknown>, host
   const current = requireExecutionHost(host), recovery = recoveryStateSchema.safeParse(account.recoveryState);
   if (!recovery.success || recovery.data.startupId !== current.startupId) throw new EntryRiskError("RECOVERY_REQUIRED");
 }
-export async function assertAccountReconciliationIndexes(connection: Connection, account: Record<string, unknown>) {
+export async function assertAccountReconciliationIndexes(connection: Connection, account: Record<string, unknown>,
+  proof?: VerifiedExecutionIndexes) {
   if (account.reconciliationConfig !== undefined || account.reconciliationState !== undefined || account.recoveryState !== undefined)
-    await assertExecutionIndexes(connection, "RECONCILIATION");
+    return hasVerifiedExecutionIndexes(connection, proof, "RECONCILIATION") ? proof : assertExecutionIndexes(connection, "RECONCILIATION");
 }
 /** Absence of opt-in preserves approved Phase 2 PAPER behavior. Once configured,
  * absent/invalid state or missing durable audit proof fails closed. */
@@ -34,8 +35,9 @@ export async function currentMatchedReconciliation(connection: Connection, sessi
   return event ? { recordId: String(record.recordId), report: parsed.data } : null;
 }
 
-export async function reconciliationAdmissionHealthy(connection: Connection, session: ClientSession, scope: ExecutionScope, account: Record<string, unknown>) {
-  await assertAccountReconciliationIndexes(connection, account);
+export async function reconciliationAdmissionHealthy(connection: Connection, session: ClientSession, scope: ExecutionScope, account: Record<string, unknown>,
+  indexProof?: VerifiedExecutionIndexes) {
+  await assertAccountReconciliationIndexes(connection, account, indexProof);
   // Canonical NSE PAPER bootstrap may precede Kite login. Its unbound state is
   // never the legacy reconciliation opt-out for direct financial admission.
   if (account.reconciliationConfig === undefined) {

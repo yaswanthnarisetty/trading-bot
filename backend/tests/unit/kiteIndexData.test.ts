@@ -89,6 +89,19 @@ test("index historical candles use qualified token and preserve range/provenance
   assertQualifiedRealIndexHistory(history, index);
   assert.throws(() => assertQualifiedRealIndexHistory({ ...history }, index), /REAL_DATA_REQUIRED/);
 });
+test("live index history includes the last completed bar and excludes a forming boundary bar", async () => {
+  const f = setup(), index = (await f.service.refreshMaster()).resolve("NIFTY");
+  f.respond(() => success({ candles: [
+    ["2026-09-29T14:00:00+05:30", 24999, 25010, 24990, 25000, 123],
+    ["2026-09-29T13:55:00+05:30", 24998, 25009, 24989, 24999, 124],
+    ["2026-09-29T13:50:00+05:30", 24997, 25008, 24988, 24998, 125],
+  ] }));
+  const history = await f.service.getHistoricalCandles({ index, interval: "5minute", realtime: true,
+    from: "2026-09-29T08:15:00Z", to: "2026-09-29T08:30:00Z" });
+  assert.deepEqual(history.candles.map(c => c.timestamp),
+    ["2026-09-29T08:20:00.000Z", "2026-09-29T08:25:00.000Z"]);
+  assertQualifiedRealIndexHistory(history, index);
+});
 test("old index evidence and token reuse fail after master replacement", async () => {
   const f = setup(), old = (await f.service.refreshMaster()).resolve("NIFTY");
   f.respond(() => success({ [old.contractKey]: { instrument_token: 256265, last_price: 25000,

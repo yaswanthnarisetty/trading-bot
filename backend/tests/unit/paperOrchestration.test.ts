@@ -4,8 +4,10 @@ import http from "node:http";
 import https from "node:https";
 import { readFileSync } from "node:fs";
 import { capturePaperConfig,cycleIdentity,decisionWindow,entryCalendarBlock,safeCycleError } from "../../src/domain/paperOrchestration";
-import { PaperEvaluationScheduler } from "../../src/services/PaperEvaluationScheduler";
-import { evaluateWithPhase5LLM } from "../../src/services/Phase5LLMService";
+import { MarketDataError } from "../../src/domain/kiteMarketData";
+import { PaperEvaluationScheduler, nextEvaluationWake, nextPreparationWake } from "../../src/services/PaperEvaluationScheduler";
+import { completedIndexHistoryRange } from "../../src/services/PaperMarketDataProvider";
+import { evaluateWithPhase5LLM, revalidatePhase5Candidate } from "../../src/services/Phase5LLMService";
 import { config,evaluationTime,fakeLLM,llmConfig,mockCapture } from "../fixtures/paperOrchestration";
 const originals={h:http.request,hg:http.get,s:https.request,sg:https.get,f:fetch};let attempts=0;
 before(()=>{const block=()=>{attempts++;throw new Error("NETWORK_FORBIDDEN");};http.request=block as any;http.get=block as any;https.request=block as any;https.get=block as any;globalThis.fetch=block as any;});
@@ -20,6 +22,17 @@ test("family changes cannot evade same-bar identity",()=>assert.equal(cycleIdent
 for(const [at,reason]of [["2026-09-29T03:44:59Z","ENTRY_WINDOW_CLOSED"],["2026-09-29T09:30:00Z","ENTRY_WINDOW_CLOSED"],["2026-09-30T06:00:00Z","MARKET_CALENDAR_CLOSED"],["2026-10-03T06:00:00Z","MARKET_CALENDAR_CLOSED"],["2026-09-29T06:00:00Z",null]] as const)
  test(`IST entry calendar ${at}`,()=>assert.equal(entryCalendarBlock(config(),new Date(at)),reason));
 test("unknown exceptions cannot expose credentials",()=>assert.equal(safeCycleError(new Error("token secret mongodb://credentials")),"CYCLE_FAILED_REQUIRES_ATTENTION"));
+test("known Kite read failures retain only their safe code",()=>assert.equal(safeCycleError(new MarketDataError("HISTORICAL_DATA_UNAVAILABLE")),"HISTORICAL_DATA_UNAVAILABLE"));
+test("live index transport failure has a safe retryable reason",()=>assert.equal(safeCycleError(new Error("KITE_STREAM_UNAVAILABLE")),"KITE_STREAM_UNAVAILABLE"));
+for (const [at, completedThrough] of [
+ ["2026-10-07T07:31:17Z", "2026-10-07T07:30:00.000Z"],
+ ["2026-10-07T07:35:00Z", "2026-10-07T07:35:00.000Z"],
+] as const) test(`index history includes the latest completed 5-minute bar at ${at}`, () => {
+ const range = completedIndexHistoryRange(new Date(at));
+ assert.equal(range.to, completedThrough);
+ assert.equal(Date.parse(range.to) - Date.parse(range.from), 7 * 86_400_000);
+ assert.equal(Date.parse(range.from) % 300_000, 0);
+});
 for(const family of ["LONG_OPTION","DEBIT_VERTICAL","CREDIT_VERTICAL"] as const)test(`actual analytics + LLM + evaluator ${family}`,async()=>{
  const captured=await mockCapture();const d=await evaluateWithPhase5LLM({...captured,strategyConfig:config(family).strategyConfig,llmConfig},fakeLLM(),()=>+evaluationTime);
  assert.equal(d.action,"CANDIDATE");if(d.evidence.strategyResult.action==="CANDIDATE"){assert.equal(d.evidence.strategyResult.candidate.strategyFamily,family);assert.equal(d.evidence.strategyResult.candidate.dataMode,"MOCK");}
@@ -33,6 +46,54 @@ test("scheduler start is idempotent; stop/replacement cannot queue a stale succe
  scheduler.stop("old");scheduler.start("a","new",300000);release();await new Promise(r=>setImmediate(r));scheduler.stop("new");assert.deepEqual(called,["old","new"]);
 });
 test("scheduler error is isolated",async()=>{let errors=0;const s=new PaperEvaluationScheduler(async()=>{throw new Error("offline");},()=>errors++);s.start("a","s",300000);await new Promise(r=>setImmediate(r));s.stop("s");assert.equal(errors,1);});
+test("scheduler wakes after broker bar boundaries without inheriting slow-cycle drift",()=>{
+ assert.equal(nextEvaluationWake(Date.parse("2026-10-07T08:17:31Z"),300000),Date.parse("2026-10-07T08:20:45Z"));
+ assert.equal(nextEvaluationWake(Date.parse("2026-10-07T08:20:04Z"),300000),Date.parse("2026-10-07T08:25:45Z"));
+ assert.equal(nextEvaluationWake(Date.parse("2026-10-07T08:20:05Z"),300000),Date.parse("2026-10-07T08:25:45Z"));
+});
+test("broker preparation starts three minutes before the next bar without moving the decision",()=>{
+ const now=Date.parse("2026-10-07T08:21:00Z"), targetAtMs=Date.parse("2026-10-07T08:25:45Z");
+ assert.deepEqual(nextPreparationWake(now,300000,180000),{targetAtMs,delayMs:105000});
+ assert.deepEqual(nextPreparationWake(Date.parse("2026-10-07T08:24:00Z"),300000,180000),
+   {targetAtMs,delayMs:0});
+ assert.throws(()=>nextPreparationWake(now,300000,300000),/INVALID_CADENCE/);
+});
+test("a newly started session waits until the preparation lead when the next bar is distant",async t=>{
+ const now=Date.parse("2026-10-07T08:20:30Z"), called:number[]=[];
+ t.mock.timers.enable({apis:["setTimeout"]});
+ const scheduler=new PaperEvaluationScheduler(async (_id,targetAtMs)=>{called.push(targetAtMs);},
+   ()=>{},()=>now,180000);
+ try {
+   scheduler.start("a","s",300000);
+   assert.deepEqual(called,[]);
+   t.mock.timers.tick(134999);
+   await new Promise(r=>setImmediate(r));
+   assert.deepEqual(called,[]);
+   t.mock.timers.tick(1);
+   await new Promise(r=>setImmediate(r));
+   assert.deepEqual(called,[Date.parse("2026-10-07T08:25:45Z")]);
+ } finally { scheduler.stop("s"); t.mock.timers.reset(); }
+});
+test("failed early preparation is not retried in a zero-delay loop for the same bar",async t=>{
+ const now=Date.parse("2026-10-07T08:24:00Z"), called:number[]=[];
+ t.mock.timers.enable({apis:["setTimeout"]});
+ const scheduler=new PaperEvaluationScheduler(async (_id,targetAtMs)=>{called.push(targetAtMs);},
+   ()=>{},()=>now,180000);
+ try {
+   scheduler.start("a","s",300000);
+   await new Promise(r=>setImmediate(r));
+   assert.deepEqual(called,[Date.parse("2026-10-07T08:25:45Z")]);
+   t.mock.timers.tick(0);
+   await new Promise(r=>setImmediate(r));
+   assert.equal(called.length,1);
+   t.mock.timers.tick(224999);
+   await new Promise(r=>setImmediate(r));
+   assert.equal(called.length,1);
+   t.mock.timers.tick(1);
+   await new Promise(r=>setImmediate(r));
+   assert.deepEqual(called,[Date.parse("2026-10-07T08:25:45Z"),Date.parse("2026-10-07T08:30:45Z")]);
+ } finally { scheduler.stop("s"); t.mock.timers.reset(); }
+});
 test("retired loop cannot call legacy execution",async()=>{const loop=await import("../../src/services/SignalLoopService");await assert.rejects(loop.start("x","NIFTY"),/DISABLED/);await assert.rejects(loop._runTick("x","NIFTY"),/DISABLED/);assert.equal(loop.isRunning(),false);});
 test("runtime/session wiring has no legacy entry or exit authority",()=>{
  for(const file of ["src/services/PaperEntryOrchestrator.ts","src/routes/session.ts","src/index.ts"]){const s=readFileSync(file,"utf8");assert.doesNotMatch(s,/PaperTradeService|PositionMonitorService|openPosition\(/);}
@@ -44,6 +105,25 @@ for(const family of ['LONG_OPTION','DEBIT_VERTICAL','CREDIT_VERTICAL'] as const)
  const result=await evaluateWithPhase5LLM({...captured,strategyConfig:c.strategyConfig,llmConfig},fakeLLM(),()=>+evaluationTime);
  assert.equal(result.action,'CANDIDATE',JSON.stringify(result.evidence));assert.equal(result.evidence.dataMode,'KITE_REAL');captured.assertCurrent();
  assert.ok(f.paths.every(p=>p==='/quote'||p.startsWith('/instruments/historical/')));
+});
+test('real candidate is rebuilt from a fresh same-bar quote while retaining the AI evidence',async()=>{
+ const {realProvider}=await import('../fixtures/paperOrchestration');let at=new Date(evaluationTime);
+ const f=await realProvider(()=>at),c={...config('LONG_OPTION'),dataMode:'KITE_REAL' as const};
+ await f.provider.prepare(c);const first=await f.provider.capture(c);
+ const decision=await evaluateWithPhase5LLM({...first,strategyConfig:c.strategyConfig,llmConfig},fakeLLM(),()=>+at);
+ assert.equal(decision.action,'CANDIDATE');
+ at=new Date(+at+10000);const latest=await f.provider.capture(c);
+ const renewed=revalidatePhase5Candidate(decision,first.analytics,latest.analytics,latest.evaluatedAt,c.strategyConfig,+at);
+ assert.equal(renewed.action,'CANDIDATE',JSON.stringify(renewed.evidence));
+ assert.equal(renewed.evidence.promptAnalyticsEvidenceId,decision.evidence.analyticsEvidenceId);
+ assert.notEqual(renewed.evidence.analyticsEvidenceId,decision.evidence.analyticsEvidenceId);
+ if(decision.evidence.strategyResult.action==='CANDIDATE'&&renewed.evidence.strategyResult.action==='CANDIDATE'){
+  assert.equal(renewed.evidence.strategyResult.candidate.candidateKey,decision.evidence.strategyResult.candidate.candidateKey);
+  assert.ok(Date.parse(renewed.evidence.strategyResult.candidate.evaluatedAt)>Date.parse(decision.evidence.strategyResult.candidate.evaluatedAt));
+ }
+ at=new Date(+evaluationTime+300000);const changedBar=await f.provider.capture(c);
+ const rejected=revalidatePhase5Candidate(decision,first.analytics,changedBar.analytics,changedBar.evaluatedAt,c.strategyConfig,+at);
+ assert.equal(rejected.action,'HOLD');assert.equal(rejected.evidence.reason,'MARKET_DATA_NOT_FRESH');
 });
 for(const failure of ['disconnected','mode','stale','unavailable'] as const)test(`qualified provider ${failure} never falls back`,async()=>{
  const {realProvider}=await import('../fixtures/paperOrchestration');const f=await realProvider(),c={...config(),dataMode:'KITE_REAL' as const};
@@ -73,6 +153,18 @@ test('issued real evidence expiry uses exchange evidence, not newer fetch time; 
  assert.equal(+plan.marketEvidenceExpiresAt!,+evaluationTime+20000);
  assert.doesNotThrow(()=>assertEntryTemporalAuthorization(plan,new Date(+evaluationTime+20000)));
  assert.throws(()=>assertEntryTemporalAuthorization(plan,new Date(+evaluationTime+20001)),/MARKET_EVIDENCE_EXPIRED/);
+});
+test('Kite long-option decision may survive remote admission while each quote keeps a 30-second lifetime',async()=>{
+ const {realProvider}=await import('../fixtures/paperOrchestration');const wire=await realProvider(),c={...config('LONG_OPTION'),dataMode:'KITE_REAL' as const};
+ await wire.provider.prepare(c);const captured=await wire.provider.capture(c);
+ const decision=await evaluateWithPhase5LLM({...captured,strategyConfig:c.strategyConfig,llmConfig},fakeLLM(),()=>+evaluationTime);
+ assert.equal(decision.evidence.strategyResult.action,'CANDIDATE');if(decision.evidence.strategyResult.action!=='CANDIDATE')throw new Error('fixture');
+ const candidate=decision.evidence.strategyResult.candidate;
+ const {plan}=candidateEntryPlan(candidate,new Date(+evaluationTime+120000),evaluationTime,entryCutoffAt(c,evaluationTime));
+ assert.equal(+plan.validUntil,+evaluationTime+120000);
+ assert.equal(+plan.marketEvidenceExpiresAt!,+evaluationTime+30000);
+ assert.throws(()=>assertEntryTemporalAuthorization(plan,new Date(+evaluationTime+30001)),/MARKET_EVIDENCE_EXPIRED/);
+ assert.throws(()=>candidateEntryPlan(candidate,new Date(+evaluationTime+120001),evaluationTime),/STALE_CANDIDATE/);
 });
 test('MOCK carries explicit null evidence expiry without real freshness authority; cutoff still enforced',async()=>{
  const captured=await mockCapture();assert.ok(captured.analytics.available);assert.equal(marketEvidenceExpiry(captured.analytics.snapshot),null);

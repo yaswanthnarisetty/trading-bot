@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import { identifierSchema } from "@trading-bot/shared";
-import { freeze } from "./kiteMarketData";
+import { freeze, MarketDataError } from "./kiteMarketData";
 import { validStrategyQualityConfig, type StrategyQualityConfig } from "./strategyEvaluation";
 import { NSE_FO_CALENDAR_2026 } from "../config/nseTradingCalendar";
 import { classifyNseDate, nseCalendarBlock } from "./nseTradingCalendar";
@@ -51,11 +51,15 @@ export function entryCalendarBlock(c: PaperSessionConfig, at: Date): string | nu
   return null;
 }
 export function safeCycleError(error: unknown): string {
+  // MarketDataError carries a fixed, non-secret code. Preserve it so a failed
+  // broker read can be diagnosed without exposing its raw response or token.
+  if (error instanceof MarketDataError) return error.code;
   const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
   const message = error instanceof Error ? error.message : "";
-  const allowed = ["MARKET_EVIDENCE_EXPIRED","ENTRY_CUTOFF_PASSED","PAPER_ONLY","SESSION_STOPPED","SESSION_REPLACED","SESSION_CONFIG_CONFLICT","RECOVERY_REQUIRED",
+  const allowed = ["MARKET_EVIDENCE_EXPIRED","MARKET_DATA_NOT_FRESH","QUOTE_MOVED_BEYOND_LIMIT","ENTRY_CUTOFF_PASSED","PAPER_ONLY","SESSION_STOPPED","SESSION_REPLACED","SESSION_CONFIG_CONFLICT","RECOVERY_REQUIRED",
     "RECONCILIATION_REQUIRED","ACCOUNT_NOT_READY","RISK_POLICY_REQUIRED","DATA_MODE_REQUIRED","KITE_SESSION_REQUIRED",
-    "INSTRUMENT_MASTER_STALE","QUOTE_UNAVAILABLE","STALE_MARKET_DATA","QUALIFIED_INSTRUMENT_REQUIRED",
-    "MONTHLY_METADATA_REQUIRED","MOCK_PROVIDER_REQUIRED","DECISION_CONFLICT","STALE_CANDIDATE","PAPER_INDEXES_REQUIRED"];
+    "INSTRUMENT_MASTER_STALE","QUOTE_UNAVAILABLE","STALE_MARKET_DATA","KITE_STREAM_UNAVAILABLE","QUALIFIED_INSTRUMENT_REQUIRED",
+    "MONTHLY_METADATA_REQUIRED","EXIT_CONFIG_REQUIRED","KILL_SWITCH_ACTIVE","DAILY_LOSS_LIMIT_EXCEEDED",
+    "MOCK_PROVIDER_REQUIRED","DECISION_CONFLICT","STALE_CANDIDATE","PAPER_INDEXES_REQUIRED"];
   return allowed.includes(code) ? code : allowed.includes(message) ? message : "CYCLE_FAILED_REQUIRES_ATTENTION";
 }

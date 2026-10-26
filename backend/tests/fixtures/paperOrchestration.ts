@@ -29,16 +29,25 @@ import { KiteIndexDataService, qualifyIndexMaster } from "../../src/services/Kit
 import { KiteMarketDataService } from "../../src/services/KiteMarketDataService";
 import { PaperMarketDataProvider } from "../../src/services/PaperMarketDataProvider";
 import type { KiteMarketSession } from "../../src/services/KiteSessionService";
+import type { CompletedIndexStreamBar } from "../../src/services/KiteIndexCandleStream";
+import type { QualifiedIndex } from "../../src/services/KiteIndexDataService";
 import { loadKiteOptionMaster } from "../../src/services/KiteMarketDataRuntime";
-export async function realProvider(clock:()=>Date=()=>evaluationTime, operationalDefaults = false) {
+export async function realProvider(clock:()=>Date=()=>evaluationTime, operationalDefaults = false,
+  stream?: {ensure(index:QualifiedIndex):void;completed(index:QualifiedIndex):CompletedIndexStreamBar[];stop():void}) {
   let csv="";const data=await familyFixture(value=>{csv=value;return value;});
-  const state={connected:true,mode:"KITE_REAL",ageMs:0,missing:false,exitPrices:{} as Record<string,{bidMinor:number;askMinor:number}>};
+  const state={connected:true,mode:"KITE_REAL",ageMs:0,historyLagBars:0,missing:false,exitPrices:{} as Record<string,{bidMinor:number;askMinor:number}>};
   const paths:string[]=[];
   const wire:KiteMarketSession={async get(path,params){
     paths.push(path);if(state.missing)throw new Error("fixture unavailable");
     const at=clock(),timestamp=new Date(+at-state.ageMs).toISOString();
-    if(path.startsWith('/instruments/historical/'))return{status:'success',data:{candles:data.candles.slice(0,50).map(c=>[
-      new Date(Date.parse(c.timestamp)+ +at- +evaluationTime).toISOString(),c.openMinor/100,c.highMinor/100,c.lowMinor/100,c.closeMinor/100,c.volume])}};
+    if(path.startsWith('/instruments/historical/')) {
+      // Broker five-minute bars retain aligned starts when the test clock moves by seconds.
+      const lastCompletedStart = Math.floor(+at / 300000) * 300000 - 300000 - state.historyLagBars * 300000;
+      const fixtureLastStart = Date.parse(data.candles[49]!.timestamp);
+      return {status:'success',data:{candles:data.candles.slice(0,50).map(c=>[
+        new Date(Date.parse(c.timestamp)+lastCompletedStart-fixtureLastStart).toISOString(),
+        c.openMinor/100,c.highMinor/100,c.lowMinor/100,c.closeMinor/100,c.volume])}};
+    }
     if(path!=="/quote")throw new Error('UNEXPECTED_FIXTURE_ENDPOINT');
     const values:Record<string,unknown>={};
     for(const key of params!.getAll('i')){
@@ -59,7 +68,7 @@ export async function realProvider(clock:()=>Date=()=>evaluationTime, operationa
   const options=new KiteMarketDataService(wire,()=>operationalDefaults
     ? loadKiteOptionMaster({get:async()=>csv},clock,{}) : new KiteInstrumentMasterService({getInstrumentsCsv:async()=>csv},clock,
     [{underlying:'NIFTY',expiry:'2026-10-27',sourceReference:'OFFLINE_CALENDAR'}]).load(),mode,()=>+clock());
-  const index=new KiteIndexDataService(wire,async()=>qualifyIndexMaster(csv,clock().toISOString()),mode,()=>+clock());
+  const index=new KiteIndexDataService(wire,async()=>qualifyIndexMaster(csv,clock().toISOString()),mode,()=>+clock(),stream);
   const provider=new PaperMarketDataProvider(index,options,{status:()=>({tokenValid:state.connected}),getMode:()=>state.mode},clock);
   return{provider,state,paths,index,options};
 }

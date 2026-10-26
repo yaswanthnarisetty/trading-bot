@@ -4,6 +4,7 @@ import { classifiedEntryPlanSchema, entryRiskPolicySchema } from "../domain/entr
 import { captureMonitoringConfig } from "../domain/paperMonitoring";
 import { DEFAULT_LONG_SELECTION } from "../domain/strategyEvaluation";
 import { paperHistoryModels } from "./PaperEntryOrchestrator";
+import { paperDisplayAnalyticsSchema } from "./PaperDisplayAnalytics";
 
 export const ACTIVE_POSITION_LIMIT = 1000;
 type Row = Record<string, any>;
@@ -58,13 +59,30 @@ export function projectPaperDecision(cycle: Row) {
   const primary = evidence.primary?.status === "COMPLETED" ? evidence.primary.result : null;
   const verifier = evidence.verifier?.status === "COMPLETED" ? evidence.verifier.result : null;
   const family = cycle.config?.strategyConfig?.strategyFamily;
-  return { cycleId: cycle.cycleId, evaluatedAt: iso(cycle.evaluatedAt) ?? iso(cycle.timestamp),
+  const candidate = evidence.strategyResult?.action === "CANDIDATE" ? evidence.strategyResult.candidate : null;
+  const leg = candidate?.strategyFamily === "LONG_OPTION" && Array.isArray(candidate.legs) ? candidate.legs[0] : null;
+  const instrument = leg?.instrument;
+  const strikeMinor = integer(instrument?.strikeMinor), premiumMinor = integer(leg?.priceMinor);
+  const quantityUnits = integer(leg?.quantityUnits), spotMinor = integer(cycle.displayAnalytics?.spotMinor);
+  const selectedOption = leg && ["CE", "PE"].includes(instrument?.instrumentType)
+    && strikeMinor !== null && strikeMinor > 0 && premiumMinor !== null && premiumMinor > 0
+    && quantityUnits !== null && quantityUnits > 0 && Number.isSafeInteger(premiumMinor * quantityUnits)
+    && text(instrument?.contractKey) && text(instrument?.expiry)
+    ? { contractKey: instrument.contractKey as string, type: instrument.instrumentType as "CE" | "PE",
+      strikeMinor, expiry: instrument.expiry as string, quantityUnits, premiumMinor,
+      lotRiskMinor: premiumMinor * quantityUnits,
+      spotMinor: spotMinor !== null && spotMinor > 0 ? spotMinor : null } : null;
+  return { cycleId: cycle.cycleId, sessionId: text(cycle.sessionId), evaluatedAt: iso(cycle.evaluatedAt) ?? iso(cycle.timestamp),
     direction: text(evidence.finalProposal?.direction) ?? "UNAVAILABLE",
     confidence: typeof evidence.finalProposal?.confidence === "number" ? evidence.finalProposal.confidence : null,
     outcome: text(cycle.outcome) ?? "UNAVAILABLE", candidate: evidence.strategyResult?.action === "CANDIDATE",
     family: ["LONG_OPTION", "DEBIT_VERTICAL", "CREDIT_VERTICAL"].includes(family) ? family : null,
-    strategyKind: text(evidence.strategyResult?.candidate?.strategyKind),
+    strategyKind: text(candidate?.strategyKind), selectedOption,
     reason: text(cycle.reason) ?? text(evidence.reason),
+    primary: { status: text(evidence.primary?.status) ?? "NOT_RUN",
+      direction: ["BULLISH", "BEARISH", "HOLD"].includes(primary?.direction) ? primary.direction : null,
+      confidence: typeof primary?.confidence === "number" && Number.isFinite(primary.confidence)
+        && primary.confidence >= 0 && primary.confidence <= 1 ? primary.confidence : null },
     verifier: verifier ? { status: "COMPLETED", verdict: verifier.verdict, reasonCode: verifier.reasonCode }
       : { status: text(evidence.verifier?.status) ?? "NOT_RUN", verdict: null, reasonCode: text(evidence.verifier?.reason) },
     rationale: text(primary?.rationale), blockingReason: ["REJECTED", "ATTENTION", "ERROR", "HOLD"].includes(cycle.outcome)
@@ -78,7 +96,7 @@ export async function readPaperDashboard(connection: Connection, sessionId: stri
   if (!session || !session.accountId) throw new Error("SESSION_NOT_FOUND");
   const accountId = session.accountId as string, scope = { accountId, executionMode: "PAPER" };
   const config = captureMonitoringConfig(session.config);
-  const [account, partition, cycles] = await Promise.all([
+  const [account, partition, cycles, recentCycles, displayRows] = await Promise.all([
     models.TradingAccount.findOne(scope).lean() as Promise<Row | null>,
     models.Position.aggregate([
       { $match: scope },
@@ -103,7 +121,17 @@ export async function readPaperDashboard(connection: Connection, sessionId: stri
       } },
     ]) as Promise<Row[]>,
     history.Cycle.find({ ...scope, sessionId }).sort({ timestamp: -1 }).limit(30).lean() as Promise<Row[]>,
+    history.Cycle.find({ ...scope, asset: session.asset, dataMode: "KITE_REAL" })
+      .sort({ timestamp: -1 }).limit(30).lean() as Promise<Row[]>,
+    history.Cycle.find({ ...scope, asset: session.asset, dataMode: "KITE_REAL",
+      "displayAnalytics.version": "PAPER_DISPLAY_ANALYTICS_V1" })
+      .sort({ timestamp: -1 }).limit(20).select({ displayAnalytics: 1, sessionId: 1 }).lean() as Promise<Row[]>,
   ]);
+  const displayRow = displayRows.map(row => ({ row, parsed: paperDisplayAnalyticsSchema.safeParse(row.displayAnalytics) }))
+    .find(item => item.parsed.success && text(item.row.sessionId));
+  const displayAnalytics = displayRow?.parsed.success ? {
+    ...displayRow.parsed.data, sessionId: text(displayRow.row.sessionId)!,
+  } : null;
   const activeRows: Row[] = partition[0]?.active ?? [], historyRows: Row[] = partition[0]?.history ?? [];
   const activeTruncated = activeRows.length > ACTIVE_POSITION_LIMIT;
   const positionsTruncated = historyRows.length > 200;
@@ -143,13 +171,14 @@ export async function readPaperDashboard(connection: Connection, sessionId: stri
     positions: durablePositions, positionsTruncated, activePositions, historyPositions, activeTruncated,
     attentionWorkflows: attentionWorkflows.map(p => ({positionId:p.positionId,lifecycle:p.lifecycle,
       reason:p.unknownOrders.length ? "UNKNOWN_ORDER_REQUIRES_ATTENTION" : p.exitStates[0]?.reason ?? "UNSETTLED_POSITION"})),
-    decisions: cycles.map(projectPaperDecision),
+    decisions: cycles.map(projectPaperDecision), recentDecisions: recentCycles.map(projectPaperDecision), displayAnalytics,
     exits: { status: exitMonitorActive && !activeTruncated && !attentionIds.size ? "ACTIVE" : "ATTENTION",
       active: exitMonitorActive, closeInProgress: activeTruncated ? null : activePositions.filter(p => p.closeState === "CLOSING").length,
       attentionCount: activeTruncated ? null : attentionIds.size,
       activePositionCount: activeTruncated ? null : activePositions.length,
       completeness: activeTruncated ? "TRUNCATED" : "COMPLETE" },
     risk: account ? { pendingRiskMinor: pending, committedRiskMinor: committed, capacityMinor: cap,
+      maxRiskPerEntryMinor: policy.success ? policy.data.maxRiskPerEntryMinor : null,
       availableCapacityMinor: available !== null && available >= 0n && available <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(available) : null,
       reservedSlots: totalSlots !== null && committedSlots !== null ? totalSlots - committedSlots : null,
       committedSlots, maxPositionSlots: policy.success ? policy.data.maxPositionSlots : null,

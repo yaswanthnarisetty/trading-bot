@@ -5,6 +5,7 @@ import { fail, freeze, istDate, marketTimestamp, object, priceMinor, responseDat
 import type { Freshness, HistoricalInterval } from "./KiteMarketDataService";
 import { historicalIntervals } from "./KiteMarketDataService";
 import type { KiteMarketSession, MarketDataMode } from "./KiteSessionService";
+import { KiteIndexCandleStream, type CompletedIndexStreamBar } from "./KiteIndexCandleStream";
 
 /** Broker documented index symbols; the CSV supplies the actual token and routing identity. */
 const symbols = { NIFTY: "NIFTY 50", BANKNIFTY: "NIFTY BANK", FINNIFTY: "NIFTY FIN SERVICE" } as const;
@@ -114,6 +115,10 @@ export interface IndexHistory extends IndexEvidence {
 }
 const issuedQuote = new WeakMap<object, KiteIndexDataService>();
 const issuedHistory = new WeakMap<object, KiteIndexDataService>();
+type IndexCandleStreamReader = Pick<KiteIndexCandleStream, "ensure" | "completed" | "stop">;
+const istMinute = (ms: number) => Math.floor(((ms + 19_800_000) % 86_400_000) / 60_000);
+const consecutiveBars = (previous: number, next: number) => next === previous + 300_000
+  || istDate(previous) !== istDate(next) && istMinute(previous) === 925 && istMinute(next) === 555;
 function freshness(fetchedAt: string, brokerTimestamp: string | null, now: number, maxAgeMs: number): Freshness {
   if (!Number.isSafeInteger(maxAgeMs) || maxAgeMs < 0 || !Number.isFinite(now)) return fail("INVALID_REQUEST");
   const fetchedAgeMs = now - Date.parse(fetchedAt), brokerAgeMs = brokerTimestamp === null ? null : now - Date.parse(brokerTimestamp);
@@ -138,8 +143,14 @@ export function assertQualifiedRealIndexHistory(value: unknown, index: Qualified
 export class KiteIndexDataService {
   private master: IndexMaster | null = null;
   private loading: Promise<IndexMaster> | null = null;
+  private readonly realtime: IndexCandleStreamReader | null;
   constructor(private readonly session: KiteMarketSession, private readonly load: () => Promise<IndexMaster>,
-    private readonly mode: () => MarketDataMode, private readonly clock: () => number = Date.now) {}
+    private readonly mode: () => MarketDataMode, private readonly clock: () => number = Date.now,
+    realtime?: IndexCandleStreamReader | null) {
+    this.realtime = realtime === undefined && session.streamingCredentials
+      ? new KiteIndexCandleStream(() => session.streamingCredentials!(), clock) : null;
+    if (realtime !== undefined) this.realtime = realtime;
+  }
   private real() { if (this.mode() !== "KITE_REAL") fail("DATA_MODE_REQUIRED"); }
   private checkMaster(master: IndexMaster) {
     const now = this.clock(), today = istDate(now), retrieved = Date.parse(master.provenance.retrievedAt);
@@ -151,6 +162,7 @@ export class KiteIndexDataService {
   async refreshMaster(): Promise<IndexMaster> {
     this.real();
     if (this.loading) return this.loading;
+    this.realtime?.stop();
     this.master = null;
     this.loading = this.load().then(master => { this.checkMaster(master); this.master = master; return master; })
       .finally(() => { this.loading = null; });
@@ -162,6 +174,11 @@ export class KiteIndexDataService {
     const master = this.activeMaster();
     try { if (master.resolve(index.underlying) !== index || index.provenance !== master.provenance) fail("INSTRUMENT_MASTER_STALE"); }
     catch { fail("INSTRUMENT_MASTER_STALE"); }
+  }
+  /** Start the broker's timestamped index stream; a full uninterrupted bar is required before use. */
+  enableRealtimeCandles(index: QualifiedIndex): void {
+    this.assertCurrentIndex(index);
+    this.realtime?.ensure(index);
   }
   private evidence(index: QualifiedIndex): IndexEvidence {
     return { source: "KITE", dataMode: "KITE_REAL", index, canonicalId: index.canonicalId,
@@ -192,13 +209,15 @@ export class KiteIndexDataService {
       return quote;
     } catch (error) { throw safeMarketError(error); }
   }
-  async getHistoricalCandles(input: { index: QualifiedIndex; from: string; to: string; interval: HistoricalInterval }): Promise<IndexHistory> {
+  async getHistoricalCandles(input: { index: QualifiedIndex; from: string; to: string; interval: HistoricalInterval;
+    realtime?: boolean }): Promise<IndexHistory> {
     this.assertCurrentIndex(input.index);
     if (!historicalIntervals.includes(input.interval)) return fail("INVALID_REQUEST");
     let from: string, to: string;
     try { from = marketTimestamp(input.from); to = marketTimestamp(input.to); } catch { return fail("INVALID_REQUEST"); }
     const start = Date.parse(from), end = Date.parse(to), span = 29 * 86_400_000;
-    if (start > end || end > this.clock() || end - start > 24 * span || start % 1000 || end % 1000) return fail("INVALID_REQUEST");
+    const requestedAt = this.clock();
+    if (start > end || end > requestedAt || end - start > 24 * span || start % 1000 || end % 1000) return fail("INVALID_REQUEST");
     const merged = new Map<string, IndexCandle>();
     const wireDate = (ms: number) => new Date(ms + 19_800_000).toISOString().slice(0, 19).replace("T", " ");
     try {
@@ -214,6 +233,9 @@ export class KiteIndexDataService {
           if (!Array.isArray(row) || row.length !== 6) return fail();
           const timestamp = marketTimestamp(row[0]), time = Date.parse(timestamp);
           if (time < left || time > right) return fail();
+          // A broker may include the bar that starts at the request's upper
+          // boundary. It is not complete yet and must never enter live analytics.
+          if (input.realtime && input.interval === "5minute" && time + 300_000 > requestedAt) continue;
           const candle: IndexCandle = freeze({ ...evidence, interval: input.interval, timestamp,
             openMinor: priceMinor(row[1]), highMinor: priceMinor(row[2]), lowMinor: priceMinor(row[3]),
             closeMinor: priceMinor(row[4]), volume: units(row[5]) });
@@ -228,8 +250,38 @@ export class KiteIndexDataService {
       }
       if (!merged.size) return fail("HISTORICAL_DATA_UNAVAILABLE");
       const candles = [...merged.values()].sort((a, b) => a.timestamp.localeCompare(b.timestamp));
-      const result: IndexHistory = freeze({ ...this.evidence(input.index), interval: input.interval,
+      let result: IndexHistory = freeze({ ...this.evidence(input.index), interval: input.interval,
         requestedRange: { from, to }, actualRange: { from: candles[0]!.timestamp, to: candles[candles.length - 1]!.timestamp }, candles });
+      if (input.realtime && input.interval === "5minute" && this.realtime) {
+        const live = this.realtime.completed(input.index).filter(bar => bar.startMs >= start && bar.startMs <= end)
+          .sort((a, b) => a.startMs - b.startMs);
+        const historicalLast = Date.parse(candles[candles.length - 1]!.timestamp);
+        if (live.length && live[live.length - 1]!.startMs >= historicalLast) {
+          // A reconnect can leave a gap in old streamed bars. Use the longest
+          // contiguous suffix that joins broker history, never fill a missing bar.
+          let suffix: CompletedIndexStreamBar[] = [];
+          let prefix: IndexCandle[] = [];
+          for (let i = 0; i < live.length; i++) {
+            const candidate = live.slice(i), before = candles.filter(candle => Date.parse(candle.timestamp) < candidate[0]!.startMs);
+            const preceding = before[before.length - 1];
+            if (!preceding || !consecutiveBars(Date.parse(preceding.timestamp), candidate[0]!.startMs)
+              || !candidate.every((bar, n) => n === 0 || consecutiveBars(candidate[n - 1]!.startMs, bar.startMs))) continue;
+            suffix = candidate;
+            prefix = before;
+            break;
+          }
+          if (suffix.length) {
+            const appended = suffix.map(bar => freeze({ ...this.evidence(input.index), interval: "5minute" as const,
+              timestamp: new Date(bar.startMs).toISOString(), openMinor: bar.openMinor,
+              highMinor: bar.highMinor, lowMinor: bar.lowMinor, closeMinor: bar.closeMinor,
+              volume: bar.volume }));
+            const combined = [...prefix, ...appended];
+            result = freeze({ ...this.evidence(input.index), interval: input.interval,
+              requestedRange: { from, to }, actualRange: { from: combined[0]!.timestamp,
+                to: combined[combined.length - 1]!.timestamp }, candles: combined });
+          }
+        }
+      }
       issuedHistory.set(result, this);
       return result;
     } catch (error) { throw safeMarketError(error); }

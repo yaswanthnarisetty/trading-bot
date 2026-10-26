@@ -16,7 +16,7 @@ const ClaimSchema = new Schema({
   claimId: { ...idField(), immutable: false }, reservationId: { ...idField(), immutable: false }, evidenceRef: { ...idField(), immutable: false },
   policyVersion: unitsField(), executionEpoch: unitsField(),
   claimedAt: { type: Date, required: true }, expiresAt: { type: Date, required: true },
-  request: { type: Schema.Types.Mixed }, requestFingerprint: { type: String },
+  request: { type: Schema.Types.Mixed }, requestFingerprint: { type: String }, quoteRenewal: { type: Schema.Types.Mixed },
 }, { _id: false, strict: "throw" });
 export const BrokerOrderSchema = executionSchema({
   orderId: idField(), positionId: idField(), intentId: idField(), legId: idField(), sliceId: idField(),

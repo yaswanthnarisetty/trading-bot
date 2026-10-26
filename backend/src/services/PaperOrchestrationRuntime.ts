@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import mongoose from "mongoose";
 import { createExecutionHostContext } from "../domain/ExecutionHostContext";
-import { capturePaperConfig } from "../domain/paperOrchestration";
+import { capturePaperConfig, safeCycleError } from "../domain/paperOrchestration";
 import { PaperEntryOrchestrator } from "./PaperEntryOrchestrator";
 import { PaperEvaluationScheduler } from "./PaperEvaluationScheduler";
 import { PaperMarketDataProvider } from "./PaperMarketDataProvider";
@@ -44,17 +44,35 @@ export const paperOrchestrator=new PaperEntryOrchestrator(mongoose.connection,{
   transport:phase5OpenAITransport(),llmConfig:phase5LegacyCompatibleConfig,
   broker:paperBrokerFor,
 });
-export const paperScheduler=new PaperEvaluationScheduler(async id=>{
+export const paperScheduler=new PaperEvaluationScheduler(async (id,targetAtMs)=>{
+  const hold = async (reason:string) => paperOrchestrator.history.Session.updateOne(
+    {sessionId:id,startupId:paperExecutionHost.startupId,status:"RUNNING"},
+    {$set:{lastCycleAt:new Date(),lastCycleOutcome:"HOLD",blockingReason:reason}});
   const row = await paperOrchestrator.active(id), session = row.toObject();
-  const readiness = await paperSessionReadiness(session, true);
+  // Reconciliation and market readiness may take over a minute. Complete them
+  // ahead of the bar; a receipt that expires before evaluation is refreshed.
+  const readiness = await paperSessionReadiness(session, true, targetAtMs);
   if (!readiness.entryReady) {
-    await paperOrchestrator.history.Session.updateOne({sessionId:id,startupId:paperExecutionHost.startupId,status:"RUNNING"},
-      {$set:{lastCycleAt:new Date(),lastCycleOutcome:"HOLD",blockingReason:readiness.entryBlockingReason}});
+    await hold(readiness.entryBlockingReason ?? "READINESS_PREPARATION_REQUIRED");
     return readiness;
   }
-  return paperOrchestrator.runEvaluationCycle(id);
+  const remaining = targetAtMs - Date.now();
+  if (remaining < 0) { await hold("READINESS_PREPARATION_REQUIRED"); return; }
+  if (remaining) await new Promise<void>(resolve => setTimeout(resolve, remaining));
+  try {
+    await paperOrchestrator.active(id);
+    const receipt = await paperEntryPreparation.read(session.accountId, id);
+    if (!receipt || receipt.status !== "READY") {
+      await hold(receipt?.reason ?? "READINESS_PREPARATION_REQUIRED");
+      return;
+    }
+    // Final financial, calendar, session and market checks remain inside the
+    // orchestrator and risk admission. Recheck kill/loss and exit policy here.
+    await accountEntryGate(session.accountId, session.asset);
+    return paperOrchestrator.runEvaluationCycle(id);
+  } catch (error) { await hold(safeCycleError(error)); }
 },
-  sessionId=>logger.warn("PAPER evaluation failed",{sessionId,reason:"CYCLE_FAILED"}));
+  sessionId=>logger.warn("PAPER evaluation failed",{sessionId,reason:"CYCLE_FAILED"}),Date.now,180_000);
 export async function paperConfigurations(){
   const file=process.env.NSE_PAPER_CONFIG_FILE;
   if(!file)return [];
@@ -79,7 +97,7 @@ export const paperEntryPreparation = new PaperEntryPreparationService(mongoose.c
 /** Compatibility/admin operation uses the same exact running-session preparation. */
 export async function recoverPaperAccount(configId: string, expectedAccountId?: string) {
   const config = (await paperConfigurations()).find(c => c.configId === configId)
-    ?? (!process.env.NSE_PAPER_CONFIG_FILE && configId === "NIFTY_PAPER_DEFAULT_V1" ? await paperDefaultSession.config("NIFTY") : undefined);
+    ?? (!process.env.NSE_PAPER_CONFIG_FILE && configId === "NIFTY_PAPER_DEFAULT_V2" ? await paperDefaultSession.config("NIFTY") : undefined);
   if (!config) throw new Error("INVALID_PAPER_CONFIG");
   if (expectedAccountId && config.accountId !== expectedAccountId) throw new Error("SESSION_CONFIG_CONFLICT");
   const session = await paperOrchestrator.activeForAccount(config.accountId) as Record<string, any> | null;
@@ -103,14 +121,15 @@ async function accountEntryGate(accountId: string, asset: string) {
 
 /** GET uses prepare=false: no recovery, reconciliation or financial writes.
  * Explicit Start / scheduler may invoke the existing audited recovery workflow. */
-export async function paperSessionReadiness(session: Record<string, any>, prepare = false): Promise<PaperEntryReadiness> {
+export async function paperSessionReadiness(session: Record<string, any>, prepare = false,
+  validThroughMs?: number): Promise<PaperEntryReadiness> {
   const readiness = await evaluatePaperReadiness({sessionId:String(session.sessionId),config:session.config}, {
     clock: () => new Date(), active: id => paperOrchestrator.active(id),
     calendar: now => classifyNseDate(nseLocalDate(now)),
-    preparation: (accountId, sessionId, mutate) => mutate ? paperEntryPreparation.prepare(accountId, sessionId) : paperEntryPreparation.read(accountId, sessionId),
+    preparation: (accountId, sessionId, mutate) => mutate ? paperEntryPreparation.prepare(accountId, sessionId, validThroughMs) : paperEntryPreparation.read(accountId, sessionId),
     connected: () => kiteSession.status().tokenValid, mode: () => kiteSession.getMode(),
     entryConfig: config => paperOrchestrator.entryConfiguration(config), accountGate: accountId => accountEntryGate(accountId, session.config.asset),
-    assertReady: config => paperOrchestrator.assertReady(config), recover: config => recoverPaperAccount(config.configId, config.accountId),
+    assertReady: async config => { await paperOrchestrator.assertReady(config); }, recover: config => recoverPaperAccount(config.configId, config.accountId),
     market: async (config, refresh) => {
       return refresh ? paperMarket.prepare(config) : paperMarket.checkReadiness(config);
     },

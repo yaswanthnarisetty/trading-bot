@@ -22,6 +22,8 @@ import { MonitoringSessionModel } from "./models/MonitoringSession";
 import { paperOrchestrator, paperExitMonitor, paperExitScheduler } from "./services/PaperOrchestrationRuntime";
 import { bootstrapNsePaperAccount } from "./db/nsePaperStartup";
 import mongoose from "mongoose";
+import { recoverBtcDemoIntents } from "./services/BtcDemoExecutionService";
+import { startBtcDemoAutoScheduler } from "./services/BtcDemoAutoService";
 
 /**
  * Creates and configures the core Express application instance.
@@ -77,6 +79,17 @@ async function bootstrap(): Promise<void> {
 
   await connectWithRetry();
   await createIndexes();
+  // Recovery observes broker order/fill/position evidence only. An uncertain
+  // submission is never sent a second time after restart.
+  await recoverBtcDemoIntents().catch(error => logger.error("BTC Demo recovery unavailable", { error }));
+  let btcRecoveryRunning = false;
+  const btcRecoveryTimer = setInterval(() => {
+    if (btcRecoveryRunning) return;
+    btcRecoveryRunning = true;
+    void recoverBtcDemoIntents().catch(error => logger.error("BTC Demo recovery unavailable", { error }))
+      .finally(() => { btcRecoveryRunning = false; });
+  }, 15_000);
+  btcRecoveryTimer.unref();
   await bootstrapNsePaperAccount(mongoose.connection);
 
   await paperOrchestrator.initialize();
@@ -92,6 +105,7 @@ async function bootstrap(): Promise<void> {
   WebSocketService.init(server);
 
   server.listen(port, () => {
+    startBtcDemoAutoScheduler();
     logger.info("Backend server started", {
       port,
       phase,

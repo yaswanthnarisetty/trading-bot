@@ -1,6 +1,7 @@
 import { closeDependencyRefs } from "../domain/closeWorkflowEvidence";
 import { exitClaimPermitted } from "./paperExitStore";
 import { assertEntryTemporalAuthorization } from "../domain/entryRisk";
+import { assertEntryQuoteRenewal, entryQuoteRenewalFor } from "./entryQuoteRenewal";
 import { entryCutoffAt } from "../domain/paperOrchestration";
 import { fencePaperSession } from "./paperSessionFence";
 import { candidateWriteAllowed } from "./candidateWrite";
@@ -20,7 +21,8 @@ interface WriteDocument {
 import { z } from "zod";
 import { executionScopeSchema, type ExecutionScope } from "@trading-bot/shared";
 import { requireExecutionTransaction } from "./executionReadiness";
-import { assertExecutionIndexes } from "./executionIndexes";
+import { assertExecutionIndexes, clearExecutionAccountFence, executionAccountFenceFor,
+  executionIndexProofFor, rememberExecutionAccountFence } from "./executionIndexes";
 import { brokerOrderRequestSchema } from "../brokers/BrokerAdapter";
 import { submissionFingerprint, validateSubmissionEvidence } from "../brokers/submissionEvidence";
 import { fillAccounting, type AccountingFill } from "../domain/fillAccounting";
@@ -65,7 +67,7 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
   const session = doc.$session();
   requireExecutionTransaction(connection, session ?? undefined);
   if (!session) throw new Error("PERSISTENCE_NOT_READY");
-  await assertExecutionIndexes(connection);
+  if (!executionIndexProofFor(connection, session)) await assertExecutionIndexes(connection);
   await doc.validate();
   const data: RecordData = doc.toObject();
   const scope = executionScopeSchema.parse({ accountId: data.accountId, executionMode: data.executionMode });
@@ -77,10 +79,14 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
     return record;
   };
   const name = doc.collection.collectionName;
+  const accountFenceKey = `${scope.executionMode}:${scope.accountId}`;
+  const reconciliationProof = executionIndexProofFor(connection, session, "RECONCILIATION");
   if (name === "execution_accounts") {
+    // An account save changes the snapshot used by later chain validators.
+    clearExecutionAccountFence(connection, session, accountFenceKey);
     const previous = await db.collection(name).findOne(scope, { session });
-    await assertAccountReconciliationIndexes(connection, data);
-    if (previous) await assertAccountReconciliationIndexes(connection, previous);
+    await assertAccountReconciliationIndexes(connection, data, reconciliationProof);
+    if (previous) await assertAccountReconciliationIndexes(connection, previous, reconciliationProof);
     if (previous?.reconciliationConfig && canonical(previous.reconciliationConfig) !== canonical(data.reconciliationConfig)) throw new Error("RECONCILIATION_CONFIG_IMMUTABLE");
     if (canonical(previous?.reconciliationState) !== canonical(data.reconciliationState) && !reconciliationWriteAllowed(session))
       throw new Error("AUDITED_RECONCILIATION_SERVICE_REQUIRED");
@@ -95,16 +101,24 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
     if (!previous && (data.killSwitchEnabled || data.killSwitchCommand)) throw new Error("AUDITED_KILL_SERVICE_REQUIRED");
     return;
   }
-  const account = await find("execution_accounts", "accountId", scope.accountId);
-  await assertAccountReconciliationIndexes(connection, account);
+  const fencedAccount = executionAccountFenceFor(connection, session, accountFenceKey);
+  const account = fencedAccount ?? await find("execution_accounts", "accountId", scope.accountId);
+  await assertAccountReconciliationIndexes(connection, account, reconciliationProof);
   if (["execution_reconciliations", "execution_reconciliation_links"].includes(name))
-    await assertExecutionIndexes(connection, "RECONCILIATION");
+    if (!reconciliationProof) await assertExecutionIndexes(connection, "RECONCILIATION");
   if (units(account, "version") === Number.MAX_SAFE_INTEGER) throw new Error("CAS_VERSION_EXHAUSTED");
   // All chain writes contend on the account version. Snapshot reads alone permit
   // write skew (e.g. a new fill racing closure); this CAS makes one transaction retry.
-  const fenced = await db.collection("execution_accounts").updateOne({ ...scope, version: account.version },
-    { $inc: { version: 1 } }, { session });
-  if (fenced.matchedCount !== 1) throw new Error("CAS_CONFLICT: account write fence");
+  if (!fencedAccount) {
+    const fenced = await db.collection("execution_accounts").updateOne({ ...scope, version: account.version },
+      { $inc: { version: 1 } }, { session });
+    if (fenced.matchedCount !== 1) throw new Error("CAS_CONFLICT: account write fence");
+    // The transaction now owns the account write conflict. Subsequent saves in
+    // this transaction see the same account terms unless an audited account
+    // save invalidates this snapshot above.
+    rememberExecutionAccountFence(connection, session, accountFenceKey,
+      { ...account, version: units(account, "version") + 1 });
+  }
   const intentFor = (id: unknown) => find("execution_intents", "intentId", id);
   const positionFor = (id: unknown) => find("execution_positions", "positionId", id);
   const checkIntentPosition = (intent: RecordData, position: RecordData) => {
@@ -186,7 +200,7 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
       equal(scope.executionMode, "PAPER", "entry reservation mode");
       const { requirement, admission: snapshot } = await verifyEntryRiskLedger(connection, session, scope, data, intent, position);
       if (doc.isNew) {
-        if (!await reconciliationAdmissionHealthy(connection, session, scope, account)) throw new Error("RECONCILIATION_REQUIRED");
+        if (!await reconciliationAdmissionHealthy(connection, session, scope, account, reconciliationProof)) throw new Error("RECONCILIATION_REQUIRED");
         const policy = entryRiskPolicySchema.safeParse(account.entryRiskPolicy);
         riskAssert(policy.success && policy.data.policyVersion === account.policyVersion, "RISK_POLICY_REQUIRED");
         riskAssert(account.admissionStatus === "PAPER_READY" && account.broker === "PAPER", "ACCOUNT_NOT_READY");
@@ -235,8 +249,14 @@ export async function validateExecutionWrite(doc: WriteDocument): Promise<void> 
         const cycle = await fencePaperSession(connection, session, scope.accountId, signal.orchestration);
         equal((intent.entryPlan as any)?.entryCutoffAt?.getTime(), entryCutoffAt(cycle.config, new Date(cycle.timestamp)).getTime(), "claim entry cutoff");
       }
-      assertEntryTemporalAuthorization(intent.entryPlan, new Date((data.submissionClaim as { claimedAt: Date }).claimedAt));
-      if (!await reconciliationAdmissionHealthy(connection, session, scope, account)) throw new Error("RECONCILIATION_REQUIRED");
+      const claim = data.submissionClaim as { claimedAt: Date; quoteRenewal?: unknown };
+      if (claim.quoteRenewal !== undefined) {
+        const issued = entryQuoteRenewalFor(session);
+        if (!issued || JSON.stringify(claim.quoteRenewal) !== JSON.stringify(issued)) throw new Error("MARKET_EVIDENCE_EXPIRED");
+        assertEntryQuoteRenewal(issued, intent.entryPlan, { contractKey: text(data, "contractKey"),
+          limitPriceMinor: units(data, "limitPriceMinor"), side: text(data, "side") }, new Date(claim.claimedAt));
+      } else assertEntryTemporalAuthorization(intent.entryPlan, new Date(claim.claimedAt));
+      if (!await reconciliationAdmissionHealthy(connection, session, scope, account, reconciliationProof)) throw new Error("RECONCILIATION_REQUIRED");
       if (account.killSwitchEnabled) throw new Error("KILL_SWITCH_ACTIVE");
       equal(previous?.phase, "READY", "ENTRY admission requires an existing READY child");
       if (!data.submissionAuthorization) throw new Error("ENTRY_ADMISSION_REQUIRED");

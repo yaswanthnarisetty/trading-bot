@@ -91,10 +91,17 @@ Concurrent Fill, admission, control and settlement writers contend on the existi
 account CAS fence and use snapshot/majority transactions. No broker call is retried
 inside these transactions.
 
+## Proven never-submitted entries
+
+An expired PAPER entry may release its reserved risk only when every owned child is
+unclaimed, has no broker ID or outcome, is KNOWN with zero fills, and is marked
+NOT_SENT in the same snapshot/majority transaction. The entry intent and empty
+position become ABORTED; the release retains an immutable settlement proof and
+ENTRY_RISK_SETTLED audit event. Capacity reads recheck the complete order/Fill
+chain and the event. A merely rejected or expired quote does not itself free risk.
+
 ## Conservative deferrals
 
-Zero-fill REJECTED/NOT_SENT entries remain held: this service only accepts the complete
-successful-CLOSED workflow; no new ABORTED/non-execution workflow is introduced.
 Ambiguous submission, unsettled cancellation and executable partial-entry remainder
 never release risk. An entry remainder must first become conclusively impossible under
 the existing finality model, and the actual acquired units must close conclusively.

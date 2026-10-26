@@ -8,7 +8,9 @@ import { checkTransactionCapability } from "../db/executionReadiness";
 import { entryRiskPolicySchema } from "../domain/entryRisk";
 import { tradingCalendarSchema } from "../domain/realizedRisk";
 import { reconciliationConfigSchema } from "../domain/reconciliation";
-import { NSE_PAPER_POLICY_V1 } from "../config/nsePaperPolicy";
+import { NSE_PAPER_POLICY_V2, NSE_PAPER_POLICY_V3 } from "../config/nsePaperPolicy";
+import { assertAccountEntryProjection, loadAccountEntryProjection } from "../db/entryRiskProjection";
+import { riskAudit, saveRisk } from "./riskAudit";
 
 export const NSE_PAPER_ACCOUNT_ID = "PAPER:NSE";
 const scope = { accountId: NSE_PAPER_ACCOUNT_ID, executionMode: "PAPER" } as const;
@@ -46,7 +48,7 @@ function assertCanonical(accounts: readonly Record<string, any>[], capitalMinor:
 export async function ensureNsePaperAccount(connection: Connection, env: NodeJS.ProcessEnv = process.env,
   readProvisioning: (path: string) => Promise<string> = path => readFile(path, "utf8")): Promise<void> {
   const capitalMinor = paperCapitalMinor(env.PAPER_CAPITAL);
-  if (capitalMinor !== NSE_PAPER_POLICY_V1.initialCapitalMinor) throw new Error("PAPER_CAPITAL_POLICY_V1_MISMATCH");
+  if (capitalMinor !== NSE_PAPER_POLICY_V3.initialCapitalMinor) throw new Error("PAPER_CAPITAL_POLICY_V3_MISMATCH");
   if (connection.readyState !== 1) throw new Error("PERSISTENCE_NOT_READY");
   const models = executionModels(connection);
   const findCanonical = () => models.TradingAccount.find({ accountId: NSE_PAPER_ACCOUNT_ID }).limit(2).lean<Record<string, any>[]>();
@@ -61,7 +63,7 @@ export async function ensureNsePaperAccount(connection: Connection, env: NodeJS.
     try { parsed = provisioningSchema.parse(JSON.parse(await readProvisioning(path))); }
     catch { throw new Error("PAPER_ACCOUNT_POLICY_INVALID"); }
   }
-  const configured = parsed ?? NSE_PAPER_POLICY_V1;
+  const configured = parsed ?? NSE_PAPER_POLICY_V3;
   const policy = entryRiskPolicySchema.parse(configured.entryRiskPolicy);
   if (policy.maxReservedRiskMinor > capitalMinor || policy.maxRiskPerEntryMinor > policy.maxReservedRiskMinor
     || policy.maxDailyLossMinor! > capitalMinor) throw new Error("PAPER_ACCOUNT_POLICY_INVALID");
@@ -118,6 +120,43 @@ export async function bindNsePaperKiteIdentity(connection: Connection, verifiedB
         kind: "PAPER_KITE_SHADOW_V1", scope: "REFERENCE_ONLY", brokerAccountId,
       }));
       await account.save({ session });
+    }, { readConcern: { level: "snapshot" }, writeConcern: { w: "majority" } });
+  } finally { await session.endSession(); }
+}
+
+/** Explicit, audited upgrade of an idle existing PAPER:NSE account to the approved V3 policy. */
+export async function upgradeNsePaperRiskPolicy(connection: Connection): Promise<"UPDATED" | "CURRENT"> {
+  await assertExecutionIndexes(connection, "ALL");
+  if (!(await checkTransactionCapability(connection)).supported) throw new Error("PERSISTENCE_NOT_READY");
+  const models = executionModels(connection), session = await connection.startSession();
+  try {
+    return await session.withTransaction(async () => {
+      const account = await models.TradingAccount.findOne(scope).session(session).orFail();
+      if (account.get("broker") !== "PAPER" || account.get("currency") !== "INR"
+        || account.get("initialCapitalMinor") !== NSE_PAPER_POLICY_V3.initialCapitalMinor) throw new Error("PAPER_ACCOUNT_CONFLICT");
+      const current = entryRiskPolicySchema.parse(account.get("entryRiskPolicy"));
+      if (account.get("policyVersion") === 3 && JSON.stringify(current) === JSON.stringify(NSE_PAPER_POLICY_V3.entryRiskPolicy))
+        return "CURRENT";
+      if (account.get("policyVersion") !== 2 || JSON.stringify(current) !== JSON.stringify(NSE_PAPER_POLICY_V2.entryRiskPolicy))
+        throw new Error("PAPER_ACCOUNT_POLICY_CONFLICT");
+      assertAccountEntryProjection(account.toObject(), await loadAccountEntryProjection(connection, session, scope));
+      if (account.get("reservedExposureMinor") !== 0 || account.get("committedExposureMinor") !== 0
+        || account.get("positionSlots") !== 0 || account.get("committedPositionSlots") !== 0
+        || await models.RiskReservation.exists({ ...scope, state: { $in: ["HELD", "PARTIALLY_CONSUMED"] } }).session(session))
+        throw new Error("PAPER_ACCOUNT_RISK_ACTIVE");
+      const now = new Date();
+      account.set({ policyVersion: 3, entryRiskPolicy: NSE_PAPER_POLICY_V3.entryRiskPolicy });
+      await saveRisk(account, scope, session, now);
+      await riskAudit(models, scope, session, now, {
+        eventId: "PAPER:NSE:RISK_POLICY_V3", eventType: "RISK_POLICY_UPDATED",
+        causationId: "NSE_PAPER_POLICY_V3_APPROVED", reason: "APPROVED_PER_TRADE_LIMIT_20000_INR",
+        tradingDate: account.get("dailyTradingDay") ?? now.toISOString().slice(0, 10),
+        evidenceRefs: ["NSE_PAPER_POLICY_V3"], payload: {
+          kind: "RISK_POLICY", commandId: "NSE_PAPER_POLICY_V3_APPROVED",
+          fromVersion: 2, toVersion: 3, fromMaxRiskPerEntryMinor: 1_600_000, toMaxRiskPerEntryMinor: 2_000_000,
+        },
+      });
+      return "UPDATED";
     }, { readConcern: { level: "snapshot" }, writeConcern: { w: "majority" } });
   } finally { await session.endSession(); }
 }

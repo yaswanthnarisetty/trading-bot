@@ -4,7 +4,7 @@ import { assertExecutionIndexes } from '../db/executionIndexes';
 import { PaperExitStore } from '../db/paperExitStore';
 import { verifyCloseLedger,closeOrderFinality } from '../domain/closeWorkflowEvidence';
 import { classifiedEntryPlanSchema } from '../domain/entryRisk';
-import { captureExitConfig,exitEconomics,exitTriggers,safeExitError,type ExitLeg,type ExitFill,type PaperExitConfig } from '../domain/paperExits';
+import { captureExitConfig,exitEconomics,exitTriggers,safeExitError,type ExitLeg,type ExitFill,type ExitPrice,type PaperExitConfig } from '../domain/paperExits';
 import { transitionOrder,type OrderState } from '../domain/OrderStateMachine';
 import { CloseIntentService } from './CloseIntentService';
 import { CloseWorkflowService } from './CloseWorkflowService';
@@ -16,6 +16,18 @@ import { PaperBrokerAdapter } from '../brokers/PaperBrokerAdapter';
 import type {ExitMarketProvider} from './PaperExitMarketData';
 import type {ExecutionScope} from '@trading-bot/shared';
 type Row=Record<string,any>;
+function bufferedCloseLimits(prices:readonly ExitPrice[],plan:ReturnType<typeof classifiedEntryPlanSchema.parse>,config:PaperExitConfig){
+ return prices.map(price=>{
+  const tick=plan.legs.find(leg=>leg.legId===price.legId)?.tickSizeMinor;
+  if(!tick||!Number.isSafeInteger(tick)||tick<=0)throw new Error('EXIT_IDENTITY_MISMATCH');
+  const divisor=10000n*BigInt(tick),adjusted=BigInt(price.priceMinor)*BigInt(price.side==='SELL'
+   ?10000-config.maxExitSlippageBps:10000+config.maxExitSlippageBps);
+  const units=price.side==='SELL'?adjusted/divisor:(adjusted+divisor-1n)/divisor;
+  const limit=units*BigInt(tick);
+  if(limit<=0n||limit>BigInt(Number.MAX_SAFE_INTEGER))throw new Error('EXIT_PRICE_NOT_EXECUTABLE');
+  return{...price,priceMinor:Number(limit)};
+ });
+}
 export interface PaperExitDependencies {clock:()=>Date;market:ExitMarketProvider;configs:()=>Promise<readonly PaperExitConfig[]>;broker:(scope:ExecutionScope)=>PaperBrokerAdapter}
 /** Independent durable exposure management. Never reads entry-session status or asks an LLM. */
 export class PaperExitMonitor {
@@ -83,8 +95,14 @@ export class PaperExitMonitor {
     family:plan.family,strategyKind:plan.strategyKind,config,economics,market:evidence.provenance,prices:evidence.prices,...decision});
    await this.store.markDecision(lease,decisionId,decision.reason,economics.stranded);
    if(!decision.reason)return finish('MONITORING','NO_TRIGGER',{decisionId,directionalStop:decision.directionalStop,stranded:economics.stranded});
+   // The decision may outlive its quote while remote ledger writes complete.
+   // Use a new executable quote to price the close; retain the old observation
+   // only as decision history, never as submission authorization.
+   const policyEvidence=await this.deps.market.capture(plan,legs,config);
+   policyEvidence.assertCurrent();
+   const approvedLimits=bufferedCloseLimits(policyEvidence.prices,plan,config);
    await this.transaction(async session=>{
-    await this.store.fence(lease!,session);evidence.assertCurrent();
+    await this.store.fence(lease!,session);policyEvidence.assertCurrent();
     const position=await this.models.Position.findOne({...scope,positionId}).session(session).orFail();
     if(position.get('activeCloseIntentId'))return;
     if(position.get('version')!==ledger.position.version)throw new Error('POSITION_CHANGED');
@@ -99,13 +117,30 @@ export class PaperExitMonitor {
       causationId:decisionId,reason:'EXIT_FENCED_UNCLAIMED_ENTRY',tradingDate:this.deps.clock().toISOString().slice(0,10),evidenceRefs:[decisionId],payload:{kind:'REFERENCE',entityId:order.get('orderId')}});
     }
     position.set('closePolicy',{kind:'POSITION_LIMIT_V1',monitorDecisionId:decisionId,policyVersion:account.get('policyVersion'),product:'INTRADAY',
-     expiresAt:new Date(+this.deps.clock()+config!.authorizationMs),legLimits:evidence.prices.map(p=>({legId:p.legId,limitPriceMinor:p.priceMinor}))});
-    await saveRisk(position,scope,session,this.deps.clock());evidence.assertCurrent();await this.store.fence(lease!,session);
+     expiresAt:new Date(+this.deps.clock()+config!.authorizationMs),legLimits:approvedLimits.map(p=>({legId:p.legId,limitPriceMinor:p.priceMinor}))});
+    await saveRisk(position,scope,session,this.deps.clock());policyEvidence.assertCurrent();await this.store.fence(lease!,session);
    });
-   const close=await new CloseIntentService(this.connection,scope,this.deps.clock).requestClose(positionId,`paper-exit:${positionId}`,async session=>{await this.store.fence(lease!,session);evidence.assertCurrent();});
+   const close=await new CloseIntentService(this.connection,scope,this.deps.clock).requestClose(positionId,`paper-exit:${positionId}`,async session=>{
+    await this.store.fence(lease!,session);
+    // An elapsed quote may be replaced, but a revoked instrument master or
+    // changed contract identity must abort the close before any child exists.
+    try{policyEvidence.assertCurrent();}catch(error){if(safeExitError(error)!=='STALE_MARKET_DATA')throw error;}
+    const current=await this.deps.market.capture(plan,legs,config!);
+    const executable=approvedLimits.every(approved=>{
+     const latest=current.prices.find(price=>price.legId===approved.legId);
+     return latest&&latest.side===approved.side&&latest.quantityUnits===approved.quantityUnits&&
+      (approved.side==='SELL'?latest.priceMinor>=approved.priceMinor:latest.priceMinor<=approved.priceMinor);
+    });
+    current.assertCurrent();
+    if(!executable)throw new Error('EXIT_PRICE_NOT_EXECUTABLE');
+   });
    await this.store.record(lease,{evaluatedAt:this.deps.clock(),kind:'CLOSE_LINK',decisionIdRef:decisionId,closeIntentId:close.intentId,reason:decision.reason});
    return await this.progress(lease,config,finish);
-  }catch(error){const reason=safeExitError(error);if(lease){await this.store.record(lease,{evaluatedAt:this.deps.clock(),kind:'BLOCKED',reason});await this.store.finish(lease,'ATTENTION',reason);}return{status:'ATTENTION',reason};}
+  }catch(error){const reason=safeExitError(error);if(lease){
+   const diagnostic=error instanceof Error?error.message.slice(0,300):String(error).slice(0,300);
+   await this.store.record(lease,{evaluatedAt:this.deps.clock(),kind:'BLOCKED',reason,diagnostic});
+   await this.store.finish(lease,'ATTENTION',reason);
+  }return{status:'ATTENTION',reason};}
   finally{this.busy.delete(positionId);}
  }
  private async progress(lease:NonNullable<Awaited<ReturnType<PaperExitStore['acquire']>>>,config:PaperExitConfig,
@@ -119,17 +154,28 @@ export class PaperExitMonitor {
    await this.store.fence(lease);const next=await workflow.advance(positionId);
    if(next.status==='CLOSED'){await new RiskSettlementService(this.connection,scope,this.deps.clock).settleClosedPosition(positionId);return finish('SETTLED','PROVEN_FLAT',{closeIntentId:next.intentId});}
    const ready=await this.models.BrokerOrder.find({...scope,intentId:next.intentId,phase:'READY',submissionClaim:{$exists:false}});
-   if(!ready.length)return finish('CLOSING',next.blockingOrderIds.length?'ORDER_TRUTH_REQUIRED':'CLOSE_DEPENDENCY_BLOCKED',{closeIntentId:next.intentId});
+   if(!ready.length){
+    const overdue=new Date(+this.deps.clock()-60000);
+    const unresolved=next.blockingOrderIds.length>0&&await this.models.BrokerOrder.exists({...scope,intentId:next.intentId,
+     orderId:{$in:next.blockingOrderIds},phase:'SUBMITTING',submissionClaim:{$exists:true},submissionOutcome:{$exists:false},
+     'submissionClaim.claimedAt':{$lte:overdue}});
+    return finish(unresolved?'ATTENTION':'CLOSING',unresolved?'ORDER_OUTCOME_UNRESOLVED':
+     next.blockingOrderIds.length?'ORDER_TRUTH_REQUIRED':'CLOSE_DEPENDENCY_BLOCKED',{closeIntentId:next.intentId});
+   }
    for(const order of ready){
     const ledger=await this.ledger(positionId),evidence=await this.deps.market.capture(ledger.entry.entryPlan,ledger.position.legs,config);
     const guard=async(session:ClientSession,child:Document)=>{
-     await this.store.fence(lease,session);evidence.assertCurrent();
-     const price=evidence.prices.find(p=>p.legId===child.get('legId'));
+     await this.store.fence(lease,session);
+     try{evidence.assertCurrent();}catch(error){if(safeExitError(error)!=='STALE_MARKET_DATA')throw error;}
+     const current=await this.deps.market.capture(ledger.entry.entryPlan,ledger.position.legs,config);
+     const price=current.prices.find(p=>p.legId===child.get('legId'));
      if(!price||price.side!==child.get('side')||price.quantityUnits!==child.get('quantityUnits')||
        (price.side==='SELL'?child.get('limitPriceMinor')>price.priceMinor:child.get('limitPriceMinor')<price.priceMinor))throw new Error('EXIT_PRICE_NOT_EXECUTABLE');
+     current.assertCurrent();
     };
     await this.store.record(lease,{evaluatedAt:this.deps.clock(),kind:'CLAIM_MARKET',closeIntentId:next.intentId,orderId:order.get('orderId'),market:evidence.provenance,prices:evidence.prices});
-    await manager.submit(order.get('orderId'),guard);
+    const submitted=await manager.submit(order.get('orderId'),guard);
+    if(submitted.status==='UNRESOLVED')throw new Error('ORDER_OUTCOME_UNRESOLVED');
     const consumed=await processor.processRetained(order.get('orderId'));if(consumed.failedTradeKeys.length)throw new Error('FILL_PROCESSING_REQUIRED');
    }
   }

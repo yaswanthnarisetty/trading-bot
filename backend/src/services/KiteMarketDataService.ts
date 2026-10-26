@@ -44,11 +44,16 @@ function freshness(quote: Pick<MarketQuote, "fetchedAt" | "brokerTimestamp">, no
   return freeze({ state: brokerAgeMs === null ? "UNAVAILABLE" : fetchedAgeMs < 0 || brokerAgeMs < 0 || fetchedAgeMs > maxAgeMs || brokerAgeMs > maxAgeMs ? "STALE" : "FRESH",
     brokerAgeMs, fetchedAgeMs, evaluatedAt: new Date(now).toISOString(), maxAgeMs, ruleVersion: "KITE_EXCHANGE_AGE_V1" });
 }
-/** Re-evaluates age at consumption, and checks the service's active snapshot again. */
-export function assertQualifiedRealMarketData(value: unknown, options: { maxAgeMs: number; instrument: InstrumentDefinition }): asserts value is MarketQuote {
+/** Prove the quote was issued for this instrument by the current real master. */
+export function assertIssuedRealMarketData(value: unknown, options: { instrument: InstrumentDefinition }): asserts value is MarketQuote {
   const proof = value && typeof value === "object" ? issued.get(value) : undefined;
   if (!proof || proof.instrument !== options.instrument) return fail("REAL_DATA_REQUIRED");
   proof.service.assertCurrentInstrument(options.instrument);
+}
+/** Re-evaluates age at consumption, and checks the service's active snapshot again. */
+export function assertQualifiedRealMarketData(value: unknown, options: { maxAgeMs: number; instrument: InstrumentDefinition }): asserts value is MarketQuote {
+  assertIssuedRealMarketData(value, options);
+  const proof = issued.get(value)!;
   if (proof.service.evaluateFreshness(value as MarketQuote, options.maxAgeMs).state !== "FRESH") return fail("STALE_MARKET_DATA");
 }
 /** Explicit request-only HTTP service. No timers, writes, caching, mocks or strategy dependencies. */

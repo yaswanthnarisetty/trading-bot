@@ -5,7 +5,7 @@ import { marketEvidenceExpiry, isMarketAnalyticsFresh, assertMarketAnalytics, ty
 import { analyticsEvidenceId } from "./analyticsEvidence";
 import { freeze, marketTimestamp } from "./kiteMarketData";
 
-export const STRATEGY_EVALUATOR_VERSION = "PHASE6A01_V1";
+export const STRATEGY_EVALUATOR_VERSION = "PHASE6A01_V2";
 
 export type HoldReason = "INVALID_INPUT" | "REAL_DATA_REQUIRED" | "MARKET_DATA_NOT_FRESH"
   | "INSUFFICIENT_HISTORY" | "ANALYTICS_UNAVAILABLE" | "NO_DIRECTION" | "CONFIDENCE_TOO_LOW"
@@ -40,6 +40,14 @@ export interface StrategyQualityConfig {
   readonly minVolumeRatio: number;
   readonly bullishRsiMax: number;
   readonly bearishRsiMin: number;
+  /** PAPER-only opt-in: an RSI extension requires independent completed-bar trend proof. */
+  readonly bullishTrendRsiException?: Readonly<{
+    readonly maxRsi: number;
+    readonly minConfidence: number;
+    readonly minAdx: number;
+    readonly minDiLead: number;
+    readonly minEmaSeparationAtr: number;
+  }>;
   readonly openingBlockMinutes: number;
   readonly minDteDays: number;
   readonly strikeStepMinor: number;
@@ -116,23 +124,39 @@ export interface StrategyEvaluationInput {
   readonly evaluatedAt: string;
   /** Logical duplicates in the current evaluation context only; durable admission is elsewhere. */
   readonly priorCandidateKeys?: readonly string[];
+  /** Option evidence shown to the directional evaluator. Selected legs are added automatically. */
+  readonly decisionOptionIds?: readonly string[];
 }
-const issuedCandidates = new WeakMap<object, MarketAnalyticsSnapshot>();
+const issuedCandidates = new WeakMap<object, Readonly<{
+  snapshot: MarketAnalyticsSnapshot; optionIds: readonly string[];
+}>>();
 export function assertIssuedTradeCandidate(value: unknown, now?: number): asserts value is TradeCandidate {
-  if (!value || typeof value !== "object" || !issuedCandidates.has(value)) throw new Error("ISSUED_CANDIDATE_REQUIRED");
-  if (now !== undefined && !isMarketAnalyticsFresh(issuedCandidates.get(value)!, now)) throw new Error("STALE_CANDIDATE");
+  const proof = value && typeof value === "object" ? issuedCandidates.get(value) : undefined;
+  if (!proof) throw new Error("ISSUED_CANDIDATE_REQUIRED");
+  if (now !== undefined && !isMarketAnalyticsFresh(proof.snapshot, now, proof.optionIds)) throw new Error("STALE_CANDIDATE");
 }
 export function candidateMarketEvidenceExpiry(value: unknown): number | null {
   assertIssuedTradeCandidate(value);
-  return marketEvidenceExpiry(issuedCandidates.get(value)!);
+  const proof = issuedCandidates.get(value)!;
+  return marketEvidenceExpiry(proof.snapshot, proof.optionIds);
 }
 const hold = (reason: HoldReason): StrategyEvaluationResult => freeze({ action: "HOLD", reason });
 const integer = (n: number) => Number.isSafeInteger(n) && n > 0;
 const finite = (n: number) => Number.isFinite(n);
 export function validStrategyQualityConfig(c: StrategyQualityConfig): boolean {
   const delta = c.longOptionSelection === undefined ? DEFAULT_LONG_SELECTION : c.longOptionSelection;
+  const trend = c.bullishTrendRsiException;
   if (!delta || typeof delta !== "object" || Array.isArray(delta)
     || Object.keys(delta).some(key => !["minAbsDelta", "maxAbsDelta", "targetAbsDelta", "maxStrikeDistanceMinor"].includes(key))) return false;
+  if (trend !== undefined && (!trend || typeof trend !== "object" || Array.isArray(trend)
+    || Object.keys(trend).some(key => !["maxRsi", "minConfidence", "minAdx", "minDiLead", "minEmaSeparationAtr"].includes(key))
+    || c.strategyFamily !== "LONG_OPTION"
+    || !finite(trend.maxRsi) || trend.maxRsi <= c.bullishRsiMax || trend.maxRsi > 80
+    || !finite(trend.minConfidence) || trend.minConfidence < Math.max(c.minConfidence, 0.75) || trend.minConfidence > 1
+    || !finite(trend.minAdx) || trend.minAdx < 25 || trend.minAdx > 50
+    || !finite(trend.minDiLead) || trend.minDiLead < 0 || trend.minDiLead > 100
+    || !finite(trend.minEmaSeparationAtr) || trend.minEmaSeparationAtr < 0.5
+    || trend.minEmaSeparationAtr > 5)) return false;
   return (c.strategyFamily === undefined || ["LONG_OPTION", "DEBIT_VERTICAL", "CREDIT_VERTICAL"].includes(c.strategyFamily))
     && !!delta && [delta.minAbsDelta, delta.maxAbsDelta, delta.targetAbsDelta].every(n => finite(n) && n > 0 && n <= 1)
     && delta.minAbsDelta <= delta.targetAbsDelta && delta.targetAbsDelta <= delta.maxAbsDelta
@@ -161,6 +185,19 @@ function liquid(option: OptionAnalytics, config: StrategyQualityConfig): boolean
     && option.askMinor >= option.bidMinor && option.askMinor - option.bidMinor <= config.maxBidAskSpreadMinor;
 }
 
+/** The extended RSI band never stands alone as evidence of trend strength. */
+function strongBullishTrend(snapshot: MarketAnalyticsSnapshot, confidence: number, c: StrategyQualityConfig): boolean {
+  const rule = c.bullishTrendRsiException, values = snapshot.indicators.values;
+  const proof = snapshot.indicators.directionalTrend;
+  return !!rule && !!proof && confidence >= rule.minConfidence && values.rsi <= rule.maxRsi
+    && values.regime === "trending" && values.emaAlignment === "bullish"
+    && values.priceVsEma20 === "above" && values.priceVsEma50 === "above"
+    && values.candleMomentum !== "BEARISH" && values.ema20 !== null && values.ema50 !== null
+    && values.atr !== null && values.atr > 0
+    && values.ema20 - values.ema50 >= values.atr * rule.minEmaSeparationAtr
+    && proof.adx14 >= rule.minAdx && proof.plusDi14 - proof.minusDi14 >= rule.minDiLead;
+}
+
 export function resolvedStrategyConfig(c: StrategyQualityConfig): StrategyQualityConfig & { strategyFamily: StrategyFamily } {
   return freeze({ ...c, strategyFamily: c.strategyFamily ?? "CREDIT_VERTICAL",
     longOptionSelection: { ...(c.longOptionSelection ?? DEFAULT_LONG_SELECTION) }, debitLongOffsetMinor: c.debitLongOffsetMinor ?? 0 });
@@ -180,6 +217,7 @@ export function verticalContractQueries(spot: number, direction: "BULLISH" | "BE
 export function inLongSelectionUniverse(i: InstrumentDefinition, underlying: AssetKey, expiry: string,
   direction: "BULLISH" | "BEARISH", spot: number, c: StrategyQualityConfig): boolean {
   return i.underlying === underlying && i.expiry === expiry && i.instrumentType === (direction === "BULLISH" ? "CE" : "PE")
+    && (direction === "BULLISH" ? i.strikeMinor < spot : i.strikeMinor > spot)
     && Math.abs(i.strikeMinor - spot) <= (c.longOptionSelection ?? DEFAULT_LONG_SELECTION).maxStrikeDistanceMinor;
 }
 
@@ -211,6 +249,7 @@ export function evaluateStrategy(input: StrategyEvaluationInput): StrategyEvalua
   if (values.atr > c.maxAtrPoints) return hold("ATR_GATE");
   if (values.volumeRatio < c.minVolumeRatio) return hold("VOLUME_GATE");
   if (proposal.direction === "BULLISH" && values.rsi > c.bullishRsiMax
+    && !strongBullishTrend(snapshot, proposal.confidence, c)
     || proposal.direction === "BEARISH" && values.rsi < c.bearishRsiMin) return hold("RSI_GATE");
   const matching = snapshot.options.filter(o => o.instrument.expiry === proposal.expiry);
   if (!matching.length) return hold("NO_QUALIFIED_CONTRACT");
@@ -234,7 +273,9 @@ export function evaluateStrategy(input: StrategyEvaluationInput): StrategyEvalua
     if (!liquidOptions.length) return hold("LIQUIDITY_GATE");
     liquidOptions.sort((a, b) => {
       const distance = (o: OptionAnalytics) => o.greeks.available ? Math.abs(Math.abs(o.greeks.value.delta) - delta.targetAbsDelta) : Infinity;
-      return distance(a) - distance(b) || (a.askMinor - a.bidMinor) - (b.askMinor - b.bidMinor)
+      // Select the nearest qualified ITM strike; delta and spread break ties only.
+      return Math.abs(a.instrument.strikeMinor - snapshot.spotMinor) - Math.abs(b.instrument.strikeMinor - snapshot.spotMinor)
+        || distance(a) - distance(b) || (a.askMinor - a.bidMinor) - (b.askMinor - b.bidMinor)
         || (a.canonicalId < b.canonicalId ? -1 : a.canonicalId > b.canonicalId ? 1 : 0);
     });
     selected = [{ option: liquidOptions[0]!, side: "BUY", role: "LONG" }];
@@ -289,6 +330,9 @@ export function evaluateStrategy(input: StrategyEvaluationInput): StrategyEvalua
   else candidate = { ...base, strategyFamily: family, strategyKind: bull ? "LONG_CALL" : "LONG_PUT", strategy: bull ? "LONG_CALL" : "LONG_PUT",
     widthMinor: null, debitPerUnitMinor: Number(-cash), debitPerLotMinor: Number(-cash * BigInt(lot)),
     maxProfitPerUnitMinor: null, maxProfitPerLotMinor: null };
-  issuedCandidates.set(candidate, snapshot);
+  issuedCandidates.set(candidate, freeze({ snapshot,
+    optionIds: [...new Set([...(input.decisionOptionIds ?? snapshot.options.map(o => o.canonicalId)),
+      ...selected.map(({ option }) => option.canonicalId)])],
+  }));
   return freeze({ action: "CANDIDATE", candidate });
 }

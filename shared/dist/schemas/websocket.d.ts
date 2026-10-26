@@ -949,8 +949,8 @@ export declare const positionOpenedMessageSchema: z.ZodObject<{
         marginSource: z.ZodOptional<z.ZodEnum<["KITE_API", "ESTIMATED"]>>;
     }, "strip", z.ZodTypeAny, {
         status: "OPEN" | "CLOSED_SL" | "CLOSED_TARGET" | "CLOSED_EXPIRY" | "CLOSED_MANUAL";
-        strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
         positionId: string;
+        strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
         sessionId: string;
         asset: string;
         legs: {
@@ -984,8 +984,8 @@ export declare const positionOpenedMessageSchema: z.ZodObject<{
         marginSource?: "KITE_API" | "ESTIMATED" | undefined;
     }, {
         status: "OPEN" | "CLOSED_SL" | "CLOSED_TARGET" | "CLOSED_EXPIRY" | "CLOSED_MANUAL";
-        strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
         positionId: string;
+        strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
         sessionId: string;
         asset: string;
         legs: {
@@ -1022,8 +1022,8 @@ export declare const positionOpenedMessageSchema: z.ZodObject<{
     type: "POSITION_OPENED";
     payload: {
         status: "OPEN" | "CLOSED_SL" | "CLOSED_TARGET" | "CLOSED_EXPIRY" | "CLOSED_MANUAL";
-        strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
         positionId: string;
+        strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
         sessionId: string;
         asset: string;
         legs: {
@@ -1060,8 +1060,8 @@ export declare const positionOpenedMessageSchema: z.ZodObject<{
     type: "POSITION_OPENED";
     payload: {
         status: "OPEN" | "CLOSED_SL" | "CLOSED_TARGET" | "CLOSED_EXPIRY" | "CLOSED_MANUAL";
-        strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
         positionId: string;
+        strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
         sessionId: string;
         asset: string;
         legs: {
@@ -1155,8 +1155,8 @@ export declare const positionClosedMessageSchema: z.ZodObject<{
         marginSource: z.ZodOptional<z.ZodEnum<["KITE_API", "ESTIMATED"]>>;
     }, "strip", z.ZodTypeAny, {
         status: "OPEN" | "CLOSED_SL" | "CLOSED_TARGET" | "CLOSED_EXPIRY" | "CLOSED_MANUAL";
-        strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
         positionId: string;
+        strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
         sessionId: string;
         asset: string;
         legs: {
@@ -1190,8 +1190,8 @@ export declare const positionClosedMessageSchema: z.ZodObject<{
         marginSource?: "KITE_API" | "ESTIMATED" | undefined;
     }, {
         status: "OPEN" | "CLOSED_SL" | "CLOSED_TARGET" | "CLOSED_EXPIRY" | "CLOSED_MANUAL";
-        strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
         positionId: string;
+        strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
         sessionId: string;
         asset: string;
         legs: {
@@ -1228,8 +1228,8 @@ export declare const positionClosedMessageSchema: z.ZodObject<{
     type: "POSITION_CLOSED";
     payload: {
         status: "OPEN" | "CLOSED_SL" | "CLOSED_TARGET" | "CLOSED_EXPIRY" | "CLOSED_MANUAL";
-        strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
         positionId: string;
+        strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
         sessionId: string;
         asset: string;
         legs: {
@@ -1266,8 +1266,8 @@ export declare const positionClosedMessageSchema: z.ZodObject<{
     type: "POSITION_CLOSED";
     payload: {
         status: "OPEN" | "CLOSED_SL" | "CLOSED_TARGET" | "CLOSED_EXPIRY" | "CLOSED_MANUAL";
-        strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
         positionId: string;
+        strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
         sessionId: string;
         asset: string;
         legs: {
@@ -2056,8 +2056,8 @@ export declare const wsMessageSchema: z.ZodDiscriminatedUnion<"type", [z.ZodObje
         marginSource: z.ZodOptional<z.ZodEnum<["KITE_API", "ESTIMATED"]>>;
     }, "strip", z.ZodTypeAny, {
         status: "OPEN" | "CLOSED_SL" | "CLOSED_TARGET" | "CLOSED_EXPIRY" | "CLOSED_MANUAL";
-        strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
         positionId: string;
+        strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
         sessionId: string;
         asset: string;
         legs: {
@@ -2091,8 +2091,8 @@ export declare const wsMessageSchema: z.ZodDiscriminatedUnion<"type", [z.ZodObje
         marginSource?: "KITE_API" | "ESTIMATED" | undefined;
     }, {
         status: "OPEN" | "CLOSED_SL" | "CLOSED_TARGET" | "CLOSED_EXPIRY" | "CLOSED_MANUAL";
-        strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
         positionId: string;
+        strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
         sessionId: string;
         asset: string;
         legs: {
@@ -2129,8 +2129,8 @@ export declare const wsMessageSchema: z.ZodDiscriminatedUnion<"type", [z.ZodObje
     type: "POSITION_OPENED";
     payload: {
         status: "OPEN" | "CLOSED_SL" | "CLOSED_TARGET" | "CLOSED_EXPIRY" | "CLOSED_MANUAL";
-        strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
         positionId: string;
+        strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
         sessionId: string;
         asset: string;
         legs: {
@@ -2167,8 +2167,8 @@ export declare const wsMessageSchema: z.ZodDiscriminatedUnion<"type", [z.ZodObje
     type: "POSITION_OPENED";
     payload: {
         status: "OPEN" | "CLOSED_SL" | "CLOSED_TARGET" | "CLOSED_EXPIRY" | "CLOSED_MANUAL";
-        strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
         positionId: string;
+        strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
         sessionId: string;
         asset: string;
         legs: {
@@ -2260,8 +2260,8 @@ export declare const wsMessageSchema: z.ZodDiscriminatedUnion<"type", [z.ZodObje
         marginSource: z.ZodOptional<z.ZodEnum<["KITE_API", "ESTIMATED"]>>;
     }, "strip", z.ZodTypeAny, {
         status: "OPEN" | "CLOSED_SL" | "CLOSED_TARGET" | "CLOSED_EXPIRY" | "CLOSED_MANUAL";
-        strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
         positionId: string;
+        strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
         sessionId: string;
         asset: string;
         legs: {
@@ -2295,8 +2295,8 @@ export declare const wsMessageSchema: z.ZodDiscriminatedUnion<"type", [z.ZodObje
         marginSource?: "KITE_API" | "ESTIMATED" | undefined;
     }, {
         status: "OPEN" | "CLOSED_SL" | "CLOSED_TARGET" | "CLOSED_EXPIRY" | "CLOSED_MANUAL";
-        strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
         positionId: string;
+        strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
         sessionId: string;
         asset: string;
         legs: {
@@ -2333,8 +2333,8 @@ export declare const wsMessageSchema: z.ZodDiscriminatedUnion<"type", [z.ZodObje
     type: "POSITION_CLOSED";
     payload: {
         status: "OPEN" | "CLOSED_SL" | "CLOSED_TARGET" | "CLOSED_EXPIRY" | "CLOSED_MANUAL";
-        strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
         positionId: string;
+        strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
         sessionId: string;
         asset: string;
         legs: {
@@ -2371,8 +2371,8 @@ export declare const wsMessageSchema: z.ZodDiscriminatedUnion<"type", [z.ZodObje
     type: "POSITION_CLOSED";
     payload: {
         status: "OPEN" | "CLOSED_SL" | "CLOSED_TARGET" | "CLOSED_EXPIRY" | "CLOSED_MANUAL";
-        strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
         positionId: string;
+        strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
         sessionId: string;
         asset: string;
         legs: {

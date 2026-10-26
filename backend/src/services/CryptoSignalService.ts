@@ -71,7 +71,7 @@ function computeRSI(prices: number[], period: number): number {
  * @param candles - OHLCV candles in chronological order
  * @param period  - ATR period (default 14)
  */
-function computeATR(candles: OHLCV[], period: number): number {
+function computeATR(candles: readonly OHLCV[], period: number): number {
   if (candles.length < period + 1) return 0;
 
   const trs: number[] = [];
@@ -96,12 +96,35 @@ function computeATR(candles: OHLCV[], period: number): number {
 /**
  * Computes the ratio of the latest candle volume to the 20-bar average.
  */
-function computeVolumeRatio(candles: OHLCV[]): number {
+function computeVolumeRatio(candles: readonly OHLCV[]): number {
   if (candles.length < 21) return 1;
   const recent = candles.slice(-21, -1);
   const avg = recent.reduce((s, c) => s + c.volume, 0) / recent.length;
   const latest = candles[candles.length - 1]?.volume ?? 0;
   return avg > 0 ? parseFloat((latest / avg).toFixed(2)) : 1;
+}
+
+/** Reject partial, missing, duplicate, or stale exchange bars before evaluating a signal. */
+export function qualifyClosedCryptoCandles(
+  source: readonly OHLCV[], nowMs: number, intervalMs = 60_000, required = CRYPTO_SIGNAL_LOOKBACK_BARS
+): OHLCV[] {
+  if (!Number.isFinite(nowMs) || !Number.isInteger(intervalMs) || intervalMs <= 0 || required < 1)
+    throw new Error("BTC_CANDLES_INVALID_REQUEST");
+  const closed = source.filter(c => c.timestamp.getTime() + intervalMs <= nowMs).slice(-required);
+  if (closed.length !== required) throw new Error("BTC_CANDLES_INSUFFICIENT");
+  for (let i = 0; i < closed.length; i++) {
+    const bar = closed[i]!;
+    const time = bar.timestamp.getTime();
+    if (!Number.isFinite(time) || time % intervalMs !== 0 ||
+      ![bar.open, bar.high, bar.low, bar.close, bar.volume].every(Number.isFinite) ||
+      bar.open <= 0 || bar.close <= 0 || bar.low <= 0 || bar.volume < 0 ||
+      bar.high < Math.max(bar.open, bar.close) || bar.low > Math.min(bar.open, bar.close) ||
+      (i > 0 && time - closed[i - 1]!.timestamp.getTime() !== intervalMs))
+      throw new Error("BTC_CANDLES_INVALID_OR_GAPPED");
+  }
+  if (nowMs - (closed[closed.length - 1]!.timestamp.getTime() + intervalMs) > 90_000)
+    throw new Error("BTC_CANDLES_STALE");
+  return closed;
 }
 
 // ─── Signal Evaluation ───────────────────────────────────────────────────────
@@ -123,11 +146,9 @@ function computeVolumeRatio(candles: OHLCV[]): number {
  * @param asset - Crypto asset to evaluate
  * @returns CryptoSignal with side, confidence, and raw indicator values
  */
-export async function evaluateCryptoSignal(
-  asset: CryptoAssetKey
-): Promise<CryptoSignal> {
-  const candles = await getDeltaCandles(asset, 60, CRYPTO_SIGNAL_LOOKBACK_BARS);
-
+export function evaluateCryptoSignalFromClosedCandles(
+  asset: CryptoAssetKey, candles: readonly OHLCV[], timestamp: string
+): CryptoSignal {
   const closes = candles.map((c) => c.close);
 
   const ema9  = computeEMA(closes, CRYPTO_EMA_FAST);
@@ -136,7 +157,6 @@ export async function evaluateCryptoSignal(
   const rsi   = computeRSI(closes, CRYPTO_RSI_PERIOD);
   const atr   = computeATR(candles, CRYPTO_ATR_PERIOD);
   const volumeRatio = computeVolumeRatio(candles);
-  const timestamp   = new Date().toISOString();
 
   // ── Alignment flags ──────────────────────────────────────────────────────
   const bullishAlignment = ema9 > ema21 && ema21 > ema50;
@@ -189,17 +209,26 @@ export async function evaluateCryptoSignal(
     reason,
   };
 
+  return signal;
+}
+
+export async function evaluateCryptoSignal(asset: CryptoAssetKey): Promise<CryptoSignal> {
+  const candles = qualifyClosedCryptoCandles(
+    await getDeltaCandles(asset, 60, CRYPTO_SIGNAL_LOOKBACK_BARS + 3), Date.now()
+  );
+  const signal = evaluateCryptoSignalFromClosedCandles(asset, candles, new Date().toISOString());
+
   logger.info("📊 Crypto signal evaluated", {
     asset,
-    side,
-    confidence,
-    rsi,
-    ema9,
-    ema21,
-    ema50,
-    atr,
-    volumeRatio,
-    reason,
+    side: signal.side,
+    confidence: signal.confidence,
+    rsi: signal.rsi,
+    ema9: signal.ema9,
+    ema21: signal.ema21,
+    ema50: signal.ema50,
+    atr: signal.atr,
+    volumeRatio: signal.volumeRatio,
+    reason: signal.reason,
   });
 
   return signal;

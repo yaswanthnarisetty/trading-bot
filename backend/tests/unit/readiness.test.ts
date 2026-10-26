@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import mongoose from "mongoose";
 import fs from "node:fs";
 import path from "node:path";
-import { checkTransactionCapability, foundationReadiness, isTransactionTopology, requireExecutionTransaction } from "../../src/db/executionReadiness";
+import { checkTransactionCapability, foundationReadiness, hasVerifiedTransactionCapability, isTransactionTopology, requireExecutionTransaction } from "../../src/db/executionReadiness";
 
 test("INV-038 disconnected Mongo never passes readiness and never buffers execution writes", async () => {
   const connection = mongoose.createConnection();
@@ -12,6 +12,7 @@ test("INV-038 disconnected Mongo never passes readiness and never buffers execut
   assert.equal(foundationReadiness(capability).ready, false);
   assert.throws(() => requireExecutionTransaction(connection), /PERSISTENCE_NOT_READY/);
   assert.equal(foundationReadiness({ supported: true, reason: "SNAPSHOT_TRANSACTION_VERIFIED" }).ready, false);
+  assert.equal(hasVerifiedTransactionCapability(connection, { supported: true, reason: "SNAPSHOT_TRANSACTION_VERIFIED" }), false);
 });
 
 test("topology evidence is explicit; standalone and missing session support fail closed", () => {

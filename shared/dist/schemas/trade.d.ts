@@ -112,8 +112,8 @@ export declare const optionsPositionSchema: z.ZodObject<{
     marginSource: z.ZodOptional<z.ZodEnum<["KITE_API", "ESTIMATED"]>>;
 }, "strip", z.ZodTypeAny, {
     status: "OPEN" | "CLOSED_SL" | "CLOSED_TARGET" | "CLOSED_EXPIRY" | "CLOSED_MANUAL";
-    strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
     positionId: string;
+    strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
     sessionId: string;
     asset: string;
     legs: {
@@ -147,8 +147,8 @@ export declare const optionsPositionSchema: z.ZodObject<{
     marginSource?: "KITE_API" | "ESTIMATED" | undefined;
 }, {
     status: "OPEN" | "CLOSED_SL" | "CLOSED_TARGET" | "CLOSED_EXPIRY" | "CLOSED_MANUAL";
-    strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
     positionId: string;
+    strategy: "BULL_PUT_SPREAD" | "BEAR_CALL_SPREAD";
     sessionId: string;
     asset: string;
     legs: {

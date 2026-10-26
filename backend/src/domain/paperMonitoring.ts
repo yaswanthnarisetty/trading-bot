@@ -19,14 +19,16 @@ export const paperEntryMetadataSchema = paperMonitoringConfigSchema.pick({
 }).strict();
 
 export function builtInNiftyPaperConfig(accountId: string): Readonly<PaperMonitoringConfig> {
-  return captureMonitoringConfig({ configId: "NIFTY_PAPER_DEFAULT_V1", accountId,
+  return captureMonitoringConfig({ configId: "NIFTY_PAPER_DEFAULT_V2", accountId,
     asset: "NIFTY", executionMode: "PAPER", dataMode: "KITE_REAL", intervalMs: TICK_INTERVAL_MS,
     entryCutoffMinuteIST: 900, maxAgeMs: 30000,
     // Same approved quality defaults as Phase 5/6 normalizeBacktestParams;
     // no backtest, legacy capital or risk settings are imported into this account.
-    strategyConfig: { version: "NIFTY_PAPER_QUALITY_V1", strategyFamily: "LONG_OPTION",
+    strategyConfig: { version: "NIFTY_PAPER_QUALITY_V2", strategyFamily: "LONG_OPTION",
       minConfidence: MIN_CONFIDENCE_DEFAULT, longOptionSelection: DEFAULT_LONG_SELECTION,
       maxAtrPoints: 70, minVolumeRatio: 0, bullishRsiMax: 70, bearishRsiMin: 30,
+      bullishTrendRsiException: { maxRsi: 80, minConfidence: 0.75, minAdx: 25,
+        minDiLead: 5, minEmaSeparationAtr: 1 },
       openingBlockMinutes: 15, minDteDays: MIN_DTE_FOR_BUYING, strikeStepMinor: 5000,
       widthMinor: 10000, shortOffsetMinor: 10000, minDepthUnits: 1,
       maxBidAskSpreadMinor: 1000, minCreditMinor: 2500 },

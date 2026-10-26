@@ -3,6 +3,40 @@ import type { ExecutionScope } from "@trading-bot/shared";
 import { successfulClose, verifyCloseLedger } from "../domain/closeWorkflowEvidence";
 import { calculateEntryRisk } from "../domain/entryRisk";
 
+/** A never-claimed PAPER entry has no broker submission path once its immutable
+ * market/authorization deadline has passed. Prove that from the whole owned
+ * chain and Fill ledger before releasing its reserved capacity. */
+export async function noSubmissionRiskProof(connection: Connection, session: ClientSession, scope: ExecutionScope,
+  position: Record<string, any>, intent: Record<string, any>, now: Date,
+  snapshot?: { orders: Record<string, any>[]; fills: Record<string, any>[]; intents: Record<string, any>[] }) {
+  if (position.accountId !== scope.accountId || position.executionMode !== scope.executionMode
+    || position.lifecycle !== "ABORTED" || position.integrity !== "CONSISTENT"
+    || position.activeCloseIntentId !== null || position.potentiallyExecutingOrderCount !== 0
+    || intent.accountId !== scope.accountId || intent.executionMode !== scope.executionMode
+    || intent.intentId !== position.entryIntentId || intent.purpose !== "ENTRY" || intent.state !== "ABORTED"
+    || !(intent.entryPlan?.marketEvidenceExpiresAt instanceof Date)
+    || Math.min(+intent.entryPlan.marketEvidenceExpiresAt, +intent.deadline) >= +now)
+    throw new Error("NO_SUBMISSION_RISK_PROOF_REQUIRED");
+  const db = connection.db!;
+  const orders = snapshot ? snapshot.orders.filter(row => row.positionId === position.positionId)
+    : await db.collection("execution_orders").find({ ...scope, positionId: position.positionId }, { session }).toArray();
+  const fills = snapshot ? snapshot.fills.filter(row => row.positionId === position.positionId)
+    : await db.collection("execution_fills").find({ ...scope, positionId: position.positionId }, { session }).toArray();
+  const otherIntents = snapshot ? snapshot.intents.filter(row => row.positionId === position.positionId)
+    : await db.collection("execution_intents").find({ ...scope, positionId: position.positionId }, { session }).toArray();
+  const required = calculateEntryRisk(intent.targetLegs, intent.entryPlan);
+  if (fills.length || otherIntents.length || !orders.length || orders.length !== required.legs.length
+    || !required.legs.every(leg => orders.some(order => order.intentId === intent.intentId
+      && order.legId === leg.legId && order.contractKey === leg.contractKey && order.side === leg.side
+      && order.quantityUnits === leg.quantityUnits && order.sliceId === "entry" && order.generation === 0))
+    || orders.some(order => order.phase !== "NOT_SENT" || order.knowledge !== "KNOWN" || order.cancellation !== "NONE"
+      || order.filledUnits !== 0 || order.submissionClaim || order.submissionOutcome || order.brokerOrderId)
+    || position.legs.some((leg: Record<string, any>) => leg.entryFilledUnits !== 0 || leg.exitFilledUnits !== 0)
+    || JSON.stringify([...position.closureEvidenceRefs].sort()) !== JSON.stringify(orders.map(order => String(order.orderId)).sort()))
+    throw new Error("NO_SUBMISSION_RISK_PROOF_REQUIRED");
+  return { abortIntentId: String(intent.intentId), evidenceRefs: orders.map(order => String(order.orderId)).sort() };
+}
+
 /** Reuses 2B5's complete ownership/finality proof, without resolving knowledge. */
 export async function terminalRiskProof(connection: Connection, session: ClientSession, scope: ExecutionScope, position: Record<string, any>) {
   const db = connection.db!;

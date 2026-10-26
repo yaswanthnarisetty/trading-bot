@@ -74,6 +74,7 @@ export declare const cryptoSignalSchema: z.ZodObject<{
     timestamp: z.ZodString;
     reason: z.ZodString;
 }, "strip", z.ZodTypeAny, {
+    reason: string;
     rsi: number;
     ema50: number;
     atr: number;
@@ -84,8 +85,8 @@ export declare const cryptoSignalSchema: z.ZodObject<{
     ema9: number;
     ema21: number;
     timestamp: string;
-    reason: string;
 }, {
+    reason: string;
     rsi: number;
     ema50: number;
     atr: number;
@@ -96,7 +97,6 @@ export declare const cryptoSignalSchema: z.ZodObject<{
     ema9: number;
     ema21: number;
     timestamp: string;
-    reason: string;
 }>;
 export type CryptoSignal = z.infer<typeof cryptoSignalSchema>;
 //# sourceMappingURL=crypto.d.ts.map

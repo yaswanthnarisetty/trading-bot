@@ -46,7 +46,7 @@ for (const family of families) for (const [n, direction] of directions.entries()
     const c = e.result.candidate;
     assert.equal(c.strategyKind, kinds[family][n]); assert.equal(c.executionAuthority, "NONE");
     assert.equal(c.expiry, "2026-10-06"); assert.equal(c.quantityUnits, 65);
-    assert.match(c.analyticsEvidenceId, /^ANALYTICS_SHA256_V1:/); assert.equal(c.evaluatorVersion, "PHASE6A01_V1");
+    assert.match(c.analyticsEvidenceId, /^ANALYTICS_SHA256_V1:/); assert.equal(c.evaluatorVersion, "PHASE6A01_V2");
     for (const leg of c.legs) {
       assertQualifiedInstrument(leg.instrument); assert.equal(leg.instrument, data.master.getInstrumentByCanonicalId(leg.canonicalId));
       assert.equal(leg.quantityUnits, 65); assert.equal(leg.instrument.expiry, c.expiry);
@@ -98,6 +98,42 @@ test("long delta band is configurable and no premium range is used", async () =>
   const e = evaluate(data, "LONG_OPTION"); assert.equal(e.result.action, "CANDIDATE");
   if (e.result.action === "CANDIDATE") assert.equal(e.result.candidate.legs[0]!.priceMinor, 30100);
 });
+test("NIFTY long call can extend RSI only with strong completed-bar trend proof", async () => {
+  const base = await familyFixture();
+  let closeMinor = 2_490_000;
+  const data = { ...base, candles: base.candles.map((bar, index) => {
+    if (index) closeMinor += index % 3 === 0 ? -400 : 600;
+    return { ...bar, openMinor: closeMinor - 100, highMinor: closeMinor + 1000,
+      lowMinor: closeMinor - 1000, closeMinor };
+  }) };
+  const rule = { maxRsi: 80, minConfidence: 0.75, minAdx: 25,
+    minDiLead: 5, minEmaSeparationAtr: 1 };
+  const trendQuality = { strategyFamily: "LONG_OPTION" as const, bullishRsiMax: 70 };
+  const baseline = evaluate(data, "LONG_OPTION", "BULLISH", { bullishRsiMax: 70 });
+  assert.ok(baseline.analytics.available);
+  if (!baseline.analytics.available) return;
+  const indicators = baseline.analytics.snapshot.indicators;
+  assert.ok(indicators.values.rsi > 70 && indicators.values.rsi < 80);
+  assert.ok(indicators.directionalTrend.adx14 >= 25);
+  assert.ok(indicators.directionalTrend.plusDi14 - indicators.directionalTrend.minusDi14 >= 5);
+  assert.deepEqual(baseline.result, { action: "HOLD", reason: "RSI_GATE" });
+  const allowed = evaluate(data, "LONG_OPTION", "BULLISH", { ...trendQuality,
+    bullishTrendRsiException: rule });
+  assert.equal(allowed.result.action, "CANDIDATE");
+  if (allowed.result.action === "CANDIDATE") {
+    assert.equal(allowed.result.candidate.strategyKind, "LONG_CALL");
+    assert.equal(allowed.result.candidate.executionAuthority, "NONE");
+  }
+  for (const blocked of [
+    { ...rule, maxRsi: 74 }, { ...rule, minConfidence: 0.9 },
+    { ...rule, minDiLead: 20 }, { ...rule, minEmaSeparationAtr: 2 },
+  ]) assert.deepEqual(evaluate(data, "LONG_OPTION", "BULLISH", { ...trendQuality,
+    bullishTrendRsiException: blocked }).result, { action: "HOLD", reason: "RSI_GATE" });
+  assert.deepEqual(evaluate(data, "LONG_OPTION", "BULLISH", { ...trendQuality,
+    bullishTrendRsiException: rule, maxAtrPoints: 10 }).result, { action: "HOLD", reason: "ATR_GATE" });
+  assert.throws(() => evaluate(data, "LONG_OPTION", "BULLISH", { ...trendQuality,
+    bullishTrendRsiException: { ...rule, maxRsi: 85 } }), /INVALID_BACKTEST_CONFIG/);
+});
 test("long selection tie-breaking is deterministic under reversed quote order", async () => {
   const data = await familyFixture(); const e = evaluate(data, "LONG_OPTION"); assert.ok(e.analytics.available);
   const deltas = e.analytics.snapshot.options.filter(o => o.instrument.instrumentType === "CE" && o.instrument.strikeMinor <= 2490000)
@@ -105,6 +141,40 @@ test("long selection tie-breaking is deterministic under reversed quote order", 
   const quality = { longOptionSelection: { ...DEFAULT_LONG_SELECTION, targetAbsDelta: (deltas[0]! + deltas[1]!) / 2 } };
   assert.deepEqual(evaluate(data, "LONG_OPTION", "BULLISH", quality).result,
     evaluate({ ...data, optionQuotes: [...data.optionQuotes].reverse() }, "LONG_OPTION", "BULLISH", quality).result);
+});
+test("long option prefers the nearest qualified ITM strike over a farther target-delta match", async () => {
+  const data = await familyFixture();
+  const baseline = evaluate(data, "LONG_OPTION", "BULLISH");
+  assert.ok(baseline.analytics.available);
+  if (!baseline.analytics.available) return;
+  const spot = baseline.analytics.snapshot.spotMinor;
+  const calls = baseline.analytics.snapshot.options.filter(o => o.instrument.instrumentType === "CE"
+    && o.instrument.strikeMinor < spot && o.greeks.available)
+    .sort((a, b) => b.instrument.strikeMinor - a.instrument.strikeMinor);
+  assert.ok(calls.length >= 2);
+  const farther = calls[1]!;
+  assert.ok(farther.greeks.available);
+  if (!farther.greeks.available) return;
+  const target = Math.abs(farther.greeks.value.delta);
+  const result = evaluate(data, "LONG_OPTION", "BULLISH", { longOptionSelection: {
+    ...DEFAULT_LONG_SELECTION, minAbsDelta: 0.01, maxAbsDelta: 1, targetAbsDelta: target,
+  } }).result;
+  assert.equal(result.action, "CANDIDATE");
+  if (result.action === "CANDIDATE") assert.equal(result.candidate.legs[0]!.instrument.strikeMinor,
+    calls[0]!.instrument.strikeMinor);
+});
+test("long option never selects ATM or OTM, even if its delta is eligible", async () => {
+  const data = await familyFixture();
+  for (const direction of directions) {
+    const result = evaluate(data, "LONG_OPTION", direction, { longOptionSelection: {
+      ...DEFAULT_LONG_SELECTION, minAbsDelta: 0.01, maxAbsDelta: 1,
+    } });
+    assert.equal(result.result.action, "CANDIDATE");
+    if (result.result.action !== "CANDIDATE" || !result.analytics.available) continue;
+    const strike = result.result.candidate.legs[0]!.instrument.strikeMinor;
+    const spot = result.analytics.snapshot.spotMinor;
+    assert.ok(direction === "BULLISH" ? strike < spot : strike > spot);
+  }
 });
 for (const direction of directions) test(`long ${direction} never substitutes the wrong option type`, async () => {
   const data = await familyFixture(); const wrongType = direction === "BULLISH" ? "PE" : "CE";

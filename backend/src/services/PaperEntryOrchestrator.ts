@@ -2,9 +2,9 @@ import { randomUUID } from "node:crypto";
 import type { Connection } from "mongoose";
 import type { ExecutionScope } from "@trading-bot/shared";
 import { executionModels } from "../db/executionModels";
-import { assertExecutionIndexes } from "../db/executionIndexes";
+import { assertExecutionIndexes, type VerifiedExecutionIndexes } from "../db/executionIndexes";
 import { assertPaperHistoryIndexes } from "../db/paperSessionFence";
-import { checkTransactionCapability } from "../db/executionReadiness";
+import { checkTransactionCapability, type TransactionCapability } from "../db/executionReadiness";
 import { withExecutionHost } from "../db/executionHost";
 import { reconciliationAdmissionHealthy } from "../db/reconciliationAdmission";
 import { requireExecutionHost, type ExecutionHostContext } from "../domain/ExecutionHostContext";
@@ -13,15 +13,18 @@ import { capturePaperConfig, cycleIdentity, decisionWindow, digest, entryCutoffA
 import type { AnalyticsOutcome } from "../domain/marketAnalytics";
 import { MonitoringSessionSchema } from "../models/MonitoringSession";
 import { SignalLogSchema } from "../models/SignalLog";
-import { CandidateIntentAdapter } from "./CandidateIntentAdapter";
+import { CandidateIntentAdapter, KITE_PAPER_LONG_OPTION_DECISION_LIFETIME_MS } from "./CandidateIntentAdapter";
 import { RiskAdmissionService } from "./RiskAdmissionService";
+import { RiskSettlementService } from "./RiskSettlementService";
 import { EntryProtectionService } from "./EntryProtectionService";
 import { OrderManager } from "./OrderManager";
 import { FillProcessor } from "./FillProcessor";
 import { PaperBrokerAdapter } from "../brokers/PaperBrokerAdapter";
-import { evaluateWithPhase5LLM, type Phase5LLMConfig, type Phase5LLMTransport } from "./Phase5LLMService";
+import { evaluateWithPhase5LLM, revalidatePhase5Candidate, type Phase5LLMConfig, type Phase5LLMTransport } from "./Phase5LLMService";
 import { captureMonitoringConfig, completePaperEntryConfig, type PaperMonitoringConfig } from "../domain/paperMonitoring";
 import { NSE_PAPER_ACCOUNT_ID } from "./NsePaperAccountService";
+import { projectPaperDisplayAnalytics } from "./PaperDisplayAnalytics";
+import { issueEntryQuoteRenewal, type EntryQuoteRenewal } from "../db/entryQuoteRenewal";
 
 export interface PaperMarketProvider {
   prepare(config: Readonly<PaperSessionConfig>): Promise<void>;
@@ -62,9 +65,11 @@ export class PaperEntryOrchestrator {
       .select({accountId:1,_id:0}).limit(2).lean<{accountId:string}[]>();
   }
   async assertReady(config: PaperSessionConfig) {
-    await assertPaperHistoryIndexes(this.connection);
-    await assertExecutionIndexes(this.connection);
-    if (!(await checkTransactionCapability(this.connection)).supported) throw new Error("ACCOUNT_NOT_READY");
+    const [, indexProof, reconciliationProof, transactions] = await Promise.all([
+      assertPaperHistoryIndexes(this.connection), assertExecutionIndexes(this.connection),
+      assertExecutionIndexes(this.connection, "RECONCILIATION"), checkTransactionCapability(this.connection),
+    ]);
+    if (!transactions.supported) throw new Error("ACCOUNT_NOT_READY");
     const session = await this.connection.startSession();
     try { await session.withTransaction(() => withExecutionHost(session, this.deps.host, async () => {
       const account = await this.models.TradingAccount.findOne(this.scope(config.accountId)).session(session).orFail();
@@ -74,8 +79,39 @@ export class PaperEntryOrchestrator {
       // Automatic orchestration always opts into the approved current-host barrier.
       // Legacy isolated service callers may still use the approved opt-out path.
       if (!account.get("reconciliationConfig") || account.get("recoveryState.status") !== "READY") throw new Error("RECOVERY_REQUIRED");
-      if (!await reconciliationAdmissionHealthy(this.connection, session, this.scope(config.accountId), account.toObject())) throw new Error("RECONCILIATION_REQUIRED");
+      if (!await reconciliationAdmissionHealthy(this.connection, session, this.scope(config.accountId), account.toObject(), reconciliationProof)) throw new Error("RECONCILIATION_REQUIRED");
     })); } finally { await session.endSession(); }
+    return { indexProof, reconciliationProof, transactionProof: transactions };
+  }
+  private async hasBlockingEntryAttention(accountId: string): Promise<boolean> {
+    const scope = this.scope(accountId);
+    const attention = await this.history.Cycle.find({ ...scope, outcome: "ATTENTION", intentId: { $exists: true } })
+      .select({ intentId: 1 });
+    if (!attention.length) return false;
+    const intentIds = [...new Set(attention.map(cycle => String(cycle.get("intentId"))))];
+    const [intents, orders] = await Promise.all([
+      this.models.OrderIntent.find({ ...scope, intentId: { $in: intentIds } }),
+      this.models.BrokerOrder.find({ ...scope, intentId: { $in: intentIds } }),
+    ]);
+    const now = +this.deps.clock();
+    const settlement = new RiskSettlementService(this.connection, scope, this.deps.clock);
+    for (const intentId of intentIds) {
+      const intent = intents.find(row => row.get("intentId") === intentId);
+      if (intent?.get("state") === "ABORTED") continue;
+      const children = orders.filter(row => row.get("intentId") === intentId);
+      const evidenceExpiry = intent?.get("entryPlan.marketEvidenceExpiresAt");
+      const deadline = intent?.get("deadline");
+      // A never-claimed child past either dispatch deadline has no submission
+      // path. Release its risk only after an atomic, ledger-proved abort.
+      if (!intent || !children.length || !(evidenceExpiry instanceof Date) || !(deadline instanceof Date)
+        || Math.min(+evidenceExpiry, +deadline) >= now) return true;
+      if (children.some(order => !["READY", "PLANNED"].includes(order.get("phase")) || order.get("knowledge") !== "KNOWN"
+        || order.get("cancellation") !== "NONE" || order.get("filledUnits") !== 0
+        || order.get("submissionClaim") || order.get("submissionOutcome") || order.get("brokerOrderId"))) return true;
+      try { await settlement.abortExpiredUnclaimedEntry(intentId); }
+      catch { return true; } // Failed proof or persistence leaves the original hold intact.
+    }
+    return false;
   }
   async start(input: unknown): Promise<Record<string, any>> {
     const config = capturePaperConfig(input), key = config.accountId;
@@ -162,6 +198,8 @@ export class PaperEntryOrchestrator {
   }
   private async runCaptured(sessionId: string, config: Readonly<PaperSessionConfig>, requestedAt: Date) {
     await assertPaperHistoryIndexes(this.connection);
+    const owner = await this.active(sessionId);
+    const sessionConfigFingerprint = owner.get("configFingerprint");
     const cycleId = cycleIdentity(config, requestedAt), previous = await this.history.Cycle.findOne({ cycleId });
     if (previous) {
       if (previous.get("configFingerprint") !== digest(config)) throw new Error("DECISION_CONFLICT");
@@ -171,13 +209,14 @@ export class PaperEntryOrchestrator {
     }
     try { await this.history.Cycle.create({ cycleId, accountId: config.accountId, executionMode: "PAPER", sessionId,
       startupId: this.deps.host.startupId, asset: config.asset, dataMode: config.dataMode,
-      config, configFingerprint: digest(config), window: decisionWindow(requestedAt), timestamp: requestedAt, outcome: "EVALUATING" }); }
+      config, configFingerprint: digest(config), sessionConfigFingerprint,
+      window: decisionWindow(requestedAt), timestamp: requestedAt, outcome: "EVALUATING" }); }
     catch (e) { if ((e as {code?:number}).code === 11000) return {cycleId,outcome:"SKIPPED",reason:"CYCLE_ALREADY_CLAIMED"}; throw e; }
     try {
-      await this.active(sessionId); await this.assertReady(config);
+      await this.active(sessionId); const { indexProof, reconciliationProof, transactionProof } = await this.assertReady(config);
       const block = entryCalendarBlock(config, this.deps.clock());
       if (block) return await this.finish(cycleId, "HOLD", block);
-      if (await this.history.Cycle.exists({ accountId: config.accountId, outcome: "ATTENTION", intentId: { $exists: true } }))
+      if (await this.hasBlockingEntryAttention(config.accountId))
         return await this.finish(cycleId, "HOLD", "EXISTING_ENTRY_REQUIRES_ATTENTION");
       const llmConfig = structuredClone(this.deps.llmConfig());
       const captured = await this.deps.market.capture(config); this.deps.market.assertCurrent(config);
@@ -186,30 +225,65 @@ export class PaperEntryOrchestrator {
       await this.active(sessionId);
       const decision = await evaluateWithPhase5LLM({ ...captured, strategyConfig: config.strategyConfig, llmConfig },
         this.deps.transport, () => this.deps.clock().getTime());
+      // The AI calls consume part of a quote's strict 30-second lifetime.
+      // Rebuild a candidate from current Kite evidence on the same completed
+      // candle before any financial write; the original AI direction has no
+      // authority to select a changed contract or bypass strategy gates.
+      if (decision.action === "CANDIDATE") captured.assertCurrent?.();
+      const admissionCapture = config.dataMode === "KITE_REAL" && decision.action === "CANDIDATE"
+        ? await this.deps.market.capture(config) : captured;
+      const finalDecision = admissionCapture === captured ? decision
+        : revalidatePhase5Candidate(decision, captured.analytics, admissionCapture.analytics,
+          admissionCapture.evaluatedAt, config.strategyConfig, this.deps.clock().getTime());
       // Store bounded structured interpretation, never prompts, credentials or hidden reasoning.
+      const displayAnalytics = projectPaperDisplayAnalytics(admissionCapture.analytics.available
+        ? admissionCapture.analytics : captured.analytics, captured.expiry);
       await this.history.Cycle.updateOne({ cycleId, outcome: "EVALUATING" },
-        { $set: { evaluatedAt: captured.evaluatedAt, decision: decision.evidence, outcome: "DECIDED" } });
-      if (decision.action === "HOLD" || decision.evidence.strategyResult.action !== "CANDIDATE")
-        return await this.finish(cycleId, "HOLD", decision.evidence.reason);
+        { $set: { evaluatedAt: finalDecision.evidence.evaluatedAt, decision: finalDecision.evidence, outcome: "DECIDED",
+          ...(displayAnalytics ? { displayAnalytics } : {}) } });
+      if (finalDecision.action === "HOLD" || finalDecision.evidence.strategyResult.action !== "CANDIDATE")
+        return await this.finish(cycleId, "HOLD", finalDecision.evidence.reason);
       await this.active(sessionId); this.deps.market.assertCurrent(config);
       const lateBlock = entryCalendarBlock(config, this.deps.clock());
       if (lateBlock || decisionWindow(this.deps.clock()) !== decisionWindow(requestedAt))
         return await this.finish(cycleId, "HOLD", lateBlock ?? "DECISION_WINDOW_EXPIRED");
-      captured.assertCurrent?.();
-      const candidate = decision.evidence.strategyResult.candidate;
+      admissionCapture.assertCurrent?.();
+      const candidate = finalDecision.evidence.strategyResult.candidate;
       const scope = this.scope(config.accountId);
       const chain = await new CandidateIntentAdapter(this.connection, scope, this.deps.clock).adapt(candidate, {
         strategyInstanceId: `nse:${config.asset}`, sessionId,
         entryCutoffAt: entryCutoffAt(config, requestedAt),
-        validUntil: new Date(Date.parse(candidate.evaluatedAt) + 60000),
-        orchestration: { cycleId, sessionId, startupId: this.deps.host.startupId } });
+        validUntil: new Date(Math.min(Date.parse(candidate.evaluatedAt)
+          + (candidate.dataMode === "KITE_REAL" && candidate.strategyFamily === "LONG_OPTION"
+            ? KITE_PAPER_LONG_OPTION_DECISION_LIFETIME_MS : 60_000),
+          // The deadline is exclusive; +1 ms retains the approved inclusive
+          // claim at the exact bar/cutoff boundary, but nothing after it.
+          Math.floor(+requestedAt / 300_000) * 300_000 + 300_001)),
+        orchestration: { cycleId, sessionId, startupId: this.deps.host.startupId }, indexProof, reconciliationProof });
       await this.history.Cycle.updateOne({cycleId},{$set:{intentId:chain.intentId,positionId:chain.positionId}});
       await this.active(sessionId);
       // Revalidate captured ownership after adaptation and all intervening awaits.
-      captured.assertCurrent?.();
-      const admission = await new RiskAdmissionService(this.connection, scope, this.deps.clock, this.deps.host).authorizeEntry(chain.intentId, captured.assertCurrent);
+      admissionCapture.assertCurrent?.();
+      const refreshQuote = config.dataMode === "KITE_REAL" && candidate.strategyFamily === "LONG_OPTION"
+        ? async (): Promise<EntryQuoteRenewal> => {
+          const fresh = await this.deps.market.capture(config);
+          const renewed = revalidatePhase5Candidate(finalDecision, admissionCapture.analytics, fresh.analytics,
+            fresh.evaluatedAt, config.strategyConfig, this.deps.clock().getTime());
+          if (renewed.action !== "CANDIDATE" || renewed.evidence.strategyResult.action !== "CANDIDATE")
+            throw new Error(renewed.evidence.reason);
+          fresh.assertCurrent?.();
+          return issueEntryQuoteRenewal(candidate, renewed.evidence.strategyResult.candidate, chain.entryPlan, this.deps.clock());
+        } : undefined;
+      const admission = await new RiskAdmissionService(this.connection, scope, this.deps.clock, this.deps.host).authorizeEntry(chain.intentId, admissionCapture.assertCurrent, indexProof, reconciliationProof, refreshQuote);
       if (admission.status !== "AUTHORIZED") return await this.finish(cycleId,"REJECTED",admission.reason);
-      return await this.progressEntry(cycleId);
+      // Remote ledger verification can leave only a few seconds on the quote.
+      // Renew while the completed-bar evidence is still qualified, before the
+      // claim's database reads consume that remaining lifetime. The renewal
+      // proves the same contract, lot and immutable BUY limit.
+      const expiringSoon = chain.entryPlan.marketEvidenceExpiresAt instanceof Date
+        && +chain.entryPlan.marketEvidenceExpiresAt - +this.deps.clock() < 15_000;
+      const claimQuoteRenewal = admission.quoteRenewal ?? (refreshQuote && expiringSoon ? await refreshQuote() : undefined);
+      return await this.progressEntry(cycleId, { indexProof, reconciliationProof, transactionProof }, refreshQuote, claimQuoteRenewal);
     } catch (e) {
       // Durable chains remain intact. An error after adaptation is never reported as an ordinary HOLD.
       const signal = await this.models.StrategySignal.findOne({ accountId: config.accountId, "orchestration.cycleId": cycleId });
@@ -220,11 +294,13 @@ export class PaperEntryOrchestrator {
   /** Explicit durable progression/recovery hook. Retained fills always ingest, even after stop.
    * Unclaimed children need an active current-host session and all original admission gates.
    */
-  async progressEntry(cycleId: string) {
+  async progressEntry(cycleId: string, proofs?: { indexProof?: VerifiedExecutionIndexes; reconciliationProof?: VerifiedExecutionIndexes; transactionProof?: TransactionCapability },
+    refreshQuote?: () => Promise<EntryQuoteRenewal>, admissionQuoteRenewal?: EntryQuoteRenewal) {
     const cycle = await this.history.Cycle.findOne({cycleId,executionMode:"PAPER"}).orFail();
     if (!cycle.get("intentId") || !["DECIDED","ENTRY","ATTENTION"].includes(cycle.get("outcome"))) throw new Error("DECISION_CONFLICT");
     const scope = this.scope(cycle.get("accountId")), sessionId = cycle.get("sessionId");
     const orders = await this.models.BrokerOrder.find({...scope,intentId:cycle.get("intentId")});
+    const intent = await this.models.OrderIntent.findOne({...scope,intentId:cycle.get("intentId")}).orFail();
     const processor = new FillProcessor(this.connection,scope,this.deps.clock);
     const broker = this.deps.broker(scope);
     if (!(broker instanceof PaperBrokerAdapter)) throw new Error("PAPER_ONLY");
@@ -233,9 +309,13 @@ export class PaperEntryOrchestrator {
     let failure: string | undefined;
     for (const original of orders.sort((a,b)=>a.get("side")===b.get("side")?0:a.get("side")==="BUY"?-1:1)) {
       const orderId = original.get("orderId");
-      // Retained receipt processing is independent of kill/readiness/session gates.
-      const retained = await processor.processRetained(orderId);
-      if (retained.failedTradeKeys.length) { failure="FILL_PROCESSING_REQUIRED"; break; }
+      // A newly admitted READY child cannot have retained broker evidence.
+      // If another worker claims it now, submit() observes that claim and the
+      // post-submit pass below still ingests any retained receipt.
+      if (original.get("submissionClaim") || original.get("submissionOutcome") || original.get("phase") !== "READY") {
+        const retained = await processor.processRetained(orderId);
+        if (retained.failedTradeKeys.length) { failure="FILL_PROCESSING_REQUIRED"; break; }
+      }
       try {
         await this.active(sessionId);
         // An admitted chain keeps its captured complete terms even if optional
@@ -246,7 +326,30 @@ export class PaperEntryOrchestrator {
           // Preserve session/mode gates, but admitted identity no longer depends on the mutable master.
           this.deps.market.assertSessionCurrent?.(config);
           if (original.get("side")==="SELL") await protection.advance(orderId);
-          await manager.submit(orderId);
+          const evidenceExpiry = intent.get("entryPlan.marketEvidenceExpiresAt");
+          // The admitted quote is already qualified. A third full market capture
+          // can consume its remaining lifetime before the first PAPER claim.
+          // Claim directly while it is current; OrderManager checks the clock
+          // again inside the financial transaction before any broker submission.
+          const quoteRenewal = original.get("side") === "BUY"
+            ? admissionQuoteRenewal && +this.deps.clock() <= +admissionQuoteRenewal.expiresAt
+              ? admissionQuoteRenewal
+              : evidenceExpiry instanceof Date && +this.deps.clock() > +evidenceExpiry
+                ? await refreshQuote?.() : undefined
+            : undefined;
+          try {
+            await manager.submit(orderId, undefined, { ...proofs, quoteRenewal });
+          } catch (error) {
+            if (original.get("side") !== "BUY" || !refreshQuote
+              || safeCycleError(error) !== "MARKET_EVIDENCE_EXPIRED") throw error;
+            // A clock crossing during claim can be retried only after proving
+            // that no claim or outcome was committed. An uncertain send is never retried.
+            const current = await this.models.BrokerOrder.findOne({...scope,orderId}).orFail();
+            if (current.get("phase") !== "READY" || current.get("knowledge") !== "KNOWN"
+              || current.get("filledUnits") !== 0 || current.get("submissionClaim")
+              || current.get("submissionOutcome") || current.get("brokerOrderId")) throw error;
+            await manager.submit(orderId, undefined, { ...proofs, quoteRenewal: await refreshQuote() });
+          }
         }
       } catch(e) { failure=safeCycleError(e); }
       const consumed=await processor.processRetained(orderId);

@@ -10,6 +10,9 @@ export const paperExitConfigSchema=z.object({
  family:z.enum(['LONG_OPTION','DEBIT_VERTICAL','CREDIT_VERTICAL']),dataMode:z.literal('KITE_REAL'),
  takeProfitBps:integer.max(100000),stopLossBps:integer.max(100000),maxHoldingMs:integer.max(86400000),
  eodMinuteIST:z.number().int().min(555).max(930),maxAgeMs:integer.max(60000),
+ // A bounded executable LIMIT cushion for risk-reducing PAPER closes. Older
+ // captured policies receive the same conservative default when parsed.
+ maxExitSlippageBps:z.number().int().min(0).max(1000).default(500),
  authorizationMs:integer.min(1000).max(3600000),
  directionalStop:z.literal('DEFERRED_NO_CAPTURED_BASIS'),
 }).strict();
@@ -66,6 +69,7 @@ export function safeExitError(error:unknown):string{
  const raw=error&&typeof error==='object'&&'code'in error?String(error.code):error instanceof Error?error.message:'';
  const allowed=['STALE_MARKET_DATA','QUOTE_UNAVAILABLE','INSTRUMENT_MASTER_STALE','DATA_MODE_REQUIRED','REAL_DATA_REQUIRED','EXIT_QUOTE_REQUIRED',
   'QUALIFIED_INSTRUMENT_REQUIRED','EXIT_IDENTITY_MISMATCH','EXIT_CONFIG_REQUIRED','EXIT_LEASE_LOST','EXIT_QUOTE_TIMEOUT','EXIT_PRICE_NOT_EXECUTABLE',
-  'UNRESOLVED_ENTRY_EXPOSURE','PAPER_NOT_READY','AUTHORIZATION_NOT_CURRENT','CLOSE_POLICY_NOT_CURRENT','EXIT_INDEXES_REQUIRED','POSITION_FILL_EVIDENCE_MISMATCH'];
+  'UNRESOLVED_ENTRY_EXPOSURE','PAPER_NOT_READY','AUTHORIZATION_NOT_CURRENT','CLOSE_POLICY_NOT_CURRENT','EXIT_INDEXES_REQUIRED','POSITION_FILL_EVIDENCE_MISMATCH',
+  'ORDER_OUTCOME_UNRESOLVED'];
  return allowed.includes(raw)?raw:'EXIT_REQUIRES_ATTENTION';
 }

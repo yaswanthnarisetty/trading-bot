@@ -5,27 +5,50 @@ import { join } from "node:path";
 import { KiteInstrumentMasterService } from "../../src/services/KiteInstrumentMasterService";
 import { KiteMarketDataService } from "../../src/services/KiteMarketDataService";
 import { KiteIndexDataService, qualifyIndexMaster } from "../../src/services/KiteIndexDataService";
-import { buildMockMarketAnalytics, buildRealMarketAnalytics, type MockAnalyticsInput } from "../../src/domain/marketAnalytics";
+import { buildMockMarketAnalytics, buildRealMarketAnalytics, isMarketAnalyticsFresh, marketEvidenceExpiry,
+  type MockAnalyticsInput } from "../../src/domain/marketAnalytics";
 import { analyticsEvidenceId } from "../../src/domain/analyticsEvidence";
-import { evaluateWithPhase5LLM, PRIMARY_PROMPT_VERSION, VERIFIER_PROMPT_VERSION,
+import { evaluateWithPhase5LLM, phase5ResponseFormat, PRIMARY_PROMPT_VERSION, VERIFIER_PROMPT_VERSION,
   type LLMCompletion, type LLMCompletionRequest, type Phase5LLMConfig,
   type Phase5LLMTransport } from "../../src/services/Phase5LLMService";
 import { phase5LegacyCompatibleConfig } from "../../src/services/LLMService";
-import { evaluateStrategy, type StrategyQualityConfig } from "../../src/domain/strategyEvaluation";
+import { candidateMarketEvidenceExpiry, evaluateStrategy, type StrategyQualityConfig } from "../../src/domain/strategyEvaluation";
 
 const at = "2026-09-29T08:30:00.000Z", expiryAt = "2026-10-06T10:00:00.000Z";
+test("both AI stages request strict, stage-specific schema output", () => {
+  const primary = phase5ResponseFormat("PRIMARY");
+  const verifier = phase5ResponseFormat("VERIFIER");
+  for (const result of [primary, verifier]) {
+    assert.equal(result.type, "json_schema");
+    assert.equal(result.json_schema.strict, true);
+    assert.equal(result.json_schema.schema.additionalProperties, false);
+    assert.deepEqual(Object.keys(result.json_schema.schema.properties).sort(),
+      [...result.json_schema.schema.required].sort());
+  }
+  assert.deepEqual(primary.json_schema.schema.properties.direction.enum, ["BULLISH", "BEARISH", "HOLD"]);
+  assert.deepEqual(verifier.json_schema.schema.properties.verdict.enum, ["AGREE", "DISAGREE", "HOLD"]);
+  for (const result of [primary, verifier]) {
+    const { confidence, reasonCode, rationale, riskFlags } = result.json_schema.schema.properties;
+    assert.deepEqual([confidence.minimum, confidence.maximum], [0, 1]);
+    assert.equal(reasonCode.pattern, "^[A-Za-z][A-Za-z0-9_:-]{0,63}$");
+    assert.deepEqual([rationale.minLength, rationale.maxLength], [1, 300]);
+    assert.equal(riskFlags.maxItems, 8);
+    assert.equal(riskFlags.items.pattern, reasonCode.pattern);
+  }
+});
 const base = readFileSync(join(__dirname, "../fixtures/kite-instruments.csv"), "utf8");
 const csv = base + [
   "100010,410,NIFTY26O0624900PE,NIFTY,200,2026-10-06,24900,0.05,65,PE,NFO-OPT,NFO",
   "100011,411,NIFTY26O0624800PE,NIFTY,150,2026-10-06,24800,0.05,65,PE,NFO-OPT,NFO",
   "100012,412,NIFTY26O0625100CE,NIFTY,200,2026-10-06,25100,0.05,65,CE,NFO-OPT,NFO",
   "100013,413,NIFTY26O0625200CE,NIFTY,150,2026-10-06,25200,0.05,65,CE,NFO-OPT,NFO",
+  "100014,414,NIFTY26O0622000PE,NIFTY,5,2026-10-06,22000,0.05,65,PE,NFO-OPT,NFO",
   "256265,1001,NIFTY 50,NIFTY 50,25000,,0,0,0,EQ,INDICES,NSE",
   "260105,1002,NIFTY BANK,NIFTY BANK,51000,,0,0,0,EQ,INDICES,NSE",
   "257801,1003,NIFTY FIN SERVICE,NIFTY FIN SERVICE,24000,,0,0,0,EQ,INDICES,NSE",
 ].join("\n") + "\n";
 const tokens = ["100010", "100011", "100012", "100013"];
-const prices: Record<string, number> = { "100010": 200, "100011": 150, "100012": 200, "100013": 150 };
+const prices: Record<string, number> = { "100010": 200, "100011": 150, "100012": 200, "100013": 150, "100014": 5 };
 const assumptions = { evaluatedAt: at, expiryAtByDate: { "2026-10-06": expiryAt },
   expiryAssumptionVersion: "NSE_CLOSE_1530_V1", riskFreeRate: 0.065, riskFreeRateVersion: "TEST_RATE_V1" };
 const candles = Array.from({ length: 50 }, (_, n) => ({
@@ -80,6 +103,19 @@ async function run(responses: Array<string | null | Error | (() => Promise<LLMCo
   return { result, requests: f.requests, analytics };
 }
 
+for (const [failure, expected] of [
+  ["MARKET_DATA_NOT_FRESH", "MARKET_DATA_NOT_FRESH"],
+  ["REAL_DATA_REQUIRED", "REAL_DATA_REQUIRED"],
+  ["INSUFFICIENT_HISTORY", "INSUFFICIENT_HISTORY"],
+  ["INVALID_MARKET_EVIDENCE", "ANALYTICS_UNAVAILABLE"],
+] as const) test(`unqualified market analytics report ${expected} without calling AI`, async () => {
+  const { result, requests } = await run([primary()], { analytics: { available: false, reason: failure } });
+  assert.equal(result.action, "HOLD");
+  assert.equal(result.evidence.reason, expected);
+  assert.equal(result.evidence.primary.status, "NOT_RUN");
+  assert.equal(requests.length, 0);
+});
+
 test("legacy compatible model configuration retains the deployed model and versioned prompts", () => {
   const value = phase5LegacyCompatibleConfig();
   assert.equal(value.primaryModel, "gpt-4o-mini");
@@ -118,6 +154,14 @@ for (const value of [-0.01, 1.01, "0.8", null]) test(`invalid primary confidence
   assert.equal(result.action, "HOLD"); assert.equal(result.evidence.reason, "SCHEMA_REJECTED");
   assert.equal(requests.length, 1);
 });
+test("schema rejection records only the failed field and rule, never AI text", async () => {
+  const raw = JSON.stringify({ direction: "BULLISH", confidence: 0.8, reasonCode: "TREND",
+    rationale: "A private rationale that must not appear in diagnostics.", riskFlags: ["BAD FLAG"] });
+  const { result } = await run([raw]);
+  assert.deepEqual(result.evidence.primary, { status: "FAILED", reason: "SCHEMA_REJECTED",
+    diagnostic: "riskFlags:invalid_string" });
+  assert.equal(result.evidence.verifier.status, "NOT_RUN");
+});
 for (const raw of ["not-json", JSON.stringify({ direction: "BULLISH", confidence: 0.8 }),
   JSON.stringify({ direction: "NEUTRAL", confidence: 0.8, reasonCode: "TREND", rationale: "x", riskFlags: [] }),
   JSON.stringify({ direction: "BULLISH", confidence: 0.8, reasonCode: "TREND", rationale: "x",
@@ -133,6 +177,8 @@ for (const [first, last] of [["HOLD", "BULLISH"], ["BULLISH", "HOLD"]] as const)
     const raw = `{"direction":"${first}","direction":"${last}","confidence":0.8,"reasonCode":"TREND","rationale":"x","riskFlags":[]}`;
     const { result, requests } = await run([raw]);
     assert.equal(result.action, "HOLD"); assert.equal(result.evidence.reason, "SCHEMA_REJECTED");
+    assert.deepEqual(result.evidence.primary, { status: "FAILED", reason: "SCHEMA_REJECTED",
+      diagnostic: "DUPLICATE_MEMBER" });
     assert.equal(requests.length, 1);
   });
 for (const [first, last] of [["DISAGREE", "AGREE"], ["AGREE", "DISAGREE"]] as const)
@@ -385,16 +431,20 @@ test("fixed LLM proposal and issued snapshot produce the same deterministic deci
     b.requests.map(r => [r.systemPrompt, r.userPrompt]));
 });
 
-async function realFixture(clock: () => number = () => Date.parse(at)) {
+async function realFixture(clock: () => number = () => Date.parse(at), agedToken?: string,
+  evaluatedAt = at, maxAgeMs = 1000) {
   const optionMaster = await master(), indexMaster = qualifyIndexMaster(csv, at), index = indexMaster.resolve("NIFTY");
   const calls: string[] = [], success = (data: unknown) => ({ status: "success", data });
+  const wireTimestamp = new Date(Date.parse(evaluatedAt) + 19_800_000).toISOString().replace("T", " ").slice(0, 19);
   const optionMarket = new KiteMarketDataService({ async get(path) {
     calls.push(path); const data: Record<string, unknown> = {};
-    for (const token of ["100010", "100011"]) {
+    const requested = agedToken === "100014" ? [...tokens, agedToken] : ["100010", "100011"];
+    for (const token of requested) {
       const instrument = optionMaster.getByCurrentInstrumentToken(token), price = prices[token]!;
       data[instrument.contractKey] = { instrument_token: Number(token), last_price: price,
         ohlc: { open: price, high: price + 1, low: price - 1, close: price }, volume: 100, oi: 100,
-        timestamp: "2026-09-29 14:00:00", last_trade_time: "2026-09-29 14:00:00",
+        timestamp: token === agedToken ? "2026-09-29 13:59:59" : wireTimestamp,
+        last_trade_time: token === agedToken ? "2026-09-29 13:59:59" : wireTimestamp,
         depth: { buy: [{ price: price - 1, quantity: 65, orders: 1 }],
           sell: [{ price: price + 1, quantity: 65, orders: 1 }] } };
     }
@@ -403,21 +453,33 @@ async function realFixture(clock: () => number = () => Date.parse(at)) {
   const indexMarket = new KiteIndexDataService({ async get(path) {
     calls.push(path);
     if (path === "/quote") return success({ [index.contractKey]: { instrument_token: Number(index.instrumentToken),
-      last_price: 25000, timestamp: "2026-09-29 14:00:00" } });
+      last_price: 25000, timestamp: wireTimestamp } });
     return success({ candles: candles.map(c => [c.timestamp, c.openMinor / 100, c.highMinor / 100,
       c.lowMinor / 100, c.closeMinor / 100, c.volume]) });
   } }, async () => indexMaster, () => "KITE_REAL", clock);
   await optionMarket.refreshMaster(); await indexMarket.refreshMaster();
-  const optionQuotes = await optionMarket.getQuotes(["100010", "100011"].map(token =>
-    optionMaster.getByCurrentInstrumentToken(token)), 1000);
-  const indexQuote = await indexMarket.getQuote(index, 1000);
+  const optionQuotes = await optionMarket.getQuotes((agedToken === "100014" ? [...tokens, agedToken] : ["100010", "100011"]).map(token =>
+    optionMaster.getByCurrentInstrumentToken(token)), maxAgeMs);
+  const indexQuote = await indexMarket.getQuote(index, maxAgeMs);
   const indexHistory = await indexMarket.getHistoricalCandles({ index, interval: "5minute",
-    from: candles[0]!.timestamp, to: at });
-  const analytics = buildRealMarketAnalytics({ ...assumptions, observedAt: at, index,
-    indexQuote, indexHistory, optionQuotes, maxAgeMs: 1000 });
+    from: candles[0]!.timestamp, to: evaluatedAt });
+  const analytics = buildRealMarketAnalytics({ ...assumptions, evaluatedAt, observedAt: evaluatedAt, index,
+    indexQuote, indexHistory, optionQuotes, maxAgeMs });
   assert.equal(analytics.available, true);
   return { analytics, calls };
 }
+test("real candidate quote evidence still expires after 30 seconds", async () => {
+  const evaluatedAt = new Date(Date.parse(at) + 10_000).toISOString();
+  let now = Date.parse(evaluatedAt);
+  const { analytics } = await realFixture(() => now, undefined, evaluatedAt, 30_000);
+  assert.equal(analytics.available, true);
+  if (!analytics.available) return;
+  now += 30_000;
+  assert.equal(isMarketAnalyticsFresh(analytics.snapshot, now), true);
+  assert.equal(marketEvidenceExpiry(analytics.snapshot), now);
+  now += 1;
+  assert.equal(isMarketAnalyticsFresh(analytics.snapshot, now), false);
+});
 test("KITE_REAL evidence stays KITE_REAL through LLM interpretation without broker writes", async () => {
   const { analytics, calls } = await realFixture();
   const { result, requests } = await run([primary(), verifier()], { analytics }, () => Date.parse(at));
@@ -425,6 +487,29 @@ test("KITE_REAL evidence stays KITE_REAL through LLM interpretation without brok
   assert.equal(result.action, "CANDIDATE");
   assert.equal(requests.length, 2);
   assert.deepEqual(calls, ["/quote", "/quote", "/instruments/historical/256265/5minute"]);
+});
+test("an unrelated expiring option cannot stale the AI view or selected PAPER candidate", async () => {
+  let now = Date.parse(at);
+  const { analytics } = await realFixture(() => now, "100014");
+  assert.equal(analytics.available, true);
+  if (!analytics.available) return;
+  now += 300;
+  assert.equal(isMarketAnalyticsFresh(analytics.snapshot, now), false);
+  assert.equal(marketEvidenceExpiry(analytics.snapshot), Date.parse(at));
+  const { result, requests } = await run([primary(), verifier()], { analytics }, () => now);
+  assert.equal(result.action, "CANDIDATE");
+  assert.equal(requests.length, 2);
+  if (result.evidence.strategyResult.action === "CANDIDATE")
+    assert.equal(candidateMarketEvidenceExpiry(result.evidence.strategyResult.candidate), Date.parse(at) + 1000);
+});
+test("an expiring option used by the AI still blocks before any model call", async () => {
+  let now = Date.parse(at);
+  const { analytics } = await realFixture(() => now, "100010");
+  now += 300;
+  const { result, requests } = await run([primary(), verifier()], { analytics }, () => now);
+  assert.equal(result.action, "HOLD");
+  assert.equal(result.evidence.reason, "MARKET_DATA_NOT_FRESH");
+  assert.equal(requests.length, 0);
 });
 test("already-stale issued KITE_REAL analytics cannot call the primary model", async () => {
   let now = Date.parse(at);

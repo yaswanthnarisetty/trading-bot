@@ -11,9 +11,10 @@ import { brokerOrderRequestSchema, type BrokerOrderRequest } from "../brokers/Br
 import { paperSubmissionOutcomeSchema, paperOrderObservationSchema, submissionEvidenceSchema, submissionFingerprint, validateSubmissionEvidence, type SubmissionEvidence } from "../brokers/submissionEvidence";
 import { executionModels } from "../db/executionModels";
 import { loadExecutionChain, requireAggregateVersion } from "../db/executionConcurrency";
-import { checkTransactionCapability } from "../db/executionReadiness";
-import { assertExecutionIndexes } from "../db/executionIndexes";
+import { checkTransactionCapability, hasVerifiedTransactionCapability, type TransactionCapability } from "../db/executionReadiness";
+import { assertExecutionIndexes, hasVerifiedExecutionIndexes, withExecutionIndexProofs, type VerifiedExecutionIndexes } from "../db/executionIndexes";
 import { transitionIntent } from "../domain/IntentStateMachine";
+import { assertEntryQuoteRenewal, withEntryQuoteRenewal, type EntryQuoteRenewal } from "../db/entryQuoteRenewal";
 
 export interface SubmissionState {
   orderId: string; phase: string; knowledge: string; filledUnits: number; version: number;
@@ -41,10 +42,14 @@ export class OrderManager {
     validateExecutionHost(host);
     this.models = executionModels(connection);
   }
-  private async transaction<T>(work: (session: ClientSession) => Promise<T>): Promise<T> {
+  private async transaction<T>(work: (session: ClientSession) => Promise<T>,
+    proofs?: { base: VerifiedExecutionIndexes; reconciliation?: VerifiedExecutionIndexes; quoteRenewal?: EntryQuoteRenewal }): Promise<T> {
     const session = await this.connection.startSession();
     try {
-      return await session.withTransaction(() => withExecutionHost(session, this.host, () => work(session)), { readConcern: { level: "snapshot" }, writeConcern: { w: "majority" } });
+      return await session.withTransaction(() => withEntryQuoteRenewal(session, proofs?.quoteRenewal, () => withExecutionIndexProofs(this.connection, session,
+        proofs ? { BASE: proofs.base, RECONCILIATION: proofs.reconciliation } : {},
+        () => withExecutionHost(session, this.host, () => work(session)))),
+      { readConcern: { level: "snapshot" }, writeConcern: { w: "majority" } });
     } finally { await session.endSession(); }
   }
   private async save(order: Document, session: ClientSession): Promise<void> {
@@ -66,9 +71,12 @@ export class OrderManager {
       occurredAt: now, recordedAt: now, reason: eventType, evidenceRefs: [evidenceRef],
       payload: { kind: "STATE_CHANGE", from, to: order.get("phase") } }).save({ session });
   }
-  private async claim(orderId: string, guard?: (session: ClientSession, order: Document) => Promise<void>): Promise<{ claimed: boolean; state: SubmissionState; request?: BrokerOrderRequest }> {
-    if (!(await checkTransactionCapability(this.connection)).supported) throw new Error("PERSISTENCE_NOT_READY");
-    await assertExecutionIndexes(this.connection);
+  private async claim(orderId: string, guard?: (session: ClientSession, order: Document) => Promise<void>,
+    proofs?: { indexProof?: VerifiedExecutionIndexes; reconciliationProof?: VerifiedExecutionIndexes; transactionProof?: TransactionCapability; quoteRenewal?: EntryQuoteRenewal }): Promise<{ claimed: boolean; state: SubmissionState; request?: BrokerOrderRequest }> {
+    if (!hasVerifiedTransactionCapability(this.connection, proofs?.transactionProof)
+      && !(await checkTransactionCapability(this.connection)).supported) throw new Error("PERSISTENCE_NOT_READY");
+    const baseProof = hasVerifiedExecutionIndexes(this.connection, proofs?.indexProof)
+      ? proofs!.indexProof! : await assertExecutionIndexes(this.connection);
     const claimId = randomUUID();
     return this.transaction(async session => {
       const [account, order] = await loadExecutionChain(this.connection, session, this.scope, [{ entity: "BrokerOrder", id: orderId }]);
@@ -84,7 +92,11 @@ export class OrderManager {
         await guard(session, order); permitExitClaim(session, orderId);
       }
       const now = this.clock();
-      if (intent.get("purpose") === "ENTRY") assertEntryTemporalAuthorization(intent.get("entryPlan"), now);
+      if (intent.get("purpose") === "ENTRY") {
+        if (proofs?.quoteRenewal) assertEntryQuoteRenewal(proofs.quoteRenewal, intent.get("entryPlan"),
+          { contractKey: order.get("contractKey"), limitPriceMinor: order.get("limitPriceMinor"), side: order.get("side") }, now);
+        else assertEntryTemporalAuthorization(intent.get("entryPlan"), now);
+      }
       if (intent.get("purpose") === "ENTRY" && account.get("killSwitchEnabled")) throw new Error("KILL_SWITCH_ACTIVE");
       if (!["RISK_RESERVED", "EXECUTING"].includes(intent.get("state")) || !["HELD", "PARTIALLY_CONSUMED"].includes(reservation.get("state"))
         || authorization.expiresAt.getTime() <= now.getTime() || intent.get("deadline").getTime() <= now.getTime()
@@ -100,7 +112,8 @@ export class OrderManager {
       if (order.get("brokerNamespace") !== "PAPER_SIM_V1" || submissionFingerprint(request) !== order.get("requestFingerprint")) throw new Error("AUTHORIZED_REQUEST_MISMATCH");
       order.set({ phase: "SUBMITTING", submissionClaim: { claimId, reservationId: authorization.reservationId,
         evidenceRef: authorization.evidenceRef, policyVersion: authorization.policyVersion, executionEpoch: authorization.executionEpoch,
-        claimedAt: now, expiresAt: authorization.expiresAt, request, requestFingerprint: order.get("requestFingerprint") } });
+        claimedAt: now, expiresAt: authorization.expiresAt, request, requestFingerprint: order.get("requestFingerprint"),
+        ...(proofs?.quoteRenewal ? { quoteRenewal: proofs.quoteRenewal } : {}) } });
       // This save invokes the mandatory chain/position/reservation/financial write boundary and account CAS fence.
       await this.save(order, session);
       if (intent.get("state") === "RISK_RESERVED") {
@@ -109,10 +122,14 @@ export class OrderManager {
         intent.set("state", next.value); await this.save(intent, session);
       }
       await this.audit(order, "SUBMISSION_CLAIMED", "READY", authorization.evidenceRef, session);
-      if (intent.get("purpose") === "ENTRY") assertEntryTemporalAuthorization(intent.get("entryPlan"), this.clock());
+      if (intent.get("purpose") === "ENTRY") {
+        if (proofs?.quoteRenewal) assertEntryQuoteRenewal(proofs.quoteRenewal, intent.get("entryPlan"),
+          { contractKey: order.get("contractKey"), limitPriceMinor: order.get("limitPriceMinor"), side: order.get("side") }, this.clock());
+        else assertEntryTemporalAuthorization(intent.get("entryPlan"), this.clock());
+      }
       if (order.get("closePlan.monitorDecisionId")) await guard!(session, order);
       return { claimed: true, state: stateOf(order), request };
-    });
+    }, { base: baseProof, reconciliation: proofs?.reconciliationProof, quoteRenewal: proofs?.quoteRenewal });
   }
   private async collect(request: BrokerOrderRequest): Promise<SubmissionEvidence> {
     // Called only after claim transaction commit AND session end. Never invoked by a retried transaction callback.
@@ -168,10 +185,11 @@ export class OrderManager {
       return stateOf(order);
     });
   }
-  async submit(input: string, guard?: (session: ClientSession, order: Document) => Promise<void>): Promise<SubmissionResult> {
+  async submit(input: string, guard?: (session: ClientSession, order: Document) => Promise<void>,
+    proofs?: { indexProof?: VerifiedExecutionIndexes; reconciliationProof?: VerifiedExecutionIndexes; transactionProof?: TransactionCapability; quoteRenewal?: EntryQuoteRenewal }): Promise<SubmissionResult> {
     const orderId = identifierSchema.parse(input);
     let claim: Awaited<ReturnType<OrderManager["claim"]>>;
-    try { claim = await this.claim(orderId, guard); }
+    try { claim = await this.claim(orderId, guard, proofs); }
     catch (error) {
       // An uncertain commit is never permission to send. No physical retry occurs here.
       if (error instanceof Error && "hasErrorLabel" in error && typeof error.hasErrorLabel === "function"

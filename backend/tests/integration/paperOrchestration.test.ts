@@ -10,6 +10,7 @@ import { createExecutionIndexes,executionModels } from "../../src/db/executionMo
 import { PaperEntryOrchestrator, type PaperOrchestrationDependencies } from "../../src/services/PaperEntryOrchestrator";
 import { PaperBrokerAdapter,type PaperScenario } from "../../src/brokers/PaperBrokerAdapter";
 import { RiskControlService } from "../../src/services/RiskControlService";
+import { RiskSettlementService } from "../../src/services/RiskSettlementService";
 import { FillProcessor } from "../../src/services/FillProcessor";
 import { config,evaluationTime,fakeLLM,llmConfig,mockCapture,realProvider } from "../fixtures/paperOrchestration";
 import { readPaperDashboard } from "../../src/services/PaperDashboardReadService";
@@ -118,7 +119,13 @@ for(const family of ['DEBIT_VERTICAL','CREDIT_VERTICAL'] as const)test(`real ${f
 for(const side of ['BUY','SELL'])test(`real UNKNOWN ${side} cannot blind retry; owned late fills remain ingestible`,async()=>{
  scenario=(s,q,p)=>s===side?{submission:'AMBIGUOUS',steps:[{kind:'FILL',quantityUnits:q,priceMinor:p}]}:{submission:'ACCEPTED',initialFills:[{quantityUnits:q,priceMinor:p}]};
  const {session,result}=await cycle();assert.equal(result.outcome,'ATTENTION');const prior=calls.length;
- await core.runEvaluationCycle(session.sessionId);await core.progressEntry(result.cycleId!);assert.equal(calls.length,prior);
+ now=new Date(+now+300000);
+ const blocked=await core.runEvaluationCycle(session.sessionId);assert.equal(blocked.outcome,'HOLD');
+ assert.equal(blocked.reason,'EXISTING_ENTRY_REQUIRES_ATTENTION');
+ const uncertainIntent=(await models.OrderIntent.findOne().orFail()).get('intentId');
+ await assert.rejects(new RiskSettlementService(connection,f.scope,clock).abortExpiredUnclaimedEntry(uncertainIntent),/NO_SUBMISSION_RISK_PROOF_REQUIRED/);
+ assert.equal(await models.RiskReservation.countDocuments({state:'HELD'}),1);
+ await core.progressEntry(result.cycleId!);assert.equal(calls.length,prior);
  const order=await models.BrokerOrder.findOne({side,knowledge:'UNKNOWN'}).orFail();await broker.advance({...f.scope,orderId:order.get('orderId')});
  await core.stop(session.sessionId);for(const trade of await broker.getTrades(f.scope))await new FillProcessor(connection,f.scope,clock).process(trade);
  assert.equal((await models.BrokerOrder.findById(order._id).orFail()).get('filledUnits'),65);
@@ -160,6 +167,43 @@ for(const family of ['LONG_OPTION','DEBIT_VERTICAL','CREDIT_VERTICAL'] as const)
  const fixture=await realProvider(clock);deps.market=fixture.provider;const s=await core.start({...config(family),dataMode:'KITE_REAL'});
  const r=await core.runEvaluationCycle(s.sessionId);assert.equal(r.outcome,'ENTRY',JSON.stringify(r));
  assert.equal((await models.OrderIntent.findOne().orFail()).get('entryPlan.dataMode'),'KITE_REAL');assert.equal(await models.Fill.countDocuments(),family==='LONG_OPTION'?1:2);
+});
+test('metadata-completed monitoring config passes the exact RUNNING-session financial fence',async()=>{
+ const fixture=await realProvider(clock);deps.market=fixture.provider;
+ const complete=config('LONG_OPTION');
+ deps.entryConfig=async c=>completePaperEntryConfig(c,{calendar:complete.calendar,
+   riskFreeRate:complete.riskFreeRate,riskFreeRateVersion:complete.riskFreeRateVersion});
+ const monitoring={...complete,dataMode:'KITE_REAL' as const,calendar:null,riskFreeRate:null,riskFreeRateVersion:null};
+ const session=await core.startMonitoring(monitoring);
+ await fixture.provider.prepare({...complete,dataMode:'KITE_REAL'});
+ const result=await core.runEvaluationCycle(session.sessionId);
+ assert.equal(result.outcome,'ENTRY',JSON.stringify(result));
+ assert.equal(await models.Fill.countDocuments(),1);
+ const cycle=await core.history.Cycle.findOne({cycleId:result.cycleId}).orFail();
+ assert.equal(cycle.get('sessionConfigFingerprint'),
+   (await core.active(session.sessionId)).get('configFingerprint'));
+ assert.notEqual(cycle.get('configFingerprint'),cycle.get('sessionConfigFingerprint'));
+});
+test('qualified KITE_REAL display evidence survives stop and remains account-scoped across sessions',async()=>{
+ const fixture=await realProvider(clock);deps.market=fixture.provider;
+ const first=await core.start({...config('LONG_OPTION'),dataMode:'KITE_REAL'});
+ const result=await core.runEvaluationCycle(first.sessionId);assert.equal(result.outcome,'ENTRY');
+ const recorded=await readPaperDashboard(connection,first.sessionId,true,host.startupId);
+ assert.equal(recorded.displayAnalytics?.source,'KITE');
+ assert.equal(recorded.displayAnalytics?.dataMode,'KITE_REAL');
+ assert.equal(recorded.displayAnalytics?.spotMinor,2499800);
+ assert.ok(recorded.displayAnalytics?.indicators.rsi !== undefined);
+ assert.ok(recorded.displayAnalytics?.option?.impliedVolatility);
+ await core.stop(first.sessionId);
+ await core.history.Cycle.collection.insertOne({cycleId:'foreign-display',accountId:'PAPER:foreign',executionMode:'PAPER',
+  asset:'NIFTY',dataMode:'KITE_REAL',sessionId:'foreign-session',timestamp:new Date(+now+1000),
+  displayAnalytics:{...recorded.displayAnalytics,spotMinor:1}});
+ const next=await core.start({...config('LONG_OPTION'),dataMode:'KITE_REAL'});
+ const afterHours=await readPaperDashboard(connection,next.sessionId,true,host.startupId);
+ assert.equal(afterHours.decisions.length,0);
+ assert.equal(afterHours.recentDecisions[0]?.sessionId,first.sessionId);
+ assert.equal(afterHours.displayAnalytics?.sessionId,first.sessionId);
+ assert.equal(afterHours.displayAnalytics?.spotMinor,2499800);
 });
 for(const failure of ['stale','unavailable','replaced'] as const)test(`real qualified ${failure} evidence cannot enter`,async()=>{
  const f=await realProvider(clock);deps.market=f.provider;const s=await core.start({...config(),dataMode:'KITE_REAL'});
@@ -217,9 +261,28 @@ async function beforeClaim(work:()=>void, run:()=>Promise<void>) {
  OrderManager.prototype.submit=async function(...args){work();return original.apply(this,args);};
  try{await run();}finally{OrderManager.prototype.submit=original;}
 }
+async function afterAdmission(work:()=>Promise<void>|void, run:()=>Promise<void>) {
+ const original=RiskAdmissionService.prototype.authorizeEntry;
+ RiskAdmissionService.prototype.authorizeEntry=async function(...args){const result=await original.apply(this,args);if(result.status==='AUTHORIZED')await work();return result;};
+ try{await run();}finally{RiskAdmissionService.prototype.authorizeEntry=original;}
+}
+test('real same-candle quote renewal permits admission after the original 30-second evidence expires',async()=>{
+ const {session}=await realLong();
+ const capture=deps.market.capture.bind(deps.market);let captures=0;
+ deps.market.capture=async config=>{captures++;return capture(config);};
+ await afterAdapt(()=>{now=new Date(+now+40000);},async()=>{
+  const result=await core.runEvaluationCycle(session.sessionId);
+  assert.equal(result.outcome,'ENTRY',JSON.stringify(result));
+  assert.equal(captures,3); // Initial, post-AI, and admission renewal; dispatch reuses the issued proof.
+  assert.deepEqual(calls,['BUY']);
+  assert.equal(await models.Fill.countDocuments(),1);
+  assert.equal((await models.Position.findOne().orFail()).get('lifecycle'),'OPEN');
+  assert.ok((await models.BrokerOrder.findOne().orFail()).get('submissionClaim.quoteRenewal'));
+ });
+});
 for(const bound of ['evidence','cutoff'] as const)test(`P1 real ${bound} expires before NEW admission; concurrent retry remains rejected`,async()=>{
  const {session}=await realLong(bound==='cutoff'?new Date('2026-09-29T09:29:45Z'):evaluationTime);
- await afterAdapt(()=>{now=new Date(+now+(bound==='cutoff'?20000:40000));},async()=>{
+ await afterAdapt(()=>{now=new Date(+now+(bound==='cutoff'?20000:125000));},async()=>{
   const r=await core.runEvaluationCycle(session.sessionId);assert.equal(r.outcome,'REJECTED',JSON.stringify(r));
   assert.equal(r.reason,bound==='cutoff'?'ENTRY_CUTOFF_PASSED':'MARKET_EVIDENCE_EXPIRED');
   const intent=await models.OrderIntent.findOne().orFail();
@@ -234,13 +297,139 @@ for(const bound of ['evidence','cutoff'] as const)test(`P1 real ${bound} expires
 });
 for(const bound of ['evidence','cutoff'] as const)test(`P1 real ${bound} expires before INITIAL claim; admitted reservation remains durable`,async()=>{
  const {session}=await realLong(bound==='cutoff'?new Date('2026-09-29T09:29:45Z'):evaluationTime);
- await beforeClaim(()=>{now=new Date(+now+(bound==='cutoff'?20000:40000));},async()=>{
+ await beforeClaim(()=>{now=new Date(+now+(bound==='cutoff'?20000:65000));},async()=>{
   const r=await core.runEvaluationCycle(session.sessionId);assert.equal(r.outcome,'ATTENTION');
   assert.equal(r.reason,bound==='cutoff'?'ENTRY_CUTOFF_PASSED':'MARKET_EVIDENCE_EXPIRED');
   const order=await models.BrokerOrder.findOne().orFail();assert.equal(order.get('phase'),'READY');assert.equal(order.get('submissionClaim'),undefined);
   assert.equal(await models.RiskReservation.countDocuments({state:'HELD'}),1);assert.equal(await models.Fill.countDocuments(),0);
   assert.equal((await models.TradingAccount.findOne().orFail()).get('positionSlots'),1);assert.deepEqual(calls,[]);
  });
+});
+test('real expired unclaimed PAPER entry is proved never submitted, settled, then permits a fresh cycle',async()=>{
+ const {session}=await realLong();
+ await beforeClaim(()=>{now=new Date(+now+65000);},async()=>{
+  const first=await core.runEvaluationCycle(session.sessionId);
+  assert.equal(first.outcome,'ATTENTION');assert.equal(first.reason,'MARKET_EVIDENCE_EXPIRED');
+ });
+ const oldOrder=await models.BrokerOrder.findOne().orFail();
+ assert.equal(oldOrder.get('phase'),'READY');assert.equal(oldOrder.get('submissionClaim'),undefined);
+ now=new Date(+evaluationTime+300000);
+ const next=await core.runEvaluationCycle(session.sessionId);
+ assert.equal(next.outcome,'ENTRY',JSON.stringify(next));assert.deepEqual(calls,['BUY']);
+ assert.equal(await models.RiskReservation.countDocuments({intentId:oldOrder.get('intentId'),state:'RELEASED'}),1);
+ assert.equal(await models.RiskReservation.countDocuments(),2);
+ assert.equal(await models.Fill.countDocuments(),1);
+ const retired=await models.BrokerOrder.findOne({orderId:oldOrder.get('orderId')}).orFail();
+ assert.equal(retired.get('phase'),'NOT_SENT');assert.equal(retired.get('submissionClaim'),undefined);
+ assert.equal((await models.Position.findOne({entryIntentId:oldOrder.get('intentId')}).orFail()).get('lifecycle'),'ABORTED');
+ assert.equal(await models.TradingEvent.countDocuments({eventType:'ENTRY_RISK_SETTLED',reason:'PROVEN_NEVER_SUBMITTED_ENTRY'}),1);
+});
+test('real same-candle quote renewal permits claim after the original 30-second evidence expires',async()=>{
+ const {session}=await realLong();
+ await afterAdmission(()=>{now=new Date(+now+35000);},async()=>{
+  const result=await core.runEvaluationCycle(session.sessionId);
+  assert.equal(result.outcome,'ENTRY',JSON.stringify(result));assert.deepEqual(calls,['BUY']);
+  const order=await models.BrokerOrder.findOne().orFail(),intent=await models.OrderIntent.findOne().orFail();
+  assert.ok(+intent.get('entryPlan.marketEvidenceExpiresAt') < +order.get('submissionClaim.claimedAt'));
+  assert.ok(+order.get('submissionClaim.quoteRenewal.expiresAt') >= +order.get('submissionClaim.claimedAt'));
+  assert.equal(await models.Fill.countDocuments(),1);
+ });
+});
+test('real near-expiry quote renews before slow claim reads exhaust its evidence',async()=>{
+ const {session}=await realLong();
+ const capture=deps.market.capture.bind(deps.market);let captures=0;
+ deps.market.capture=async config=>{
+  if(+now > +evaluationTime+30000)throw new Error('MARKET_DATA_NOT_FRESH');
+  captures++;return capture(config);
+ };
+ await afterAdmission(()=>{now=new Date(+evaluationTime+22000);},async()=>{
+  await beforeClaim(()=>{now=new Date(+evaluationTime+35000);},async()=>{
+   const result=await core.runEvaluationCycle(session.sessionId);
+   assert.equal(result.outcome,'ENTRY',JSON.stringify(result));
+   assert.equal(captures,3); // Initial, post-AI, proactive claim renewal.
+   const order=await models.BrokerOrder.findOne().orFail();
+   assert.ok(+order.get('submissionClaim.claimedAt')>+order.get('submissionClaim.quoteRenewal.observedAt'));
+   assert.equal(await models.Fill.countDocuments(),1);
+  });
+ });
+});
+test('real quote can rise inside the pre-approved PAPER buy limit and still reserve its full risk',async()=>{
+ const {wire,session}=await realLong();
+ await afterAdapt(async()=>{
+  const intent=await models.OrderIntent.findOne().orFail();
+  const leg=intent.get('entryPlan.legs')[0];
+  const cycle=await core.history.Cycle.findOne().orFail();
+  const originalAsk=cycle.get('decision.strategyResult.candidate.legs')[0].priceMinor;
+  const limit=leg.limitPriceMinor;
+  assert.ok(limit>originalAsk);
+  wire.state.exitPrices[leg.contractKey]={bidMinor:limit-100,askMinor:limit};
+  now=new Date(+now+40000);
+ },async()=>{
+  const result=await core.runEvaluationCycle(session.sessionId);
+  assert.equal(result.outcome,'ENTRY',JSON.stringify(result));
+  const order=await models.BrokerOrder.findOne().orFail();
+  assert.equal(order.get('limitPriceMinor'),(await models.OrderIntent.findOne().orFail()).get('entryPlan.legs')[0].limitPriceMinor);
+  assert.ok(order.get('submissionClaim.quoteRenewal'));
+  assert.equal(await models.Fill.countDocuments(),1);
+ });
+});
+test('real remote handoff beyond one minute can still claim a newly qualified same-bar quote',async()=>{
+ const {session}=await realLong();
+ await afterAdmission(()=>{now=new Date(+now+75000);},async()=>{
+  const result=await core.runEvaluationCycle(session.sessionId);
+  assert.equal(result.outcome,'ENTRY',JSON.stringify(result));
+  const order=await models.BrokerOrder.findOne().orFail(),intent=await models.OrderIntent.findOne().orFail();
+  assert.equal(+intent.get('deadline'),+evaluationTime+120000);
+  assert.ok(+order.get('submissionClaim.claimedAt')>+evaluationTime+60000);
+  assert.ok(+order.get('submissionClaim.quoteRenewal.expiresAt')>=+order.get('submissionClaim.claimedAt'));
+  assert.equal(await models.Fill.countDocuments(),1);
+ });
+});
+test('real fresh admitted quote claims without a redundant full market capture',async()=>{
+ const {session}=await realLong();
+ const capture=deps.market.capture.bind(deps.market);let captures=0;
+ deps.market.capture=async config=>{captures++;return capture(config);};
+ const result=await core.runEvaluationCycle(session.sessionId);
+ assert.equal(result.outcome,'ENTRY',JSON.stringify(result));
+ assert.equal(captures,2);assert.deepEqual(calls,['BUY']);
+ assert.equal(await models.Fill.countDocuments(),1);
+});
+test('real quote expiry during unclaimed claim renews once without a blind PAPER retry',async()=>{
+ const {session}=await realLong();let advanced=false;
+ await beforeClaim(()=>{if(!advanced){advanced=true;now=new Date(+now+40000);}},async()=>{
+  const result=await core.runEvaluationCycle(session.sessionId);
+  assert.equal(result.outcome,'ENTRY',JSON.stringify(result));
+  assert.deepEqual(calls,['BUY']);
+  const order=await models.BrokerOrder.findOne().orFail();
+  assert.ok(order.get('submissionClaim.quoteRenewal'));
+  assert.equal(await models.Fill.countDocuments(),1);
+ });
+});
+test('real quote renewal rejects a worse option price without a PAPER submission',async()=>{
+ const {wire,session}=await realLong();
+ await afterAdmission(async()=>{
+  const order=await models.BrokerOrder.findOne().orFail(),price=order.get('limitPriceMinor');
+  wire.state.exitPrices[order.get('contractKey')]={bidMinor:price+500,askMinor:price+1000};
+  now=new Date(+now+35000);
+ },async()=>{
+  const result=await core.runEvaluationCycle(session.sessionId);
+  assert.equal(result.outcome,'ATTENTION',JSON.stringify(result));assert.deepEqual(calls,[]);
+  const order=await models.BrokerOrder.findOne().orFail();assert.equal(order.get('phase'),'READY');assert.equal(order.get('submissionClaim'),undefined);
+  assert.equal(await models.Fill.countDocuments(),0);
+ });
+});
+test('real cloned quote-renewal metadata cannot authorize a PAPER claim',async()=>{
+ const {session}=await realLong(),original=OrderManager.prototype.submit;
+ OrderManager.prototype.submit=async function(orderId,guard,proofs){
+  return original.call(this,orderId,guard,proofs?.quoteRenewal
+    ? {...proofs,quoteRenewal:structuredClone(proofs.quoteRenewal)} : proofs);
+ };
+ try{
+  let result:Awaited<ReturnType<typeof core.runEvaluationCycle>>;
+  await afterAdmission(()=>{now=new Date(+now+35000);},async()=>{result=await core.runEvaluationCycle(session.sessionId);});
+  assert.equal(result!.outcome,'ATTENTION',JSON.stringify(result!));assert.deepEqual(calls,[]);
+  const order=await models.BrokerOrder.findOne().orFail();assert.equal(order.get('phase'),'READY');assert.equal(order.get('submissionClaim'),undefined);
+ }finally{OrderManager.prototype.submit=original;}
 });
 for(const boundary of ['admission','claim'] as const)test(`P1 real evidence expiry is inclusive at ${boundary}`,async()=>{
  const {session}=await realLong();const advance=()=>{now=new Date(+evaluationTime+30000);};

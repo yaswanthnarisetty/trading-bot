@@ -8,7 +8,7 @@ import { randomUUID } from "node:crypto";
 import type { ClientSession, Connection, Document } from "mongoose";
 import { executionScopeSchema, identifierSchema, type ExecutionScope } from "@trading-bot/shared";
 import { executionModels } from "../db/executionModels";
-import { assertExecutionIndexes } from "../db/executionIndexes";
+import { assertExecutionIndexes, hasVerifiedExecutionIndexes, withExecutionIndexProofs, type VerifiedExecutionIndexes } from "../db/executionIndexes";
 import { requireAggregateVersion } from "../db/executionConcurrency";
 import { assertEntryTemporalAuthorization, calculateEntryRisk, checkedRiskUnits, entryRiskPolicySchema, EntryRiskError, riskAssert,
   verifyEntryReservation, type EntryRiskReason } from "../domain/entryRisk";
@@ -16,8 +16,10 @@ import { assertAccountEntryProjection, loadAccountEntryProjection } from "../db/
 import { transitionIntent } from "../domain/IntentStateMachine";
 import { brokerOrderRequestSchema } from "../brokers/BrokerAdapter";
 import { submissionFingerprint } from "../brokers/submissionEvidence";
+import { assertEntryQuoteRenewal, type EntryQuoteRenewal } from "../db/entryQuoteRenewal";
 
-export type EntryAdmissionResult = { status: "AUTHORIZED"; intentId: string; reservationId: string; orderIds: string[]; requiredRiskMinor: number }
+export type EntryAdmissionResult = { status: "AUTHORIZED"; intentId: string; reservationId: string; orderIds: string[]; requiredRiskMinor: number;
+  /** Issued same-contract quote proof retained for the immediate unclaimed claim. */ quoteRenewal?: EntryQuoteRenewal }
   | { status: "REJECTED"; intentId: string; reason: EntryRiskReason };
 const plain = (doc: Document): Record<string, unknown> => doc.toObject();
 
@@ -48,15 +50,18 @@ export class RiskAdmissionService {
     assertAccountEntryProjection(plain(account), projection);
     return projection;
   }
-  async authorizeEntry(input: string, assertQualificationCurrent?: () => void): Promise<EntryAdmissionResult> {
+  async authorizeEntry(input: string, assertQualificationCurrent?: () => void,
+    indexProof?: VerifiedExecutionIndexes, reconciliationIndexProof?: VerifiedExecutionIndexes,
+    refreshQuote?: () => Promise<EntryQuoteRenewal>): Promise<EntryAdmissionResult> {
     const intentId = identifierSchema.parse(input);
-    await assertExecutionIndexes(this.connection);
+    const baseProof = hasVerifiedExecutionIndexes(this.connection, indexProof) ? indexProof! : await assertExecutionIndexes(this.connection);
     const session = await this.connection.startSession();
     try {
-      return await session.withTransaction(() => withExecutionHost(session, this.host, async (): Promise<EntryAdmissionResult> => {
+      return await session.withTransaction(() => withExecutionIndexProofs(this.connection, session,
+        { BASE: baseProof, RECONCILIATION: reconciliationIndexProof }, () => withExecutionHost(session, this.host, async (): Promise<EntryAdmissionResult> => {
         const account = await this.models.TradingAccount.findOne(this.scope).session(session);
         riskAssert(account && account.get("broker") === "PAPER" && account.get("admissionStatus") === "PAPER_READY", "ACCOUNT_NOT_READY");
-        await assertAccountReconciliationIndexes(this.connection, plain(account));
+        const reconciliationProof = await assertAccountReconciliationIndexes(this.connection, plain(account), reconciliationIndexProof);
         assertCurrentRecoveryHost(plain(account), this.host);
         const intent = await this.models.OrderIntent.findOne({ ...this.scope, intentId }).session(session);
         riskAssert(intent, "INTENT_NOT_FOUND"); riskAssert(intent.get("purpose") === "ENTRY", "ENTRY_ONLY");
@@ -65,6 +70,36 @@ export class RiskAdmissionService {
         riskAssert(position && signal && position.get("strategyInstanceId") === signal.get("strategyInstanceId")
           && position.get("sessionId") === signal.get("sessionId") && intent.get("closeGeneration") === 0, "STALE_EXECUTION_CHAIN");
         const requirement = calculateEntryRisk(intent.get("targetLegs"), intent.get("entryPlan"));
+        let renewedQuote: EntryQuoteRenewal | undefined;
+        const assertCurrentEntryEvidence = async () => {
+          const checkedAt = this.clock();
+          try { assertEntryTemporalAuthorization(intent.get("entryPlan"), checkedAt); return; }
+          catch (error) {
+            if (!(error instanceof EntryRiskError) || error.reason !== "MARKET_EVIDENCE_EXPIRED" || !refreshQuote) throw error;
+          }
+          // A reservation has no broker effect. Still, an expired original quote
+          // may authorize it only with a new evaluator-issued proof for the same
+          // contract, lot and fixed BUY limit. The claim checks its own fresh proof.
+          if (!renewedQuote || +renewedQuote.expiresAt < +checkedAt) {
+            try { renewedQuote = await refreshQuote(); }
+            catch (error) {
+              if (error instanceof Error && error.message === "QUOTE_MOVED_BEYOND_LIMIT")
+                throw new EntryRiskError("QUOTE_MOVED_BEYOND_LIMIT");
+              if (error instanceof Error && ["MARKET_DATA_NOT_FRESH", "MARKET_EVIDENCE_EXPIRED", "NO_QUALIFIED_CONTRACT"].includes(error.message))
+                throw new EntryRiskError("MARKET_EVIDENCE_EXPIRED");
+              throw error;
+            }
+          }
+          const leg = requirement.legs[0];
+          riskAssert(requirement.family === "LONG_OPTION" && requirement.legs.length === 1 && leg?.side === "BUY",
+            "MARKET_EVIDENCE_EXPIRED");
+          try { assertEntryQuoteRenewal(renewedQuote, intent.get("entryPlan"),
+            { contractKey: leg.contractKey, limitPriceMinor: leg.limitPriceMinor, side: leg.side }, this.clock()); }
+          catch (error) {
+            if (error instanceof Error && error.message === "ENTRY_CUTOFF_PASSED") throw new EntryRiskError("ENTRY_CUTOFF_PASSED");
+            throw new EntryRiskError("MARKET_EVIDENCE_EXPIRED");
+          }
+        };
         const positionLegs = position.get("legs") as { legId: string; contractKey: string; entrySide: string; targetUnits: number }[];
         riskAssert(positionLegs.length === requirement.legs.length && requirement.legs.every(leg => positionLegs.some(p =>
           p.legId === leg.legId && p.contractKey === leg.contractKey && p.entrySide === leg.side && p.targetUnits === leg.quantityUnits)), "STALE_EXECUTION_CHAIN");
@@ -94,12 +129,12 @@ export class RiskAdmissionService {
           return { status: "AUTHORIZED", intentId, reservationId: existing.get("reservationId"),
             orderIds: children.map(child => String(child.get("orderId"))).sort(), requiredRiskMinor: requirement.requiredRiskMinor };
         }
-        riskAssert(await reconciliationAdmissionHealthy(this.connection, session, this.scope, plain(account)), "RECONCILIATION_REQUIRED");
+        riskAssert(await reconciliationAdmissionHealthy(this.connection, session, this.scope, plain(account), reconciliationProof), "RECONCILIATION_REQUIRED");
         riskAssert(["CREATED", "RISK_PENDING"].includes(intent.get("state")) && !children.length
           && position.get("lifecycle") === "PENDING_ENTRY" && position.get("integrity") === "CONSISTENT"
           && position.get("activeCloseIntentId") === null, "STALE_EXECUTION_CHAIN");
         const now = this.clock(), expiresAt = new Date(Math.min(requirement.expiresAt.getTime(), intent.get("deadline").getTime()));
-        assertEntryTemporalAuthorization(intent.get("entryPlan"), now);
+        await assertCurrentEntryEvidence();
         riskAssert(expiresAt.getTime() > now.getTime() && signal.get("expiresAt").getTime() > now.getTime()
           && intent.get("policyVersion") === account.get("policyVersion"), "STALE_EXECUTION_CHAIN");
         const policy = entryRiskPolicySchema.safeParse(account.get("entryRiskPolicy"));
@@ -116,12 +151,14 @@ export class RiskAdmissionService {
         const slots = held.reservedSlots + held.committedSlots + 1n;
         riskAssert(total <= BigInt(policy.data.maxReservedRiskMinor), "RISK_CAPACITY_EXCEEDED");
         riskAssert(slots <= BigInt(policy.data.maxPositionSlots), "POSITION_LIMIT_EXCEEDED");
-        assertEntryTemporalAuthorization(intent.get("entryPlan"), this.clock());
+        const sequence = account.get("nextEventSequence");
+        riskAssert(Number.isSafeInteger(sequence) && sequence > 0 && sequence < Number.MAX_SAFE_INTEGER, "RISK_ARITHMETIC_OVERFLOW");
+        await assertCurrentEntryEvidence();
         riskAssert(!signal.get("orchestration") || intent.get("entryPlan.dataMode") !== "KITE_REAL"
           || typeof assertQualificationCurrent === "function", "STALE_EXECUTION_CHAIN");
         assertQualificationCurrent?.(); // Pure captured ownership check; no broker I/O, including on transaction retry.
         // This first CAS write serializes competing admissions before any authorization.
-        account.set({ ...daily, reservedExposureMinor: checkedRiskUnits(pending), reservedMarginMinor: checkedRiskUnits(pending), positionSlots: checkedRiskUnits(slots), committedPositionSlots: checkedRiskUnits(held.committedSlots) });
+        account.set({ ...daily, reservedExposureMinor: checkedRiskUnits(pending), reservedMarginMinor: checkedRiskUnits(pending), positionSlots: checkedRiskUnits(slots), committedPositionSlots: checkedRiskUnits(held.committedSlots), nextEventSequence: sequence + 1 });
         await withDayWrite(session, () => this.save(account, session));
         const reservationId = randomUUID(), base = { ...this.scope, schemaVersion: 1, correlationId: intent.get("correlationId"),
           createdAt: now, updatedAt: now, version: 0 };
@@ -132,7 +169,10 @@ export class RiskAdmissionService {
           positionSlots: 1, policyVersion: account.get("policyVersion"), entryAdmission: { ...(requirement.family ? { family: requirement.family } : {}), positionId: position.get("positionId"),
             economicsFingerprint: requirement.fingerprint, generation: 0, executionEpoch: account.get("executionEpoch"), policyVersion: account.get("policyVersion") } });
         await reservation.save({ session });
-        if (intent.get("state") === "CREATED") { this.transition(intent, "RISK_PENDING"); await this.save(intent, session); }
+        // Both transitions occur inside one atomic transaction. No reader can
+        // observe the intermediate RISK_PENDING state, so persist only the
+        // fully reserved state after validating each legal transition.
+        if (intent.get("state") === "CREATED") this.transition(intent, "RISK_PENDING");
         this.transition(intent, "RISK_RESERVED", reservationId); await this.save(intent, session);
         const orderIds: string[] = [];
         for (const leg of requirement.legs) {
@@ -150,10 +190,6 @@ export class RiskAdmissionService {
           orderIds.push(orderId);
         }
         position.set("potentiallyExecutingOrderCount", orderIds.length); await this.save(position, session);
-        const sequencer = await this.models.TradingAccount.findOne(this.scope).session(session).orFail();
-        const sequence = sequencer.get("nextEventSequence");
-        riskAssert(Number.isSafeInteger(sequence) && sequence > 0 && sequence < Number.MAX_SAFE_INTEGER, "RISK_ARITHMETIC_OVERFLOW");
-        sequencer.set("nextEventSequence", sequence + 1); await this.save(sequencer, session);
         await new this.models.TradingEvent({ ...this.scope, schemaVersion: 1, correlationId: intent.get("correlationId"), createdAt: now,
           eventId: `${reservationId}:RISK_RESERVED`, eventType: "RISK_RESERVED", accountSequence: sequence, tradingDate: now.toISOString().slice(0, 10),
           aggregateType: "OrderIntent", aggregateId: intentId, aggregateVersion: intent.get("version"), causationId: intentId,
@@ -164,10 +200,13 @@ export class RiskAdmissionService {
           eventId: `${reservationId}:TRADING_DAY_ADVANCED`, eventType: "TRADING_DAY_ADVANCED", causationId: intentId,
           reason: "QUALIFIED_LOCAL_DAY", tradingDate: daily.dailyTradingDay, evidenceRefs: [reservationId],
           payload: { kind: "TRADING_DAY", from: fromDay, to: daily.dailyTradingDay, realizedPnlMinor: daily.dailyRealizedPnlMinor } });
-        assertEntryTemporalAuthorization(intent.get("entryPlan"), this.clock());
+        await assertCurrentEntryEvidence();
+        riskAssert(expiresAt.getTime() > this.clock().getTime() && signal.get("expiresAt").getTime() > this.clock().getTime(),
+          "STALE_EXECUTION_CHAIN");
         assertQualificationCurrent?.();
-        return { status: "AUTHORIZED", intentId, reservationId, orderIds: orderIds.sort(), requiredRiskMinor: requirement.requiredRiskMinor };
-      }), { readConcern: { level: "snapshot" }, writeConcern: { w: "majority" } });
+        return { status: "AUTHORIZED", intentId, reservationId, orderIds: orderIds.sort(), requiredRiskMinor: requirement.requiredRiskMinor,
+          ...(renewedQuote ? { quoteRenewal: renewedQuote } : {}) };
+      })), { readConcern: { level: "snapshot" }, writeConcern: { w: "majority" } });
     } catch (error) {
       if (error instanceof EntryRiskError) return { status: "REJECTED", intentId, reason: error.reason };
       throw error; // Persistence failures abort; never disguise them as a successful risk decision.

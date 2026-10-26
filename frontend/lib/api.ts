@@ -356,8 +356,8 @@ export function getActiveSession(accountId: string): Promise<MonitoringSession |
 }
 
 /** Exact polling never falls back to another running session. */
-export function getSession(sessionId: string): Promise<MonitoringSession & PaperEntryReadiness> {
-  return request<MonitoringSession & PaperEntryReadiness>(`/api/session/${encodeURIComponent(sessionId)}`);
+export function getSession(sessionId: string): Promise<SessionStartResponse> {
+  return request<SessionStartResponse>(`/api/session/${encodeURIComponent(sessionId)}`);
 }
 
 /**
@@ -585,10 +585,21 @@ export interface DurablePaperPosition {
   realizedPnlMinor: number | null; estimatedUnrealizedPnlMinor: null;
 }
 export interface DurablePaperDecision {
-  cycleId: string; evaluatedAt: string | null; direction: string; confidence: number | null;
+  cycleId: string; sessionId: string | null; evaluatedAt: string | null; direction: string; confidence: number | null;
   outcome: string; candidate: boolean; family: string | null; strategyKind: string | null;
+  selectedOption: null | { contractKey: string; type: "CE" | "PE"; strikeMinor: number; expiry: string;
+    quantityUnits: number; premiumMinor: number; lotRiskMinor: number; spotMinor: number | null };
+  primary?: { status: string; direction: string | null; confidence: number | null };
   reason: string | null; verifier: { status: string; verdict: string | null; reasonCode: string | null };
   rationale: string | null; blockingReason: string | null;
+}
+export interface PaperDisplayAnalytics {
+  version: "PAPER_DISPLAY_ANALYTICS_V1"; dataMode: "KITE_REAL"; source: "KITE";
+  sessionId: string; evaluatedAt: string; spotMinor: number; lastFinalizedAt: string;
+  indicators: IndicatorSnapshot;
+  directionalTrend?: { adx14: number; plusDi14: number; minusDi14: number };
+  option: null | { canonicalId: string; type: "CE" | "PE"; strikeMinor: number; expiry: string;
+    impliedVolatility: number; delta: number; gamma: number; thetaPerDay: number; vegaPerPercent: number };
 }
 export interface PaperDashboard {
   observation?: {status:"AVAILABLE" | "UNAVAILABLE"; tradability:"NON_TRADABLE";
@@ -602,14 +613,17 @@ export interface PaperDashboard {
   positions: DurablePaperPosition[]; positionsTruncated: boolean;
   activePositions: DurablePaperPosition[]; historyPositions: DurablePaperPosition[]; activeTruncated: boolean;
   attentionWorkflows: {positionId:string; lifecycle:string; reason:string}[]; decisions: DurablePaperDecision[];
+  recentDecisions: DurablePaperDecision[];
+  displayAnalytics: PaperDisplayAnalytics | null;
   exits: { status: "ACTIVE" | "ATTENTION"; active: boolean; closeInProgress: number | null; attentionCount: number | null; activePositionCount: number | null; completeness: "COMPLETE" | "TRUNCATED" };
   risk: null | { pendingRiskMinor: number | null; committedRiskMinor: number | null; capacityMinor: number | null;
+    maxRiskPerEntryMinor: number | null;
     availableCapacityMinor: number | null; reservedSlots: number | null; committedSlots: number | null;
     maxPositionSlots: number | null; dailyTradingDay: string | null; dailyRealizedPnlMinor: number | null; killSwitchEnabled: boolean;
     recoveryStatus: string; reconciliationStatus: string };
 }
 export function getDefaultPaperConfig(asset: "NIFTY"): Promise<PaperDefaultSummary> {
-  return request(`/api/session/default/${asset}`);
+  return request(`/api/session/default/${asset}`, { signal: AbortSignal.timeout(12_000) });
 }
 export function getPaperDashboard(sessionId: string): Promise<PaperDashboard> {
   return request(`/api/session/${encodeURIComponent(sessionId)}/dashboard`);

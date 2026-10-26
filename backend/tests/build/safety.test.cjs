@@ -18,7 +18,8 @@ test("compiled Delta and crypto engine entry points enforce the disabled boundar
   const monitor = require(path.join(root, "dist/services/CryptoMonitorService.js"));
   assert.throws(() => monitor.startCryptoEngine("test", 100), /DELTA_EXECUTION_DISABLED/);
   const routes = require(path.join(root, "dist/routes/crypto.js"));
-  assert.equal(routes.cryptoRequestAllowed("GET", "/session/active"), false);
+  assert.equal(routes.cryptoRequestAllowed("GET", "/session/active"), true);
+  assert.equal(routes.cryptoRequestAllowed("GET", "/preview"), true);
   assert.equal(routes.cryptoRequestAllowed("POST", "/session/start"), false);
   assert.equal(routes.cryptoRequestAllowed("GET", "/history"), true);
 });

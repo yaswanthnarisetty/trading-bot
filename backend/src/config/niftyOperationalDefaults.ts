@@ -29,7 +29,7 @@ export const NIFTY_OPERATIONAL_DEFAULTS = freeze({
     version: "PAPER_EXIT_V1", policyId: "NIFTY_LONG_OPTION_EXITS_V1", accountId: "PAPER:NSE",
     executionMode: "PAPER", dataMode: "KITE_REAL", family: "LONG_OPTION", underlying: "NIFTY",
     takeProfitBps: 5000, stopLossBps: 5000, maxHoldingMs: 3600000, eodMinuteIST: 920,
-    maxAgeMs: 30000, authorizationMs: 900000, directionalStop: "DEFERRED_NO_CAPTURED_BASIS",
+    maxAgeMs: 30000, maxExitSlippageBps: 500, authorizationMs: 900000, directionalStop: "DEFERRED_NO_CAPTURED_BASIS",
   }),
 });
 

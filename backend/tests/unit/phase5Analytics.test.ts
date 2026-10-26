@@ -203,13 +203,15 @@ test("real analytics requires current qualified index and option quote evidence"
   const optionMaster = await master(), indexMaster = qualifyIndexMaster(csv, at);
   const index = indexMaster.resolve("NIFTY"), tokens = ["100010", "100011"];
   const optionCalls: string[] = [], indexCalls: string[] = [];
-  let lastTrade: string | null = "2026-09-29 14:00:00", candleSet: readonly AnalyticsCandle[] = candles;
+  let lastTrade: string | null = "2026-09-29 14:00:00", staleToken: string | null = null,
+    candleSet: readonly AnalyticsCandle[] = candles;
   const optionMarket = new KiteMarketDataService({ async get(path) { optionCalls.push(path);
     const data: Record<string, unknown> = {};
     for (const token of tokens) { const i = optionMaster.getByCurrentInstrumentToken(token), p = tokenPrices[token]!;
       data[i.contractKey] = { instrument_token: Number(token), last_price: p,
         ohlc: { open: p, high: p + 1, low: p - 1, close: p }, volume: 100, oi: 100,
-        timestamp: "2026-09-29 14:00:00", last_trade_time: lastTrade,
+        timestamp: "2026-09-29 14:00:00",
+        last_trade_time: token === staleToken ? "2026-09-29 13:00:00" : lastTrade,
         depth: { buy: [{ price: p - 1, quantity: 65, orders: 1 }],
           sell: [{ price: p + 1, quantity: 65, orders: 1 }] } }; }
     return success(data); } }, async () => optionMaster, () => "KITE_REAL", () => now);
@@ -245,10 +247,27 @@ test("real analytics requires current qualified index and option quote evidence"
   const oldTrade = await optionMarket.getQuotes(tokens.map(t => optionMaster.getByCurrentInstrumentToken(t)), 1000);
   assert.deepEqual(buildRealMarketAnalytics({ ...input, optionQuotes: oldTrade }),
     { available: false, reason: "MARKET_DATA_NOT_FRESH" });
+  lastTrade = "2026-09-29 14:00:00";
+  staleToken = "100011";
+  const mixedTrades = await optionMarket.getQuotes(tokens.map(t => optionMaster.getByCurrentInstrumentToken(t)), 1000);
+  const qualifiedSubset = buildRealMarketAnalytics({ ...input, optionQuotes: mixedTrades });
+  assert.equal(qualifiedSubset.available, true);
+  if (qualifiedSubset.available) {
+    assert.deepEqual(qualifiedSubset.snapshot.options.map(option => option.instrument.instrumentToken), ["100010"]);
+    const evaluation = evaluateStrategy({ analytics: qualifiedSubset,
+      proposal: { direction: "BULLISH", confidence: 0.8, expiry: "2026-10-06" }, config, evaluatedAt: at });
+    if (evaluation.action === "CANDIDATE")
+      assert.ok(evaluation.candidate.legs.every(leg => leg.instrument.instrumentToken !== staleToken));
+  }
+  staleToken = null;
   lastTrade = null;
   const unavailableTrade = await optionMarket.getQuotes(tokens.map(t => optionMaster.getByCurrentInstrumentToken(t)), 1000);
   assert.deepEqual(buildRealMarketAnalytics({ ...input, optionQuotes: unavailableTrade }),
     { available: false, reason: "INVALID_MARKET_EVIDENCE" });
+  lastTrade = "2026-09-29 14:00:00";
+  const mixedMissingTrade = await optionMarket.getQuotes(tokens.map(t => optionMaster.getByCurrentInstrumentToken(t)), 1000);
+  assert.equal(buildRealMarketAnalytics({ ...input,
+    optionQuotes: [unavailableTrade[0]!, mixedMissingTrade[1]!] }).available, true);
   candleSet = candles.map(c => ({ ...c, timestamp: new Date(Date.parse(c.timestamp) - 35 * 60_000).toISOString() }));
   const oldHistory = await indexMarket.getHistoricalCandles({ index, interval: "5minute",
     from: candleSet[0]!.timestamp, to: at });

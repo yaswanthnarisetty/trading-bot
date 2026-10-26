@@ -1,6 +1,7 @@
 import type { AssetKey } from "../config/assets";
 import { assertQualifiedInstrument, type InstrumentDefinition } from "../services/KiteInstrumentMasterService";
-import { assertQualifiedRealMarketData, type MarketQuote, type HistoricalInterval } from "../services/KiteMarketDataService";
+import { assertIssuedRealMarketData, assertQualifiedRealMarketData,
+  type MarketQuote, type HistoricalInterval } from "../services/KiteMarketDataService";
 import { assertQualifiedRealIndexHistory, assertQualifiedRealIndexQuote,
   type IndexHistory, type IndexQuote, type QualifiedIndex } from "../services/KiteIndexDataService";
 import { freeze, marketTimestamp } from "./kiteMarketData";
@@ -75,8 +76,9 @@ const issued = new WeakSet<object>();
 interface RealFreshnessProof {
   readonly observedAtMs: number;
   readonly maxAgeMs: number;
-  readonly fetchedAtMs: readonly number[];
-  readonly exchangeAtMs: readonly number[];
+  readonly indexFetchedAtMs: number;
+  readonly indexExchangeAtMs: number;
+  readonly options: ReadonlyMap<string, Readonly<{ fetchedAtMs: number; brokerAtMs: number; tradeAtMs: number }>>;
   readonly lastFinalizedAtMs: number;
   readonly candleIntervalMs: number;
 }
@@ -84,25 +86,38 @@ const realFreshness = new WeakMap<object, RealFreshnessProof>();
 export function assertMarketAnalytics(value: unknown): asserts value is MarketAnalyticsSnapshot {
   if (!value || typeof value !== "object" || !issued.has(value)) throw new Error("ANALYTICS_UNAVAILABLE");
 }
-/** Recheck issued real evidence without trusting caller-supplied timestamps or fetching again. */
-export function isMarketAnalyticsFresh(snapshot: MarketAnalyticsSnapshot, now: number): boolean {
+/** Recheck issued real evidence without trusting caller-supplied timestamps or fetching again.
+ * A supplied set is the exact option evidence consumed by the decision; omission
+ * keeps the conservative all-options behavior for existing callers. */
+export function isMarketAnalyticsFresh(snapshot: MarketAnalyticsSnapshot, now: number,
+  optionIds?: readonly string[]): boolean {
   assertMarketAnalytics(snapshot);
   if (snapshot.dataMode === "MOCK") return true;
   const proof = realFreshness.get(snapshot);
   if (!proof || !Number.isFinite(now) || now < proof.observedAtMs) return false;
   const fresh = (timestamp: number, allowance: number) => timestamp <= now && now - timestamp <= allowance;
-  return proof.fetchedAtMs.every(timestamp => fresh(timestamp, proof.maxAgeMs))
-    && proof.exchangeAtMs.every(timestamp => fresh(timestamp, proof.maxAgeMs))
+  const ids = optionIds ?? snapshot.options.map(option => option.canonicalId);
+  return fresh(proof.indexFetchedAtMs, proof.maxAgeMs)
+    && fresh(proof.indexExchangeAtMs, proof.maxAgeMs)
+    && ids.every(id => {
+      const option = proof.options.get(id);
+      return option !== undefined && fresh(option.fetchedAtMs, proof.maxAgeMs)
+        && fresh(option.brokerAtMs, proof.maxAgeMs) && fresh(option.tradeAtMs, proof.maxAgeMs);
+    })
     && fresh(proof.lastFinalizedAtMs, proof.candleIntervalMs + proof.maxAgeMs);
 }
 /** Inclusive upper bound of the issued proof. MOCK has no real-market freshness authority. */
-export function marketEvidenceExpiry(snapshot: MarketAnalyticsSnapshot): number | null {
+export function marketEvidenceExpiry(snapshot: MarketAnalyticsSnapshot, optionIds?: readonly string[]): number | null {
   assertMarketAnalytics(snapshot);
   if (snapshot.dataMode === "MOCK") return null;
   const proof = realFreshness.get(snapshot);
   if (!proof) throw new Error("INVALID_MARKET_EVIDENCE");
-  return Math.min(...proof.fetchedAtMs.map(t => t + proof.maxAgeMs),
-    ...proof.exchangeAtMs.map(t => t + proof.maxAgeMs),
+  const ids = optionIds ?? snapshot.options.map(option => option.canonicalId);
+  const options = ids.map(id => proof.options.get(id));
+  if (options.some(option => option === undefined)) throw new Error("INVALID_MARKET_EVIDENCE");
+  return Math.min(proof.indexFetchedAtMs + proof.maxAgeMs, proof.indexExchangeAtMs + proof.maxAgeMs,
+    ...options.flatMap(option => [option!.fetchedAtMs + proof.maxAgeMs,
+      option!.brokerAtMs + proof.maxAgeMs, option!.tradeAtMs + proof.maxAgeMs]),
     proof.lastFinalizedAtMs + proof.candleIntervalMs + proof.maxAgeMs);
 }
 const unavailable = (reason: AnalyticsFailure): AnalyticsOutcome => freeze({ available: false, reason });
@@ -190,21 +205,31 @@ export function buildRealMarketAnalytics(input: RealAnalyticsInput): AnalyticsOu
     if (!freshAt(input.indexQuote.brokerTimestamp, evaluation, input.maxAgeMs))
       return unavailable("MARKET_DATA_NOT_FRESH");
     const optionEvidence: MockOptionEvidence[] = [];
+    const qualifiedQuotes: MarketQuote[] = [];
+    let missingOptionEvidence = false;
     for (const quote of input.optionQuotes) {
-      assertQualifiedRealMarketData(quote, { instrument: quote.instrument, maxAgeMs: input.maxAgeMs });
+      assertIssuedRealMarketData(quote, { instrument: quote.instrument });
       if (quote.kind !== "QUOTE" || quote.instrument.underlying !== input.index.underlying
         || quote.masterFingerprint !== input.index.provenance.sourceFingerprint
-        || quote.brokerTimestamp === null || quote.lastTradeTimestamp === null
-        || !quote.depth?.buy.length || !quote.depth.sell.length
         || Date.parse(quote.fetchedAt) > evaluation) return unavailable("INVALID_MARKET_EVIDENCE");
-      if (!freshAt(quote.brokerTimestamp, evaluation, input.maxAgeMs)
-        || !freshAt(quote.lastTradeTimestamp, evaluation, input.maxAgeMs))
-        return unavailable("MARKET_DATA_NOT_FRESH");
+      if (quote.brokerTimestamp === null || quote.lastTradeTimestamp === null
+        || !quote.depth?.buy.length || !quote.depth.sell.length) {
+        missingOptionEvidence = true;
+        continue;
+      }
+      // An unrelated illiquid strike must not disqualify a different, fully fresh contract.
+      // Stale strikes are never included in the strategy's selectable evidence.
+      if (!freshAt(quote.fetchedAt, evaluation, input.maxAgeMs)
+        || !freshAt(quote.brokerTimestamp, evaluation, input.maxAgeMs)
+        || !freshAt(quote.lastTradeTimestamp, evaluation, input.maxAgeMs)) continue;
+      assertQualifiedRealMarketData(quote, { instrument: quote.instrument, maxAgeMs: input.maxAgeMs });
+      qualifiedQuotes.push(quote);
       optionEvidence.push({ instrument: quote.instrument, bidMinor: quote.depth.buy[0]!.priceMinor,
         askMinor: quote.depth.sell[0]!.priceMinor, bidQuantity: quote.depth.buy[0]!.quantity,
         askQuantity: quote.depth.sell[0]!.quantity, optionPriceMinor: quote.lastPriceMinor,
         priceTimestamp: quote.brokerTimestamp, optionTradeTimestamp: quote.lastTradeTimestamp });
     }
+    if (!qualifiedQuotes.length) return unavailable(missingOptionEvidence ? "INVALID_MARKET_EVIDENCE" : "MARKET_DATA_NOT_FRESH");
     const assembled = assemble({ ...input, underlying: input.index.underlying, dataMode: "KITE_REAL", source: "KITE",
       spotMinor: input.indexQuote.priceMinor, spotTimestamp: input.indexQuote.brokerTimestamp!,
       indexCanonicalId: input.index.canonicalId, indexMasterFingerprint: input.index.provenance.sourceFingerprint,
@@ -213,9 +238,12 @@ export function buildRealMarketAnalytics(input: RealAnalyticsInput): AnalyticsOu
       > intervalMs[input.indexHistory.interval] + input.maxAgeMs) return unavailable("MARKET_DATA_NOT_FRESH");
     if (assembled.available) realFreshness.set(assembled.snapshot, freeze({
       observedAtMs: Date.parse(observedAt), maxAgeMs: input.maxAgeMs,
-      fetchedAtMs: [Date.parse(input.indexQuote.fetchedAt), ...input.optionQuotes.map(quote => Date.parse(quote.fetchedAt))],
-      exchangeAtMs: [Date.parse(input.indexQuote.brokerTimestamp!), ...input.optionQuotes.flatMap(quote =>
-        [Date.parse(quote.brokerTimestamp!), Date.parse(quote.lastTradeTimestamp!)])],
+      indexFetchedAtMs: Date.parse(input.indexQuote.fetchedAt),
+      indexExchangeAtMs: Date.parse(input.indexQuote.brokerTimestamp!),
+      options: new Map(qualifiedQuotes.map(quote => [quote.instrument.canonicalId, freeze({
+        fetchedAtMs: Date.parse(quote.fetchedAt), brokerAtMs: Date.parse(quote.brokerTimestamp!),
+        tradeAtMs: Date.parse(quote.lastTradeTimestamp!),
+      })])),
       lastFinalizedAtMs: Date.parse(assembled.snapshot.indicators.lastFinalizedAt),
       candleIntervalMs: intervalMs[input.indexHistory.interval],
     }));

@@ -2,6 +2,8 @@ import { MonitoringSessionModel } from "../models/MonitoringSession";
 import { OptionsPositionModel } from "../models/OptionsPosition";
 import { SignalLogModel } from "../models/SignalLog";
 import { CryptoPositionModel } from "../models/CryptoPosition";
+import { BtcDemoOrderIntentModel } from "../models/BtcDemoOrderIntent";
+import { BtcDemoAutoControlModel } from "../models/BtcDemoAutoControl";
 import { logger } from "../utils/logger";
 
 /**
@@ -29,6 +31,14 @@ export async function createIndexes(): Promise<void> {
       MonitoringSessionModel.collection.createIndex({ createdAt: -1 }),
       CryptoPositionModel.collection.createIndex({ sessionId: 1, status: 1 }),
       CryptoPositionModel.collection.createIndex({ sessionId: 1, entryTimestamp: -1 }),
+      BtcDemoOrderIntentModel.collection.createIndex({ clientOrderId: 1 }, { unique: true }),
+      BtcDemoOrderIntentModel.collection.createIndex({ activeSlot: 1 }, {
+        unique: true, partialFilterExpression: { activeSlot: { $type: "string" } },
+      }),
+      BtcDemoOrderIntentModel.collection.createIndex({ dailySlot: 1 }, {
+        unique: true, partialFilterExpression: { dailySlot: { $type: "string" } },
+      }),
+      BtcDemoAutoControlModel.collection.createIndex({ key: 1 }, { unique: true }),
     ]);
 
     logger.info("MongoDB indexes created");
@@ -37,4 +47,3 @@ export async function createIndexes(): Promise<void> {
     throw error;
   }
 }
-

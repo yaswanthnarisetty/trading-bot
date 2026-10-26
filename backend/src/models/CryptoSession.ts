@@ -10,6 +10,8 @@ export interface CryptoSessionDocument extends Document {
   capital: number;
   startTime: string;
   status: "RUNNING" | "STOPPED";
+  stopReason?: string;
+  stoppedAt?: Date;
 }
 
 const CryptoSessionSchema = new Schema<CryptoSessionDocument>(
@@ -19,6 +21,8 @@ const CryptoSessionSchema = new Schema<CryptoSessionDocument>(
     capital:    { type: Number, required: true },
     startTime:  { type: String, required: true },
     status:     { type: String, enum: ["RUNNING", "STOPPED"], required: true },
+    stopReason: { type: String, default: null },
+    stoppedAt: { type: Date, default: null },
   },
   { collection: "crypto_sessions" }
 );

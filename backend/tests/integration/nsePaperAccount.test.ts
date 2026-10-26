@@ -4,8 +4,8 @@ import http from "node:http";
 import https from "node:https";
 import mongoose from "mongoose";
 import { createExecutionIndexes, executionModels } from "../../src/db/executionModels";
-import { bindNsePaperKiteIdentity, ensureNsePaperAccount, NSE_PAPER_ACCOUNT_ID } from "../../src/services/NsePaperAccountService";
-import { NSE_PAPER_POLICY_V1 } from "../../src/config/nsePaperPolicy";
+import { bindNsePaperKiteIdentity, ensureNsePaperAccount, NSE_PAPER_ACCOUNT_ID, upgradeNsePaperRiskPolicy } from "../../src/services/NsePaperAccountService";
+import { NSE_PAPER_POLICY_V2, NSE_PAPER_POLICY_V3 } from "../../src/config/nsePaperPolicy";
 import { createKiteReadSession } from "../../src/services/KiteService";
 import { reconciliationAdmissionHealthy } from "../../src/db/reconciliationAdmission";
 import { PaperEntryOrchestrator } from "../../src/services/PaperEntryOrchestrator";
@@ -40,13 +40,13 @@ after(async () => {
 });
 beforeEach(async () => { await connection.dropDatabase(); await createExecutionIndexes(connection); attempts = 0; });
 
-test("real Mongo no-file bootstrap creates the approved V1 account without broker calls or fabricated proof", async () => {
+test("real Mongo no-file bootstrap creates the approved V3 account without broker calls or fabricated proof", async () => {
   await ensure(builtinEnv);
   const account = await models.TradingAccount.findOne().orFail();
   assert.equal(await models.TradingAccount.countDocuments(), 1);
   assert.equal(account.get("initialCapitalMinor"), 20_000_000);
-  assert.deepEqual(account.get("entryRiskPolicy"), NSE_PAPER_POLICY_V1.entryRiskPolicy);
-  assert.deepEqual(account.get("riskTradingCalendar"), NSE_PAPER_POLICY_V1.riskTradingCalendar);
+  assert.deepEqual(account.get("entryRiskPolicy"), NSE_PAPER_POLICY_V3.entryRiskPolicy);
+  assert.deepEqual(account.get("riskTradingCalendar"), NSE_PAPER_POLICY_V3.riskTradingCalendar);
   assert.equal(account.get("brokerAccountRef"), "PAPER:NSE");
   assert.equal(account.get("reconciliationConfig"), undefined);
   assert.equal(account.get("reconciliationState"), undefined);
@@ -56,6 +56,21 @@ test("real Mongo no-file bootstrap creates the approved V1 account without broke
   assert.equal(attempts, 0);
   assert.equal(await models.TradingAccount.countDocuments({ executionMode: "LIVE" }), 0);
   assert.equal(await models.TradingAccount.countDocuments({ accountId: { $regex: /BTC|DELTA/ } }), 0);
+});
+
+test("approved V2 account upgrades its per-trade cap with one durable audit event", async () => {
+  await ensure(env, JSON.stringify({ brokerAccountId: "VERIFIED_TEST_KITE_ACCOUNT",
+    entryRiskPolicy: NSE_PAPER_POLICY_V2.entryRiskPolicy,
+    riskTradingCalendar: NSE_PAPER_POLICY_V2.riskTradingCalendar }));
+  assert.equal(await upgradeNsePaperRiskPolicy(connection), "UPDATED");
+  assert.equal(await upgradeNsePaperRiskPolicy(connection), "CURRENT");
+  const account = await models.TradingAccount.findOne({ accountId: NSE_PAPER_ACCOUNT_ID }).orFail();
+  assert.equal(account.get("policyVersion"), 3);
+  assert.deepEqual(account.get("entryRiskPolicy"), NSE_PAPER_POLICY_V3.entryRiskPolicy);
+  assert.equal(account.get("reservedExposureMinor"), 0);
+  const events = await models.TradingEvent.find({ accountId: NSE_PAPER_ACCOUNT_ID, eventType: "RISK_POLICY_UPDATED" });
+  assert.equal(events.length, 1);
+  assert.equal(events[0].get("payload.toMaxRiskPerEntryMinor"), 2_000_000);
 });
 
 test("unbound canonical account cannot use the legacy direct-admission reconciliation opt-out", async () => {
@@ -156,7 +171,7 @@ test("invalid or absent capital and unapproved policy fail before creating an ac
   for (const value of [undefined, "", "0", "200000.001", "2e5", "NaN", "-1", "90071992547410"]) {
     await assert.rejects(ensure({ ...env, PAPER_CAPITAL: value }), /PAPER_CAPITAL_/);
   }
-  await assert.rejects(ensure({ PAPER_CAPITAL: "200001" }), /PAPER_CAPITAL_POLICY_V1_MISMATCH/);
+  await assert.rejects(ensure({ PAPER_CAPITAL: "200001" }), /PAPER_CAPITAL_POLICY_V3_MISMATCH/);
   await assert.rejects(ensure(env, JSON.stringify({ ...JSON.parse(provisioning), extra: true })), /PAPER_ACCOUNT_POLICY_INVALID/);
   await assert.rejects(ensure(env, JSON.stringify({ ...JSON.parse(provisioning), entryRiskPolicy: { ...policy, maxReservedRiskMinor: 30000000 } })), /PAPER_ACCOUNT_POLICY_INVALID/);
   assert.equal(await models.TradingAccount.countDocuments(), 0);

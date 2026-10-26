@@ -3,7 +3,11 @@ import type { AxiosInstance } from "axios";
 import { fail, istDate, responseData, safeMarketError } from "../domain/kiteMarketData";
 
 export type MarketDataMode = "MOCK" | "KITE_REAL";
-export interface KiteMarketSession { get(path: string, params?: URLSearchParams): Promise<unknown> }
+export interface KiteMarketSession {
+  get(path: string, params?: URLSearchParams): Promise<unknown>;
+  /** Trusted backend-only access for Kite's read-only index quote subscription. */
+  streamingCredentials?(): { apiKey: string; accessToken: string; generation: number };
+}
 /** Single-operator backend session. Credentials stay in memory; restart requires login.
  * Only POST /session/token and allowlisted GETs exist. No order-write capability. */
 export class KiteSessionService implements KiteMarketSession {
@@ -34,6 +38,11 @@ export class KiteSessionService implements KiteMarketSession {
   }
   private headers(token: string) { return { "X-Kite-Version": "3", Authorization: `token ${this.config().apiKey}:${token}` }; }
   getAuthHeader(): Record<string, string> { return this.headers(this.current().token); }
+  streamingCredentials() {
+    if (this.mode !== "KITE_REAL") return fail("DATA_MODE_REQUIRED");
+    const session = this.current();
+    return Object.freeze({ apiKey: this.config().apiKey, accessToken: session.token, generation: session.generation });
+  }
   status() {
     if (this.session && this.clock() >= this.session.expiresAt) this.session = null;
     return Object.freeze({ connectionStatus: this.session ? "CONNECTED" as const : this.config().apiKey ? "SESSION_REQUIRED" as const : "DISCONNECTED" as const,

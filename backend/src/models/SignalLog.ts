@@ -32,8 +32,10 @@ export const SignalLogSchema = new Schema(
     sessionId: { type: String, required: true, index: true },
     cycleId: { type: String, immutable: true }, accountId: { type: String, immutable: true },
     window: { type: String, immutable: true }, startupId: { type: String, immutable: true },
-    configFingerprint: { type: String, immutable: true }, config: { type: Schema.Types.Mixed, immutable: true },
+    configFingerprint: { type: String, immutable: true },
+    sessionConfigFingerprint: { type: String, immutable: true }, config: { type: Schema.Types.Mixed, immutable: true },
     outcome: String, reason: String, decision: Schema.Types.Mixed, evaluatedAt: String,
+    displayAnalytics: Schema.Types.Mixed,
     intentId: String, positionId: String,
     executionMode: { type: String, enum: ["LEGACY_PAPER", "PAPER"], default: "LEGACY_PAPER", immutable: true },
     asset: { type: String, required: true },
@@ -55,6 +57,7 @@ export const SignalLogSchema = new Schema(
 
 SignalLogSchema.index({ sessionId: 1, timestamp: -1 });
 SignalLogSchema.index({ asset: 1, timestamp: -1 });
+SignalLogSchema.index({ accountId: 1, executionMode: 1, asset: 1, dataMode: 1, timestamp: -1 });
 SignalLogSchema.index({ cycleId: 1 }, { unique: true, partialFilterExpression: { executionMode: "PAPER" } });
 
 /**

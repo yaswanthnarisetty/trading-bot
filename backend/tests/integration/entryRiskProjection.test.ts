@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import mongoose, { type ClientSession } from "mongoose";
 import { executionModels, createExecutionIndexes } from "../../src/db/executionModels";
 import { RiskAdmissionService } from "../../src/services/RiskAdmissionService";
+import { loadAccountEntryProjection } from "../../src/db/entryRiskProjection";
 import { FillProcessor } from "../../src/services/FillProcessor";
 import { OrderManager } from "../../src/services/OrderManager";
 import { CloseIntentService } from "../../src/services/CloseIntentService";
@@ -69,6 +70,29 @@ before(async () => { await connection.asPromise(); });
 after(async () => { await connection.close(); });
 beforeEach(async () => { ids = 0; await connection.dropDatabase(); await createExecutionIndexes(connection);
   await tx(session => new models.TradingAccount({ ...f.account(), admissionStatus: "PAPER_READY", entryRiskPolicy: policy }).save({ session })); });
+
+test("many prior zero-fill candidates do not consume risk or block a new qualified admission", async () => {
+  for (let n = 1; n <= 8; n++) await seed(String(n));
+  await seed("9");
+  await authorize("9");
+  await expectAccount(100000, 0, 1, 0);
+});
+
+test("an unsafe order on any prior unreserved position still blocks admission", async () => {
+  await seed("1"); await seed("2");
+  await models.BrokerOrder.collection.insertOne({ ...f.brokerOrder("unsafe-prior-order"),
+    positionId: "p-1", intentId: "i-1", phase: "READY" });
+  assert.deepEqual(await admission().authorizeEntry("i-2"),
+    { status: "REJECTED", intentId: "i-2", reason: "UNSUPPORTED_ACCOUNT_EXPOSURE" });
+});
+
+test("batched entry projection still finds a Fill whose intent has a mismatched position", async () => {
+  await seed(); await authorize();
+  await connection.db!.collection("execution_fills").insertOne({ ...f.fillRecord("rogue-fill"),
+    intentId: "i-1", positionId: "wrong-position" });
+  await assert.rejects(tx(session => loadAccountEntryProjection(connection, session, f.scope)),
+    /RISK_PROJECTION_MISMATCH|STALE_EXECUTION_CHAIN/);
+});
 
 test("real first partial ENTRY Fill atomically transfers exact premium and the first slot", async () => {
   const { trades } = await setup(); await expectAccount(100000, 0, 1, 0);

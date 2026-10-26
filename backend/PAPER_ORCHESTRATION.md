@@ -40,14 +40,16 @@ PAPER decision rows are excluded from the old signal renderer.
    unchanged; bootstrap does not backfill or reset them. Their capital reference
    remains unasserted until separately provisioned through an approved migration.
 3. First creation without `NSE_PAPER_ACCOUNT_CONFIG_FILE` uses the operator-approved
-   backend-owned `NSE_PAPER_POLICY_V1`: 20,000,000 paise capital,
-   `policyVersion: 1`, per-entry risk 800,000 paise, aggregate reserved-risk
+   backend-owned `NSE_PAPER_POLICY_V3`: 20,000,000 paise capital,
+   `policyVersion: 3`, per-entry risk 2,000,000 paise, aggregate reserved-risk
    capacity 2,400,000 paise, three position slots, daily loss 400,000 paise,
    and `LOCAL_DATE_V1` in `Asia/Kolkata`. `PAPER_CAPITAL` must parse exactly to
    20,000,000 paise; other amounts fail closed. The internal `brokerAccountRef`
    is `PAPER:NSE`. No Kite login is needed to create the account. Reference-only
    reconciliation is bound once to the verified backend Kite profile during
    recovery; absent authentication leaves ENTRY waiting.
+   Existing V2 accounts require an explicit, audited idle-account upgrade; startup
+   never silently rewrites persisted risk policy or an active reservation.
 
    An optional strict `NSE_PAPER_ACCOUNT_CONFIG_FILE` may still supply an explicit
    full policy and broker reference for advanced provisioning. It is an absolute
@@ -85,8 +87,16 @@ PAPER decision rows are excluded from the old signal renderer.
    `{ "asset": "NIFTY" }`. Start/Stop never creates or resets the account.
 5. The built-in validated profile is NIFTY / LONG_OPTION / PAPER / KITE_REAL,
    five-minute cadence, 09:30–15:00 IST entries, 65% confidence and the approved
-   0.55–0.70 delta band. Other quality defaults match the approved Phase 5/6
-   defaults. Capital and account risk policy remain separate from the operational profile.
+   0.55–0.70 delta band. `NIFTY_PAPER_QUALITY_V2` keeps the standard RSI 70
+   bullish ceiling, with a narrow 70–80 exception for a LONG_CALL only when the
+   primary view is at least 75% confident and completed NIFTY candles prove a
+   trending bullish alignment: close above EMA20/EMA50, no three-bar bearish
+   momentum, EMA20–EMA50 at least one ATR, ADX(14) at least 25, and +DI ahead
+   of −DI by at least five points. Otherwise the original RSI gate holds.
+   These thresholds are a PAPER strategy hypothesis, not a guaranteed trend or
+   profitability claim. Fresh quotes, qualified contracts, risk admission,
+   recovery and reconciliation remain mandatory. Capital and account risk policy
+   remain separate from the operational profile.
    An optional `NSE_PAPER_CONFIG_FILE` remains a strict server-owned JSON array
    of complete PaperSessionConfig objects; the Dashboard NIFTY default must
    still map `PAPER:NSE`.
@@ -113,8 +123,12 @@ PAPER decision rows are excluded from the old signal renderer.
    or missing per-contract evidence block qualification, never trigger fallback.
    The default `NIFTY_LONG_OPTION_EXITS_V1` applies only to PAPER:NSE/NIFTY/LONG_OPTION:
    50% actual premium profit/loss thresholds, one-hour maximum holding, 15:20 IST
-   EOD attempt, 30-second quote age and 15-minute close authorization. These are the
-   documented durable-exit terms, not legacy settings. `NSE_PAPER_EXIT_CONFIG_FILE`
+   EOD attempt, 30-second quote age and 15-minute close authorization. A close
+   uses a fresh Kite option quote at planning and claim time, with an at-most
+   5% tick-aligned limit cushion; the current bid/ask must still make that limit
+   executable. The PAPER simulator fills at the approved limit, so this cushion
+   can make simulated exit P&L more conservative than the observed quote.
+   These are the documented durable-exit terms, not legacy settings. `NSE_PAPER_EXIT_CONFIG_FILE`
    remains an optional full override, with no silent merge on empty/invalid files.
    Previously captured position policies remain immutable; CLOSE and retained fills
    keep their existing rules independently of entry readiness.
@@ -137,6 +151,14 @@ ledger paths. Closed-market observations retain the broker timestamp and exact
 freshness, carry NON_TRADABLE presentation status, and supply no entry authority.
 The dashboard does not compute stale Greeks using invented or incomplete inputs;
 those remain UNAVAILABLE. Phase 5 strategy freshness is unchanged.
+After a qualified KITE_REAL cycle, a bounded presentation-only projection of its
+validated indicators and representative option Greeks/IV is retained with its
+evaluation time. The dashboard can show the last such record across sessions
+while markets are closed, clearly marked as recorded data. It never reuses that
+projection for entry, recovery, reconciliation or risk. Prior cycles without a
+projection cannot be backfilled. IV rank/percentile, PCR, max pain and support/
+resistance stay unavailable until qualified sources for them exist. The recent
+decision feed is account-scoped to PAPER/KITE_REAL and bounded to 30 cycles.
 
 Active/nonterminal positions, held risk and UNKNOWN/unresolved exit workflows
 are queried separately from terminal history. History is bounded at 200. The
@@ -194,14 +216,23 @@ post-dispatch fill processing are unaffected by ENTRY waiting.
 
 ## One captured evaluation
 
-PaperEvaluationScheduler owns one timer per account, waits for a cycle to finish,
-and schedules the next wakeup afterward. There is no catch-up queue. A per-account
+PaperEvaluationScheduler owns one timer per account. It starts readiness preparation
+three minutes before the next five-minute broker boundary plus 45 seconds, and
+refreshes recovery/reconciliation if the prior receipt would expire before that
+target. The decision waits until 45 seconds after the boundary, then rechecks the active session,
+receipt, account gates and all existing orchestration/admission gates. Slow
+preparation skips the bar rather than using stale proof. A failed early
+preparation is retried for the next bar, never in a same-bar rapid loop. There is no catch-up queue. A per-account
 in-process lock and durable unique cycle key protect overlapping callers.
 
 The cycle key hashes account + underlying + canonical five-minute UTC bar start
 (versioned NSE_PAPER_WINDOW_V1). These windows align with 09:15 IST and are host
- timezone independent. Session/config/family replacement cannot evade the same-bar
+timezone independent. Session/config/family replacement cannot evade the same-bar
 claim; changed configuration conflicts. A later bar is a separate decision.
+Each cycle retains both the completed entry-config fingerprint for same-window
+conflicts and the original monitoring-config fingerprint for the financial
+session fence. Server-filled calendar and Greeks metadata cannot make an
+otherwise current RUNNING session look stopped.
 Replay returns stored history, without repeating the LLM or broker submission.
 
 One frozen session/config and LLM configuration feed the approved qualified index
@@ -256,6 +287,12 @@ Vertical progression is BUY → confirmed fill ingestion → EntryProtectionServ
 partial BUY is not full protection. UNKNOWN retains its durable claim and never
 gets an automatic resend. Partial/stranded/uncertain chains are ATTENTION and block
 later cycles on that account until the existing chain is addressed.
+An ATTENTION entry whose every child is unclaimed, KNOWN, zero-fill and never
+submitted, and whose mandatory market/deadline authorization has expired, cannot
+be dispatched. Before another cycle, the orchestrator atomically proves this
+chain, marks its children NOT_SENT and the intent/position ABORTED, then audits
+release of its reservation and slot. Any uncertain or partly filled child keeps
+its full hold and blocks new entry. Expiry alone never releases risk.
 
 Stop invalidates future evaluations and serializes against new adaptation,
 admission and submission claims via the session fence in each financial
@@ -268,7 +305,9 @@ receipts after stop. Unclaimed entry submission additionally requires the origin
 active/current-host session and all existing financial gates. Replaying a cycle
 itself never retries submission. Broker-instance memory is not durable recovery;
 if a crash loses an unpersisted simulator receipt, the uncertain ledger stays
-blocked instead of inventing a fill or resubmitting.
+blocked instead of inventing a fill or resubmitting. An overdue close claim with
+no retained outcome surfaces as `ORDER_OUTCOME_UNRESOLVED` in the exit monitor;
+it requires explicit PAPER reconciliation before another close can be planned.
 
 Bootstrap marks orphaned RUNNING sessions CRASHED/RECOVERY_REQUIRED and starts no
 entry/exit timer. The approved recovery generation and MATCHED proof must be
@@ -286,6 +325,77 @@ session across reload. Stopped/crashed/not-found results never switch accounts.
 
 Status includes mode, family, last cycle and blocking reason; individual-session
 status also reports Kite connectivity, PaperBroker and deferred exits.
+
+Live-data limitation observed on 2026-10-07: Kite's historical endpoint sometimes
+returned the last completed NIFTY five-minute bar too late for the existing
+freshness allowance. A durable cycle captured at 14:05:27 IST had an index bar
+last finalized at 14:00:00; its proof expired about three seconds later, just as
+the primary AI returned an 80% view. The resulting `MARKET_DATA_NOT_FRESH` HOLD
+was correct and sent no PAPER order. [Kite's guidance](https://kite.trade/forum/discussion/14790/historical-api-is-giving-data-1-min-dealay-after-5min-candle-closing)
+recommends building live-strategy candles from WebSocket market data.
+
+The index service now subscribes read-only to the current qualified NIFTY index
+token in Kite's timestamped full mode. It retains a five-minute bar only after an
+uninterrupted subscription covers the entire interval, exchange ticks arrive
+within 30 seconds of receipt, and first/last/intermediate tick gaps are bounded.
+Only a contiguous completed stream suffix can bridge delayed broker history;
+missing or partial bars still fail closed. A disconnect, changed session token,
+or replaced master discards in-progress bars. Readiness reuses healthy intraday
+masters so its five-minute checks do not reset the stream. The entry scheduler
+wakes 45 seconds after broker bar boundaries without accumulating REST/AI execution drift.
+That offset allows the newly completed Kite bar to arrive. If only the prior
+bar is available, its original 30-second grace has elapsed and the cycle holds
+without calling AI or placing an entry.
+After a fresh connection, at least one full five-minute streamed bar must finish
+before this source can bridge a delayed historical bar. Index quotes, option
+quotes, candidate expiry, reconciliation, recovery and risk gates retain their
+existing freshness and authority checks; the 30-second evidence age is unchanged.
+
+The five-second timer belongs to the exit monitor; entry decisions run on the
+five-minute completed-bar cadence. A freshly displayed, non-tradable NIFTY spot
+observation does not refresh an option's exchange packet or last-trade time.
+Entry freshness tracks the index plus the option summaries actually read by
+the models and the contracts selected for a candidate. Unrelated, unused
+strikes cannot expire a decision, while every consumed quote and candle still
+faces a 30-second freshness limit through risk admission and the initial claim.
+For a qualified KITE_REAL candidate, the orchestrator captures a second broker
+snapshot after the AI and verifier finish. It deterministically rebuilds the
+candidate only if the completed candle, indicators, masters, direction, contract
+and lot remain the same and the spot has moved no more than half an ATR. The
+durable decision records both the AI prompt's original analytics evidence ID
+and the final candidate's refreshed evidence ID. The refreshed quote starts no
+new grace period: its own exchange, trade and fetch timestamps must pass the
+unchanged 30-second checks at admission. If remote ledger validation outlasts
+that quote, final admission may obtain another evaluator-issued proof for the
+same completed candle, selected contract, lot and immutable BUY limit. It must
+pass the same 30-second freshness checks and cannot extend the original intent
+deadline or entry cutoff. A changed or stale snapshot holds the cycle. Initial
+preparation is scheduled within the three-minute
+lead window so its five-minute readiness receipt cannot expire before the
+first evaluation.
+The KITE_REAL LONG_OPTION decision deadline allows at most two minutes from
+evaluation and never crosses its five-minute decision window. This accommodates
+remote risk admission and claim latency; every renewal still requires a fresh
+30-second Kite quote on the same completed candle and contract.
+For KITE_REAL LONG_OPTION PAPER entries, the immutable BUY limit is the
+observed qualified ask with a 1% allowance, rounded up to the contract tick
+(at most one extra tick from rounding).
+The full limit times the lot size is charged against per-trade and aggregate
+risk capacity before an order can be authorized. A refreshed ask must remain
+at or below that limit; the allowance does not relax quote freshness,
+contract identity, entry cutoff, recovery or reconciliation checks.
+For the immediate initial claim, the orchestrator reuses the verified index
+proofs from the same entry operation and skips retained-receipt processing for a
+new READY, unclaimed child. A current admitted quote is used directly. If it
+expires before the claim, the orchestrator obtains a new qualified Kite quote
+and re-runs the deterministic strategy on the same completed candle, contract
+and lot. The fresh option ask must not exceed the reserved immutable LIMIT. A
+process-issued proof binds that quote to the original plan and is persisted
+with the claim. The new evidence receives only its own 30-second lifetime and
+cannot extend the immutable intent deadline or entry cutoff. If qualification
+changes or the ask exceeds the limit, no claim or PAPER submission occurs.
+Claims, risk writes and receipt ingestion retain their transaction,
+reconciliation and broker-evidence checks.
 
 The Phase 6C1 Dashboard accepts only an asset in its Start request. The backend
 resolves the validated NIFTY default, and the browser cannot choose family,

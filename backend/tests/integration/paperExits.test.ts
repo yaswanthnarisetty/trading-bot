@@ -96,6 +96,23 @@ test('real repeated, concurrent and restarted ticks create one close chain and o
  assert.deepEqual(calls,['BUY','SELL','BUY','SELL']);assert.equal(await models.RiskReservation.countDocuments({kind:'CLOSE_QUANTITY'}),1);
  const service=new RiskSettlementService(connection,f.scope,clock);await Promise.all([service.settleClosedPosition(x.positionId),service.settleClosedPosition(x.positionId)]);await settled(x.positionId);
 });
+test('real lost PAPER close receipt remains blocked and becomes explicit attention without resend',async()=>{
+ const x=await open();x.prices('TP');scenario=()=>({submission:'ACCEPTED'});
+ const original=models.TradingEvent.prototype.save;
+ models.TradingEvent.prototype.save=function(...args:unknown[]){
+  if(this.get('eventType')==='ORDER_SUBMITTED')return Promise.reject(new Error('injected-receipt-write-failure'));
+  return original.apply(this,args);
+ };
+ try{const first=await x.monitor.evaluateOpenPosition(x.positionId);assert.equal(first.status,'ATTENTION');
+  assert.equal(first.reason,'ORDER_OUTCOME_UNRESOLVED');}
+ finally{models.TradingEvent.prototype.save=original;}
+ const child=await models.BrokerOrder.findOne({intentId:(await models.OrderIntent.findOne({purpose:'CLOSE'}).orFail()).get('intentId')}).orFail();
+ assert.equal(child.get('phase'),'SUBMITTING');assert.equal(child.get('submissionOutcome'),undefined);
+ now=new Date(+now+61000);
+ const next=await x.monitor.evaluateOpenPosition(x.positionId);
+ assert.equal(next.status,'ATTENTION');assert.equal(next.reason,'ORDER_OUTCOME_UNRESOLVED');
+ assert.deepEqual(calls,['BUY','SELL']);assert.equal(await models.Fill.countDocuments({side:'SELL'}),0);
+});
 for(const family of ['LONG_OPTION','DEBIT_VERTICAL','CREDIT_VERTICAL'] as const)test(`real ${family} partial close preserves exposure/hedge until confirmed full cover`,async()=>{
  const x=await open(family);x.prices('SL');let first=true;
  scenario=(_s,q,p)=>{if(first){first=false;return{submission:'ACCEPTED',initialFills:[{quantityUnits:30,priceMinor:p}],steps:[{kind:'FILL',quantityUnits:q-30,priceMinor:p}]};}return{submission:'ACCEPTED',initialFills:[{quantityUnits:q,priceMinor:p}]};};
@@ -141,16 +158,37 @@ test('real new host ENTRY remains recovery gated while approved PAPER close prog
  await assert.rejects(restarted.start({...config('LONG_OPTION'),dataMode:'KITE_REAL'}),/RECOVERY_REQUIRED/);
  x.prices('TP');assert.equal((await new PaperExitMonitor(connection,x.exitDeps).evaluateOpenPosition(x.positionId)).status,'SETTLED');
 });
-for(const boundary of ['plan','claim'] as const)for(const fault of ['master','age','lease'] as const)test(`real ${fault} loss at ${boundary} prevents new physical action`,async()=>{
+for(const boundary of ['plan','claim'] as const)for(const fault of ['master','age','lease'] as const)test(`real ${fault} loss at ${boundary} handles fresh close evidence safely`,async()=>{
  const x=await open();x.prices('TP');const prototype=boundary==='plan'?CloseIntentService.prototype:OrderManager.prototype,key=boundary==='plan'?'requestClose':'submit';
- const old=(prototype as any)[key];(prototype as any)[key]=async function(...args:any[]){if(fault==='master')await x.wire.options.refreshMaster();else now=new Date(+now+(fault==='age'?30001:60001));return old.apply(this,args);};
- try{assert.equal((await x.monitor.evaluateOpenPosition(x.positionId)).status,'ATTENTION');assert.deepEqual(calls,['BUY']);assert.equal(await models.Fill.countDocuments(),1);
- if(boundary==='plan')assert.equal(await models.OrderIntent.countDocuments({purpose:'CLOSE'}),0);
- else assert.equal(await models.BrokerOrder.countDocuments({intentId:(await models.OrderIntent.findOne({purpose:'CLOSE'}).orFail()).get('intentId'),submissionClaim:{$exists:true}}),0);
+ const old=(prototype as any)[key];(prototype as any)[key]=async function(...args:any[]){if(fault==='master')await x.wire.options.refreshMaster();else now=new Date(+now+(fault==='age'?30001:120001));return old.apply(this,args);};
+ try{const result=await x.monitor.evaluateOpenPosition(x.positionId);
+ if(fault==='age'){
+  assert.equal(result.status,'SETTLED',JSON.stringify(result));assert.deepEqual(calls,['BUY','SELL']);await settled(x.positionId);
+ }else{
+  assert.equal(result.status,'ATTENTION',JSON.stringify(result));assert.deepEqual(calls,['BUY']);assert.equal(await models.Fill.countDocuments(),1);
+  if(boundary==='plan')assert.equal(await models.OrderIntent.countDocuments({purpose:'CLOSE'}),0);
+  else assert.equal(await models.BrokerOrder.countDocuments({intentId:(await models.OrderIntent.findOne({purpose:'CLOSE'}).orFail()).get('intentId'),submissionClaim:{$exists:true}}),0);
+ }
  }finally{(prototype as any)[key]=old;}
 });
 test('real quote estimate alone does not write realized PnL',async()=>{
  const x=await open();x.prices('FLAT');const before=await models.Position.findOne().lean();assert.equal((await x.monitor.evaluateOpenPosition(x.positionId)).status,'MONITORING');assert.deepEqual(await models.Position.findOne().lean(),before);assert.equal(await models.OrderIntent.countDocuments({purpose:'CLOSE'}),0);
+});
+for(const [moveBps,expected] of [[300,'SETTLED'],[800,'ATTENTION']] as const)test(`real time exit ${moveBps}bps bid move respects bounded close limit`,async()=>{
+ const x=await open();now=new Date(+now+3600000);x.prices('FLAT');
+ const key=String(x.entries[0].get('contractKey')),before=x.wire.state.exitPrices[key].bidMinor;
+ const original=CloseIntentService.prototype.requestClose;
+ CloseIntentService.prototype.requestClose=async function(...args:any[]){
+  const bid=Math.floor(before*(10000-moveBps)/10000/5)*5;
+  x.wire.state.exitPrices[key]={bidMinor:bid,askMinor:bid};
+  return (original as any).apply(this,args);
+ };
+ try{const result=await x.monitor.evaluateOpenPosition(x.positionId);assert.equal(result.status,expected,JSON.stringify(result));
+  if(expected==='SETTLED'){
+   await settled(x.positionId);const sell=await models.Fill.findOne({side:'SELL'}).orFail();
+   assert.ok(sell.get('priceMinor')<=x.wire.state.exitPrices[key].bidMinor);
+  }else{assert.equal(await models.OrderIntent.countDocuments({purpose:'CLOSE'}),0);assert.deepEqual(calls,['BUY']);}
+ }finally{CloseIntentService.prototype.requestClose=original;}
 });
 test('real settled positions excluded on restart',async()=>{const x=await open();x.prices('TP');await x.monitor.evaluateOpenPosition(x.positionId);assert.deepEqual(await x.monitor.listPositions(),[]);});
 for(const [family,stranded,trigger]of [['LONG_OPTION',false,'TP'],['CREDIT_VERTICAL',false,'SL'],['CREDIT_VERTICAL',true,'FLAT']] as const)test(`OFFLINE_EXIT_SMOKE ${stranded?'STRANDED_LONG':family}`,async()=>{

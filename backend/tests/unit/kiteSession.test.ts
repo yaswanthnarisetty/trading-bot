@@ -121,6 +121,18 @@ test("session expires at next 06:00 IST and clears on broker authentication fail
   f.failGet(undefined); await f.session.exchange("request2"); f.setNow(Date.parse("2026-09-30T00:30:00Z"));
   await assert.rejects(f.session.get("/quote"), /SESSION_REQUIRED/); assert.equal(f.session.status().connectionStatus, "SESSION_REQUIRED");
 });
+test("index stream credentials rotate with the verified session and disappear on expiry", async () => {
+  const f = setup();
+  assert.throws(() => f.session.streamingCredentials(), /SESSION_REQUIRED/);
+  await f.session.exchange("request");
+  const first = f.session.streamingCredentials();
+  assert.equal(first.apiKey, "key");
+  assert.equal(first.accessToken, "private-access");
+  await f.session.exchange("replacement");
+  assert.ok(f.session.streamingCredentials().generation > first.generation);
+  f.setNow(Date.parse("2026-09-30T00:30:00Z"));
+  assert.throws(() => f.session.streamingCredentials(), /SESSION_REQUIRED/);
+});
 test("status validation failure clears connection and never returns raw error details", async () => {
   const f = setup(); await f.session.exchange("request"); f.failGet({ response: { status: 503 }, message: "private-access" });
   assert.equal(await f.session.validate(), false); assert.equal(f.session.status().tokenValid, false);

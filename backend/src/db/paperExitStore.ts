@@ -2,6 +2,7 @@ import type { ClientSession,Connection } from 'mongoose';
 import { randomUUID } from 'node:crypto';
 import type { PaperExitConfig } from '../domain/paperExits';
 export class PaperExitStore {
+ private static readonly leaseMs=120000;
  constructor(private readonly connection:Connection,private readonly clock:()=>Date){}
  get states(){return this.connection.db!.collection('paper_exit_states');}
  get decisions(){return this.connection.db!.collection('paper_exit_decisions');}
@@ -14,16 +15,19 @@ export class PaperExitStore {
   catch(e){if((e as {code?:number}).code!==11000)throw e;}
   if(config)await this.states.updateOne({accountId,positionId,config:{$exists:false}},{$set:{config},$inc:{version:1}});
   const leaseId=randomUUID(),now=this.clock();
-  const row=await this.states.findOneAndUpdate({accountId,positionId,leaseUntil:{$lte:now}},{$set:{leaseId,leaseUntil:new Date(+now+60000)},$inc:{version:1}},{returnDocument:'after'});
+  const row=await this.states.findOneAndUpdate({accountId,positionId,leaseUntil:{$lte:now}},{$set:{leaseId,leaseUntil:new Date(+now+PaperExitStore.leaseMs)},$inc:{version:1}},{returnDocument:'after'});
   return row?{accountId,positionId,leaseId,config:row.config as PaperExitConfig|undefined}:null;
  }
  async fence(lease:{accountId:string;positionId:string;leaseId:string},session?:ClientSession){
-  const r=await this.states.updateOne({accountId:lease.accountId,positionId:lease.positionId,leaseId:lease.leaseId,leaseUntil:{$gt:this.clock()}},{$inc:{version:1}},{session});
+  const now=this.clock();
+  const r=await this.states.updateOne({accountId:lease.accountId,positionId:lease.positionId,leaseId:lease.leaseId,leaseUntil:{$gt:now}},
+   {$set:{leaseUntil:new Date(+now+PaperExitStore.leaseMs)},$inc:{version:1}},{session});
   if(r.matchedCount!==1)throw new Error('EXIT_LEASE_LOST');
  }
  async markDecision(lease:{accountId:string;positionId:string;leaseId:string},decisionId:string,triggerReason:string|null,stranded:boolean){
-  const result=await this.states.updateOne({accountId:lease.accountId,positionId:lease.positionId,leaseId:lease.leaseId,leaseUntil:{$gt:this.clock()}},
-   {$set:{decisionId,triggerReason,stranded},$inc:{version:1}});
+  const now=this.clock();
+  const result=await this.states.updateOne({accountId:lease.accountId,positionId:lease.positionId,leaseId:lease.leaseId,leaseUntil:{$gt:now}},
+   {$set:{decisionId,triggerReason,stranded,leaseUntil:new Date(+now+PaperExitStore.leaseMs)},$inc:{version:1}});
   if(result.matchedCount!==1)throw new Error('EXIT_LEASE_LOST');
  }
  async finish(lease:{accountId:string;positionId:string;leaseId:string},status:string,reason:string,extra:Record<string,unknown>={}){

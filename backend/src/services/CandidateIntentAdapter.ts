@@ -5,10 +5,12 @@ import { assertIssuedTradeCandidate, candidateMarketEvidenceExpiry, type TradeCa
 import { assertQualifiedInstrument } from "./KiteInstrumentMasterService";
 import { calculateEntryRisk, classifiedEntryPlanSchema } from "../domain/entryRisk";
 import { executionModels } from "../db/executionModels";
-import { assertExecutionIndexes } from "../db/executionIndexes";
+import { assertExecutionIndexes, hasVerifiedExecutionIndexes, withExecutionIndexProofs, type VerifiedExecutionIndexes } from "../db/executionIndexes";
 import { withCandidateWrite } from "../db/candidateWrite";
 import { riskAudit } from "./riskAudit";
+import { kitePaperBuyLimitMinor } from "../domain/paperBuyLimit";
 const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+export const KITE_PAPER_LONG_OPTION_DECISION_LIFETIME_MS = 120_000;
 
 /** Explicit authority boundary. Issued analytics candidates remain advisory; this
  * PAPER-only adapter persists unreserved economics, never admits or submits them.
@@ -16,9 +18,11 @@ const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(valu
 export function candidateEntryPlan(input: unknown, validUntil: Date, now: Date, entryCutoffAt?: Date) {
   assertIssuedTradeCandidate(input, now.getTime());
   const c: TradeCandidate = input;
-  if (c.executionAuthority !== "NONE" || c.version !== "TRADE_CANDIDATE_V2" || c.evaluatorVersion !== "PHASE6A01_V1"
+  if (c.executionAuthority !== "NONE" || c.version !== "TRADE_CANDIDATE_V2" || c.evaluatorVersion !== "PHASE6A01_V2"
     || !Number.isFinite(now.getTime()) || now.getTime() < Date.parse(c.evaluatedAt) || validUntil.getTime() <= now.getTime()
-    || validUntil.getTime() > Date.parse(c.evaluatedAt) + 60_000) throw new Error("STALE_CANDIDATE");
+    || validUntil.getTime() > Date.parse(c.evaluatedAt)
+      + (c.dataMode === "KITE_REAL" && c.strategyFamily === "LONG_OPTION"
+        ? KITE_PAPER_LONG_OPTION_DECISION_LIFETIME_MS : 60_000)) throw new Error("STALE_CANDIDATE");
   const candidateRef = hash([c.candidateKey, c.evaluatedAt, c.analyticsEvidenceId, c.selectionConfig]);
   const legs = c.legs.map(l => {
     assertQualifiedInstrument(l.instrument); const i = l.instrument;
@@ -27,7 +31,9 @@ export function candidateEntryPlan(input: unknown, validUntil: Date, now: Date, 
       || i.provenance.sourceFingerprint !== c.optionMasterFingerprint) throw new Error("CANDIDATE_IDENTITY_MISMATCH");
     return { legId: l.role.toLowerCase(), contractKey: i.contractKey, instrumentKind: "NSE_OPTION" as const,
       optionType: i.instrumentType === "CE" ? "CALL" as const : "PUT" as const, expiry: new Date(`${i.expiry}T10:00:00.000Z`),
-      qualificationRef: i.canonicalId, lotSizeUnits: i.lotSizeUnits, tickSizeMinor: i.tickSizeMinor, limitPriceMinor: l.priceMinor,
+      qualificationRef: i.canonicalId, lotSizeUnits: i.lotSizeUnits, tickSizeMinor: i.tickSizeMinor,
+      limitPriceMinor: c.dataMode === "KITE_REAL" && c.strategyFamily === "LONG_OPTION" && l.side === "BUY"
+        ? kitePaperBuyLimitMinor(l.priceMinor, i.tickSizeMinor) : l.priceMinor,
       role: l.role, identity: { canonicalId: i.canonicalId, broker: i.broker, exchange: i.exchange, segment: i.segment,
         contractKey: i.contractKey, instrumentToken: i.instrumentToken, exchangeToken: i.exchangeToken, underlying: i.underlying,
         expiry: i.expiry, strikeMinor: i.strikeMinor, instrumentType: i.instrumentType, lotSizeUnits: i.lotSizeUnits,
@@ -46,16 +52,19 @@ export class CandidateIntentAdapter {
   constructor(private readonly connection: Connection, scope: ExecutionScope, private readonly clock: () => Date = () => new Date()) {
     this.scope = executionScopeSchema.parse(scope); if (this.scope.executionMode !== "PAPER") throw new Error("PAPER_ONLY");
   }
-  async adapt(candidate: unknown, context: { strategyInstanceId: string; sessionId: string; validUntil: Date; entryCutoffAt?: Date; orchestration?: { cycleId: string; sessionId: string; startupId: string } }) {
+  async adapt(candidate: unknown, context: { strategyInstanceId: string; sessionId: string; validUntil: Date; entryCutoffAt?: Date; orchestration?: { cycleId: string; sessionId: string; startupId: string }; indexProof?: VerifiedExecutionIndexes; reconciliationProof?: VerifiedExecutionIndexes }) {
     const strategyInstanceId = identifierSchema.parse(context.strategyInstanceId), sessionId = identifierSchema.parse(context.sessionId);
     const now = this.clock(), { plan, targets, requirement } = candidateEntryPlan(candidate, context.validUntil, now, context.entryCutoffAt);
     // A changed quote/config within the same strategy decision must conflict, not
     // mint a second economic intent. Evidence remains in the immutable fingerprint.
     const key = hash([this.scope, strategyInstanceId, sessionId, plan.evaluatedAt]);
     const signalId = `signal:${key}`, intentId = `entry:${key}`, positionId = `position:${key}`;
-    const models = executionModels(this.connection); await assertExecutionIndexes(this.connection);
+    const models = executionModels(this.connection);
+    const baseProof = hasVerifiedExecutionIndexes(this.connection, context.indexProof)
+      ? context.indexProof! : await assertExecutionIndexes(this.connection);
     const session = await this.connection.startSession();
-    try { return await session.withTransaction(async () => {
+    try { return await session.withTransaction(() => withExecutionIndexProofs(this.connection, session,
+      { BASE: baseProof, RECONCILIATION: context.reconciliationProof }, async () => {
       const account = await models.TradingAccount.findOne(this.scope).session(session).orFail();
       if (account.get("broker") !== "PAPER") throw new Error("PAPER_ONLY");
       const existing = await models.OrderIntent.findOne({ ...this.scope, intentId }).session(session);
@@ -63,7 +72,7 @@ export class CandidateIntentAdapter {
         if (calculateEntryRisk(existing.get("targetLegs"), existing.get("entryPlan")).fingerprint !== requirement.fingerprint)
           throw new Error("CANDIDATE_ADAPTATION_CONFLICT");
         await models.Position.findOne({ ...this.scope, positionId, entryIntentId: intentId }).session(session).orFail();
-        return { signalId, intentId, positionId, replay: true };
+        return { signalId, intentId, positionId, replay: true, entryPlan: plan };
       }
       const base = { ...this.scope, schemaVersion: 1, correlationId: key, createdAt: now }, mutable = { ...base, updatedAt: now, version: 0 };
       await new models.StrategySignal({ ...base, signalId, decisionKey: key, strategyInstanceId, sessionId,
@@ -81,7 +90,7 @@ export class CandidateIntentAdapter {
       await riskAudit(models, this.scope, session, now, { eventId: `${intentId}:ADAPTED`, eventType: "INTENT_CREATED",
         causationId: signalId, reason: "ISSUED_CANDIDATE_ADAPTED", tradingDate: now.toISOString().slice(0, 10),
         evidenceRefs: [plan.candidateRef, plan.analyticsEvidenceId], payload: { kind: "REFERENCE", entityId: intentId } });
-      return { signalId, intentId, positionId, replay: false };
-    }, { readConcern: { level: "snapshot" }, writeConcern: { w: "majority" } }); } finally { await session.endSession(); }
+      return { signalId, intentId, positionId, replay: false, entryPlan: plan };
+    }), { readConcern: { level: "snapshot" }, writeConcern: { w: "majority" } }); } finally { await session.endSession(); }
   }
 }

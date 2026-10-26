@@ -126,6 +126,16 @@ test("concurrent/repeated preparation shares one actual recovery generation and 
   assert.equal(await models.ReconciliationRecord.countDocuments(), 1);
   assert.equal(await models.TradingEvent.countDocuments({ eventType: "RECOVERY_REQUIRED" }), 1);
 });
+test("preflight refreshes a READY reconciliation that would expire before its target bar", async () => {
+  const s = await setup();
+  const first = await s.preparation.prepare(scope.accountId, s.session.sessionId);
+  assert.equal(first.status, "READY"); assert.equal(reads, 1);
+  const targetAtMs = Date.parse(first.completedAt) + 300001;
+  const refreshed = await s.preparation.prepare(scope.accountId, s.session.sessionId, targetAtMs);
+  assert.equal(refreshed.status, "READY"); assert.equal(reads, 2);
+  assert.equal(await models.ReconciliationRecord.countDocuments(), 2);
+  assert.equal((await models.TradingAccount.findOne(scope).orFail()).get("recoveryState.status"), "READY");
+});
 test("INCOMPLETE evidence stays WAITING then retries on normal cadence in the exact same session", async () => {
   const s = await setup(); failEndpoint = true;
   assert.equal((await s.readiness(true)).entryBlockingReason, "RECONCILIATION_INCOMPLETE");

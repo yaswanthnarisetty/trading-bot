@@ -25,7 +25,7 @@ const timestamp = z.string().transform((value, ctx) => {
 const hundredths = (value: number) => Number.isSafeInteger(Math.round(value * 100))
   && Math.abs(value * 100 - Math.round(value * 100)) < 0.00001;
 const qualityKeys = new Set(["version", "minConfidence", "maxAtrPoints", "minVolumeRatio", "bullishRsiMax",
-  "bearishRsiMin", "openingBlockMinutes", "minDteDays", "strikeStepMinor", "widthMinor", "shortOffsetMinor",
+  "bearishRsiMin", "bullishTrendRsiException", "openingBlockMinutes", "minDteDays", "strikeStepMinor", "widthMinor", "shortOffsetMinor",
   "minDepthUnits", "maxBidAskSpreadMinor", "minCreditMinor", "strategyFamily", "longOptionSelection", "debitLongOffsetMinor"]);
 const requestSchema = z.object({
   asset: z.enum(["NIFTY", "BANKNIFTY", "FINNIFTY"]), from: timestamp, to: timestamp,

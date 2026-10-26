@@ -53,7 +53,7 @@ export type OrderSide = z.infer<typeof orderSideSchema>;
 
 export const tradingEventTypeSchema = z.enum([
   "SIGNAL_CREATED", "INTENT_CREATED", "RISK_BLOCKED", "RISK_RESERVED", "ENTRY_RISK_COMMITTED",
-  "DAILY_PNL_UPDATED", "TRADING_DAY_ADVANCED", "KILL_SWITCH_ENABLED", "KILL_SWITCH_DISABLED", "ENTRY_RISK_SETTLED",
+  "DAILY_PNL_UPDATED", "TRADING_DAY_ADVANCED", "KILL_SWITCH_ENABLED", "KILL_SWITCH_DISABLED", "ENTRY_RISK_SETTLED", "RISK_POLICY_UPDATED",
   "SUBMISSION_CLAIMED", "ORDER_SUBMITTED", "ORDER_ACKNOWLEDGED",
   "ORDER_READY", "ORDER_FINALITY_CONFIRMED", "INTENT_COMPLETED", "RESERVATION_CONSUMED",
   "ORDER_OUTCOME_UNKNOWN", "ORDER_REJECTED", "ORDER_CANCEL_REQUESTED", "ORDER_CANCELLED",
@@ -75,6 +75,9 @@ export const eventPayloadSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("TRADING_DAY"), from: tradingDateSchema.nullable(), to: tradingDateSchema,
     realizedPnlMinor: moneyMinorSchema }).strict(),
   z.object({ kind: z.literal("KILL_SWITCH"), commandId: identifierSchema, enabled: z.boolean(), reason: identifierSchema }).strict(),
+  z.object({ kind: z.literal("RISK_POLICY"), commandId: identifierSchema,
+    fromVersion: quantityUnitsSchema, toVersion: quantityUnitsSchema,
+    fromMaxRiskPerEntryMinor: nonnegativeMoneyMinorSchema, toMaxRiskPerEntryMinor: nonnegativeMoneyMinorSchema }).strict(),
   z.object({ kind: z.literal("RISK_SETTLEMENT"), positionId: identifierSchema, reservationId: identifierSchema,
     pendingReleasedMinor: nonnegativeMoneyMinorSchema, committedReleasedMinor: nonnegativeMoneyMinorSchema,
     reservedSlotsReleased: quantityUnitsSchema, committedSlotsReleased: quantityUnitsSchema }).strict(),
@@ -116,7 +119,8 @@ export const tradingEventSchema = z.object({
     ctx.addIssue({ code: "custom", message: "Invalid execution scope" });
   }
   const kinds: Record<string, string> = { DAILY_PNL_UPDATED: "DAILY_PNL", TRADING_DAY_ADVANCED: "TRADING_DAY",
-    KILL_SWITCH_ENABLED: "KILL_SWITCH", KILL_SWITCH_DISABLED: "KILL_SWITCH", ENTRY_RISK_SETTLED: "RISK_SETTLEMENT" };
+    KILL_SWITCH_ENABLED: "KILL_SWITCH", KILL_SWITCH_DISABLED: "KILL_SWITCH", ENTRY_RISK_SETTLED: "RISK_SETTLEMENT",
+    RISK_POLICY_UPDATED: "RISK_POLICY" };
   if (kinds[event.eventType] && (event.payload.kind !== kinds[event.eventType]
     || event.aggregateType !== (event.eventType === "ENTRY_RISK_SETTLED" ? "RiskReservation" : "TradingAccount")))
     ctx.addIssue({ code: "custom", message: "Risk control event requires its typed payload and aggregate" });

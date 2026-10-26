@@ -39,7 +39,9 @@ export const classifiedEntryPlanSchema = z.object({
   strategyKind: z.enum(["LONG_CALL", "LONG_PUT", "BULL_CALL_DEBIT_SPREAD", "BEAR_PUT_DEBIT_SPREAD", "BULL_PUT_CREDIT_SPREAD", "BEAR_CALL_CREDIT_SPREAD"]),
   dataMode: z.enum(["MOCK", "KITE_REAL"]), source: z.enum(["MOCK", "KITE"]),
   candidateRef: identifierSchema, analyticsEvidenceId: identifierSchema, evaluatedAt: z.string().datetime(),
-  candidateVersion: z.literal("TRADE_CANDIDATE_V2"), evaluatorVersion: z.literal("PHASE6A01_V1"),
+  candidateVersion: z.literal("TRADE_CANDIDATE_V2"),
+  // V1 remains readable for previously admitted positions; only V2 is issued now.
+  evaluatorVersion: z.enum(["PHASE6A01_V1", "PHASE6A01_V2"]),
   legs: z.array(legacyEntryPlanSchema.shape.legs.element.extend({
     role: z.enum(["LONG", "HEDGE", "SHORT"]), identity: identitySchema,
   }).strict()).min(1).max(2),
@@ -52,6 +54,7 @@ export type EntryRiskReason = "RECOVERY_REQUIRED" | "RECONCILIATION_REQUIRED" | 
   | "RISK_PER_TRADE_EXCEEDED" | "RISK_CAPACITY_EXCEEDED" | "POSITION_LIMIT_EXCEEDED"
   | "ACCOUNT_NOT_READY" | "RISK_POLICY_REQUIRED" | "INTENT_NOT_FOUND" | "ENTRY_ONLY"
   | "MARKET_EVIDENCE_EXPIRED" | "ENTRY_CUTOFF_PASSED" | "STALE_EXECUTION_CHAIN" | "RISK_PROJECTION_MISMATCH" | "UNSUPPORTED_ACCOUNT_EXPOSURE"
+  | "QUOTE_MOVED_BEYOND_LIMIT"
   | "KILL_SWITCH_ACTIVE" | "DAILY_LOSS_LIMIT_EXCEEDED" | "DAILY_LOSS_POLICY_REQUIRED" | "TRADING_DAY_CONFIG_REQUIRED" | "TRADING_DAY_REGRESSION";
 export class EntryRiskError extends Error {
   constructor(readonly reason: EntryRiskReason) { super(reason); }
@@ -150,11 +153,16 @@ export const entryAdmissionSchema = z.object({
 export const entryProgressSchema = z.array(z.object({
   legId: identifierSchema, transferredUnits: quantityUnitsSchema, committedMinor: quantityUnitsSchema,
 }).strict()).min(1);
-export const entrySettlementSchema = z.object({
-  positionId: identifierSchema, closeIntentId: identifierSchema, eventId: identifierSchema, settledAt: z.date(),
+const settlementAmounts = {
+  positionId: identifierSchema, eventId: identifierSchema, settledAt: z.date(),
   pendingReleasedMinor: quantityUnitsSchema, committedReleasedMinor: quantityUnitsSchema,
   reservedSlotsReleased: quantityUnitsSchema, committedSlotsReleased: quantityUnitsSchema,
-}).strict();
+};
+export const entrySettlementSchema = z.union([z.object({
+  ...settlementAmounts, closeIntentId: identifierSchema,
+}).strict(), z.object({
+  ...settlementAmounts, abortIntentId: identifierSchema,
+}).strict()]);
 export type EntryRiskRequirement = ReturnType<typeof calculateEntryRisk>;
 
 /** Progress is a projection, never execution evidence. Persistence proves it against
@@ -241,6 +249,8 @@ export function verifyEntryReservation(reservation: Record<string, unknown>, int
     riskAssert(settled.positionId === positionId && settled.eventId === `${reservation.reservationId}:ENTRY_RISK_SETTLED`
       && settled.pendingReleasedMinor === projection.pendingMinor && settled.committedReleasedMinor === projection.committedMinor
       && settled.reservedSlotsReleased === projection.reservedSlots && settled.committedSlotsReleased === projection.committedSlots, "RISK_PROJECTION_MISMATCH");
+    riskAssert("abortIntentId" in settled ? settled.abortIntentId === intent.intentId && projection.committedMinor === 0
+      : "closeIntentId" in settled, "RISK_PROJECTION_MISMATCH");
   } else riskAssert(reservation.entrySettlement === undefined, "RISK_PROJECTION_MISMATCH");
   return { requirement, admission: admission.data, projection };
 }

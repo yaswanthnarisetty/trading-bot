@@ -31,6 +31,10 @@ const CryptoPositionSchema = new Schema(
     },
     status:   { type: String, enum: ["OPEN", "CLOSED"], required: true },
     dataMode: { type: String, enum: ["LIVE", "MOCK"], required: true },
+    // Legacy rows had no Delta order/fill IDs. Keep their original status for
+    // audit, but never count them as confirmed exchange exposure.
+    brokerVerification: { type: String, enum: ["UNVERIFIED_LEGACY"], default: null },
+    brokerVerifiedAt: { type: Date, default: null },
     createdAt: { type: Date, default: Date.now },
   },
   {

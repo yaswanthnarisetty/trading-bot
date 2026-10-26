@@ -5,12 +5,12 @@ import { placeOrder } from "../../src/services/DeltaService";
 import { startCryptoEngine, checkCryptoPositions, forceCloseAllCryptoPositions } from "../../src/services/CryptoMonitorService";
 import { openCryptoPosition, closeCryptoPosition } from "../../src/services/CryptoTradingService";
 
-test("crypto gate blocks all execution/mutation and GET restart routes", () => {
-  for (const [method, path] of [["POST", "/session/start"], ["POST", "/session/stop"], ["GET", "/session/active"],
+test("crypto gate blocks all execution/mutation routes", () => {
+  for (const [method, path] of [["POST", "/session/start"], ["POST", "/session/stop"],
     ["PATCH", "/positions/p/close"], ["POST", "/history"], ["GET", "/future-execution-route"]]) assert.equal(cryptoRequestAllowed(method, path), false);
 });
 test("crypto gate preserves only known read-only handlers", () => {
-  for (const path of ["/status", "/price", "/history", "/positions/s", "/positions/s/open", "/pnl/s", "/signals/s"]) assert.equal(cryptoRequestAllowed("GET", path), true);
+  for (const path of ["/status", "/preview", "/session/active", "/price", "/history", "/positions/s", "/positions/s/open", "/pnl/s", "/signals/s"]) assert.equal(cryptoRequestAllowed("GET", path), true);
 });
 test("direct crypto execution functions reject before broker or persistence access", async () => {
   assert.throws(() => startCryptoEngine("test", 100), /DELTA_EXECUTION_DISABLED/);

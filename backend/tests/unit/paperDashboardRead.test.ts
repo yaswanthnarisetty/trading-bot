@@ -6,6 +6,8 @@ import { candidateEntryPlan } from "../../src/services/CandidateIntentAdapter";
 import { projectDurablePaperPosition, projectPaperDecision } from "../../src/services/PaperDashboardReadService";
 import { financialCandidate } from "../fixtures/financialCandidates";
 import type { StrategyFamily } from "../../src/domain/strategyEvaluation";
+import { projectPaperDisplayAnalytics } from "../../src/services/PaperDisplayAnalytics";
+import { mockCapture } from "../fixtures/paperOrchestration";
 
 const originals = { request: http.request, get: http.get, secureRequest: https.request, secureGet: https.get, fetch: globalThis.fetch };
 let attempts = 0;
@@ -74,8 +76,40 @@ for (const [outcome, candidate, reason] of [["HOLD", false, "OPENING_BLOCK"], ["
     assert.equal(row.verifier.verdict, "AGREE"); assert.equal(row.rationale, "Fixture rationale");
   });
 
+test("blocked HOLD keeps the non-authoritative AI confidence distinct from final zero", () => {
+  const row = projectPaperDecision({ cycleId: "stale", outcome: "HOLD", reason: "MARKET_DATA_NOT_FRESH",
+    decision: { finalProposal: { direction: "HOLD", confidence: 0 },
+      primary: { status: "COMPLETED", result: { direction: "BEARISH", confidence: 0.8,
+        rationale: "Fixture view" } }, verifier: { status: "NOT_RUN", reason: "ANALYTICS_UNAVAILABLE" } } });
+  assert.equal(row.confidence, 0);
+  assert.deepEqual(row.primary, { status: "COMPLETED", direction: "BEARISH", confidence: 0.8 });
+  assert.equal(row.verifier.status, "NOT_RUN");
+  assert.equal(row.blockingReason, "MARKET_DATA_NOT_FRESH");
+});
+test("rejected LONG_OPTION shows the exact proposed broker contract and one-lot PAPER risk", async () => {
+  const candidate = await financialCandidate("LONG_OPTION", "BEARISH");
+  const leg = candidate.legs[0]!;
+  const row = projectPaperDecision({ cycleId: "risk-rejected", outcome: "REJECTED", reason: "RISK_PER_TRADE_EXCEEDED",
+    config: { strategyConfig: { strategyFamily: "LONG_OPTION" } }, displayAnalytics: { spotMinor: 2_500_000 },
+    decision: { strategyResult: { action: "CANDIDATE", candidate } } });
+  assert.deepEqual(row.selectedOption, { contractKey: leg.instrument.contractKey,
+    type: leg.instrument.instrumentType, strikeMinor: leg.instrument.strikeMinor,
+    expiry: leg.instrument.expiry, quantityUnits: leg.quantityUnits, premiumMinor: leg.priceMinor,
+    lotRiskMinor: candidate.maxLossPerLotMinor, spotMinor: 2_500_000 });
+  assert.equal(row.outcome, "REJECTED");
+});
+
 test("dashboard projection tests make zero external HTTP calls", () => {
   assert.equal(attempts, 0);
+});
+test("MOCK analytics never becomes a persisted production display snapshot", async () => {
+  const capture = await mockCapture();
+  assert.equal(projectPaperDisplayAnalytics(capture.analytics, capture.expiry), null);
+  assert.equal(capture.analytics.available, true);
+  if (!capture.analytics.available) return;
+  assert.equal(projectPaperDisplayAnalytics({ available: true, snapshot: {
+    ...capture.analytics.snapshot, dataMode: "KITE_REAL", source: "KITE",
+  } } as never, capture.expiry), null);
 });
 
 // Network is blocked for the module's focused tests without affecting other files.

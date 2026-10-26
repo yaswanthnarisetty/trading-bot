@@ -116,11 +116,12 @@ import { DEFAULT_LONG_SELECTION } from "../../src/domain/strategyEvaluation";
 import { PaperEvaluationScheduler } from "../../src/services/PaperEvaluationScheduler";
 
 import { normalizeBacktestParams } from "../../src/domain/historicalReplay";
-test("built-in quality defaults exactly match the approved Phase 5/6 defaults",()=>{
+test("built-in quality retains Phase 5/6 defaults with a bounded NIFTY trend exception",()=>{
  const approved=normalizeBacktestParams({asset:"NIFTY",strategyFamily:"LONG_OPTION",from:"2026-09-29T03:45:00Z",to:"2026-09-29T10:00:00Z"}).strategyConfig;
  const {version:_approvedVersion,debitLongOffsetMinor:_unused,...expected}=approved;
- const {version:_version,...actual}=builtInNiftyPaperConfig("PAPER:personal").strategyConfig;
+ const {version:_version,bullishTrendRsiException,...actual}=builtInNiftyPaperConfig("PAPER:personal").strategyConfig;
  assert.deepEqual(actual,expected);
+ assert.deepEqual(bullishTrendRsiException,{maxRsi:80,minConfidence:0.75,minAdx:25,minDiLead:5,minEmaSeparationAtr:1});
 });
 
 import { PaperExitScheduler } from "../../src/services/PaperExitScheduler";

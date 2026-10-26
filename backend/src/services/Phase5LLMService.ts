@@ -3,7 +3,7 @@ import type { AnalyticsOutcome, MarketAnalyticsSnapshot } from "../domain/market
 import { assertMarketAnalytics, isMarketAnalyticsFresh } from "../domain/marketAnalytics";
 import { analyticsEvidenceId } from "../domain/analyticsEvidence";
 import { freeze, marketTimestamp } from "../domain/kiteMarketData";
-import { evaluateStrategy, type DirectionalProposal, type StrategyEvaluationResult,
+import { assertIssuedTradeCandidate, evaluateStrategy, type DirectionalProposal, type StrategyEvaluationResult,
   type StrategyQualityConfig, type HoldReason } from "../domain/strategyEvaluation";
 
 export const PRIMARY_PROMPT_VERSION = "PHASE5_PRIMARY_V1";
@@ -16,6 +16,23 @@ const primarySchema = z.object({ direction: z.enum(["BULLISH", "BEARISH", "HOLD"
   confidence, reasonCode: code, rationale: z.string().min(1).max(300), riskFlags }).strict();
 const verifierSchema = z.object({ verdict: z.enum(["AGREE", "DISAGREE", "HOLD"]),
   confidence, reasonCode: code, rationale: z.string().min(1).max(300), riskFlags }).strict();
+/** Keep the API's strict output contract aligned with the local admission parser. */
+export function phase5ResponseFormat(stage: "PRIMARY" | "VERIFIER") {
+  const field = stage === "PRIMARY" ? "direction" : "verdict";
+  return { type: "json_schema" as const, json_schema: {
+    name: stage === "PRIMARY" ? "phase5_primary_v2" : "phase5_verifier_v2",
+    strict: true,
+    schema: { type: "object", additionalProperties: false,
+      properties: {
+        [field]: { type: "string", enum: stage === "PRIMARY" ? ["BULLISH", "BEARISH", "HOLD"] : ["AGREE", "DISAGREE", "HOLD"] },
+        confidence: { type: "number", minimum: 0, maximum: 1 },
+        reasonCode: { type: "string", pattern: "^[A-Za-z][A-Za-z0-9_:-]{0,63}$" },
+        rationale: { type: "string", minLength: 1, maxLength: 300 },
+        riskFlags: { type: "array", maxItems: 8,
+          items: { type: "string", pattern: "^[A-Za-z][A-Za-z0-9_:-]{0,63}$" } },
+      }, required: [field, "confidence", "reasonCode", "rationale", "riskFlags"] },
+  } };
+}
 const configSchema = z.object({ primaryModel: z.string().regex(/^[A-Za-z0-9._:-]{1,100}$/),
   verifierModel: z.string().regex(/^[A-Za-z0-9._:-]{1,100}$/),
   primaryPromptVersion: z.literal(PRIMARY_PROMPT_VERSION),
@@ -49,9 +66,9 @@ type Telemetry = Readonly<{ model: string; promptVersion: string;
 export type LLMPrimaryResult = Readonly<ParsedPrimary & Telemetry>;
 export type LLMVerifierResult = Readonly<ParsedVerifier & Telemetry>;
 export type PrimaryEvidence = Readonly<{ status: "COMPLETED"; result: LLMPrimaryResult } |
-  { status: "FAILED"; reason: LLMFailure } | { status: "NOT_RUN"; reason: "ANALYTICS_UNAVAILABLE" | "INVALID_INPUT" | "MARKET_DATA_NOT_FRESH" }>;
+  { status: "FAILED"; reason: LLMFailure; diagnostic?: string } | { status: "NOT_RUN"; reason: "ANALYTICS_UNAVAILABLE" | "INVALID_INPUT" | "MARKET_DATA_NOT_FRESH" }>;
 export type VerifierEvidence = Readonly<{ status: "COMPLETED"; result: LLMVerifierResult } |
-  { status: "FAILED"; reason: LLMFailure } |
+  { status: "FAILED"; reason: LLMFailure; diagnostic?: string } |
   { status: "NOT_RUN"; reason: "PRIMARY_HOLD" | "BELOW_THRESHOLD" | "PRIMARY_FAILED" | "ANALYTICS_UNAVAILABLE" }>;
 export type Phase5DecisionReason = "CANDIDATE" | "PRIMARY_HOLD" | "VERIFIER_REJECTED"
   | "ANALYTICS_UNAVAILABLE" | LLMFailure | HoldReason;
@@ -59,6 +76,9 @@ export interface Phase5DecisionEvidence {
   readonly version: typeof DECISION_VERSION;
   readonly evaluatedAt: string;
   readonly analyticsEvidenceId: string | null;
+  /** The AI saw this earlier qualified snapshot; final economics may use a
+   * newer quote from the same completed candle after deterministic recheck. */
+  readonly promptAnalyticsEvidenceId?: string;
   readonly dataMode: "KITE_REAL" | "MOCK" | null;
   readonly underlying: string | null;
   readonly primary: PrimaryEvidence;
@@ -83,6 +103,48 @@ export interface Phase5AnalysisInput {
   readonly priorCandidateKeys?: readonly string[];
 }
 
+/** Refresh only a completed AI candidate, never a HOLD or a veto. The model's
+ * direction cannot change; the same completed candle, market regime, selected
+ * contract and all deterministic strategy gates must still agree. This gives
+ * final admission a fresh broker quote without extending any evidence TTL. */
+export function revalidatePhase5Candidate(decision: Phase5Decision, original: AnalyticsOutcome,
+  refreshed: AnalyticsOutcome, evaluatedAt: string, config: StrategyQualityConfig,
+  now: number = Date.now()): Phase5Decision {
+  if (decision.action !== "CANDIDATE" || decision.evidence.strategyResult.action !== "CANDIDATE") return decision;
+  const reject = (reason: HoldReason): Phase5Decision => freeze({ action: "HOLD", evidence: {
+    ...decision.evidence, promptAnalyticsEvidenceId: decision.evidence.analyticsEvidenceId ?? undefined,
+    strategyResult: freeze({ action: "HOLD", reason }), reason,
+  } });
+  if (!original.available || !refreshed.available) return reject("MARKET_DATA_NOT_FRESH");
+  const before = original.snapshot, after = refreshed.snapshot;
+  try { assertMarketAnalytics(before); assertMarketAnalytics(after); }
+  catch { return reject("ANALYTICS_UNAVAILABLE"); }
+  const beforeValues = before.indicators.values, afterValues = after.indicators.values;
+  if (before.dataMode !== "KITE_REAL" || after.dataMode !== "KITE_REAL"
+    || before.underlying !== after.underlying || before.source !== after.source
+    || before.indexMasterFingerprint !== after.indexMasterFingerprint
+    || before.optionMasterFingerprint !== after.optionMasterFingerprint
+    || before.indicators.lastFinalizedAt !== after.indicators.lastFinalizedAt
+    || before.indicators.range.from !== after.indicators.range.from
+    || before.indicators.range.to !== after.indicators.range.to
+    || JSON.stringify(beforeValues) !== JSON.stringify(afterValues)
+    || JSON.stringify(before.indicators.directionalTrend) !== JSON.stringify(after.indicators.directionalTrend)
+    || beforeValues.atr === null || Math.abs(after.spotMinor - before.spotMinor) > beforeValues.atr * 50)
+    return reject("MARKET_DATA_NOT_FRESH");
+  const strategyResult = evaluateStrategy({ analytics: refreshed, proposal: decision.evidence.finalProposal,
+    config, evaluatedAt, decisionOptionIds: [] });
+  if (strategyResult.action !== "CANDIDATE") return reject(strategyResult.reason);
+  if (strategyResult.candidate.candidateKey !== decision.evidence.strategyResult.candidate.candidateKey
+    || strategyResult.candidate.quantityUnits !== decision.evidence.strategyResult.candidate.quantityUnits)
+    return reject("NO_QUALIFIED_CONTRACT");
+  try { assertIssuedTradeCandidate(strategyResult.candidate, now); }
+  catch { return reject("MARKET_DATA_NOT_FRESH"); }
+  return freeze({ action: "CANDIDATE", evidence: { ...decision.evidence,
+    promptAnalyticsEvidenceId: decision.evidence.analyticsEvidenceId ?? undefined,
+    evaluatedAt, analyticsEvidenceId: analyticsEvidenceId(after), strategyResult, reason: "CANDIDATE",
+  } });
+}
+
 const primarySystem = `NSE index options analyst. Prompt ${PRIMARY_PROMPT_VERSION}.
 Interpret only the supplied, precomputed market summary. Its indicator and Greek numbers are authoritative.
 Do not compute RSI, EMA, ATR, IV, Greeks, option prices, spreads, or sizing.
@@ -101,16 +163,18 @@ function promptContext(snapshot: MarketAnalyticsSnapshot, expiry: string, eviden
     .sort((a, b) => Math.abs(a.instrument.strikeMinor - snapshot.spotMinor)
       - Math.abs(b.instrument.strikeMinor - snapshot.spotMinor)
       || (a.canonicalId < b.canonicalId ? -1 : a.canonicalId > b.canonicalId ? 1 : 0))
-    .slice(0, 4).map(option => ({ type: option.instrument.instrumentType,
+    .slice(0, 4);
+  const summary = options.map(option => ({ type: option.instrument.instrumentType,
       strikeMinor: option.instrument.strikeMinor,
       greeks: option.greeks.available ? { iv: option.greeks.value.impliedVolatility,
         delta: option.greeks.value.delta, thetaPerDay: option.greeks.value.thetaPerDay }
         : { unavailable: option.greeks.reason } }));
-  return { version: "PHASE5_PROMPT_CONTEXT_V1", evidenceId, dataMode: snapshot.dataMode,
+  return { optionIds: options.map(option => option.canonicalId), summary: {
+    version: "PHASE5_PROMPT_CONTEXT_V1", evidenceId, dataMode: snapshot.dataMode,
     underlying: snapshot.underlying, evaluatedAt: snapshot.evaluatedAt, requestedExpiry: expiry,
     spotMinor: snapshot.spotMinor, spotTimestamp: snapshot.spotTimestamp,
     candleInterval: snapshot.candleInterval, indicatorRange: snapshot.indicators.range,
-    indicators: snapshot.indicators.values, optionGreeksSummary: options };
+    indicators: snapshot.indicators.values, optionGreeksSummary: summary } };
 }
 
 function failure(error: unknown): LLMFailure {
@@ -174,7 +238,7 @@ function hasDuplicateMembers(text: string): boolean {
 }
 async function complete<T>(transport: Phase5LLMTransport, request: Omit<LLMCompletionRequest, "signal">,
   timeoutMs: number, schema: z.ZodType<T>, promptVersion: string): Promise<Readonly<{ ok: true; value: T & Telemetry } |
-  { ok: false; reason: LLMFailure }>> {
+  { ok: false; reason: LLMFailure; diagnostic?: string }>> {
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -187,13 +251,20 @@ async function complete<T>(transport: Phase5LLMTransport, request: Omit<LLMCompl
     if (typeof response.content !== "string" || !response.content.trim()) return { ok: false, reason: "INVALID_RESPONSE" };
     let raw: unknown;
     try {
-      if (hasDuplicateMembers(response.content)) return { ok: false, reason: "SCHEMA_REJECTED" };
+      if (hasDuplicateMembers(response.content)) return { ok: false, reason: "SCHEMA_REJECTED", diagnostic: "DUPLICATE_MEMBER" };
       raw = JSON.parse(response.content);
     }
     catch { return { ok: false, reason: "INVALID_RESPONSE" }; }
     const parsed = schema.safeParse(raw);
-    if (!parsed.success || typeof response.model !== "string" || !/^[A-Za-z0-9._:-]{1,100}$/.test(response.model))
-      return { ok: false, reason: "SCHEMA_REJECTED" };
+    if (!parsed.success) {
+      const issue = parsed.error.issues[0];
+      const path = issue?.path[0];
+      const field = typeof path === "string" && ["direction", "verdict", "confidence", "reasonCode", "rationale", "riskFlags"].includes(path)
+        ? path : "response";
+      return { ok: false, reason: "SCHEMA_REJECTED", diagnostic: `${field}:${issue?.code ?? "unknown"}` };
+    }
+    if (typeof response.model !== "string" || !/^[A-Za-z0-9._:-]{1,100}$/.test(response.model))
+      return { ok: false, reason: "SCHEMA_REJECTED", diagnostic: "MODEL_ID" };
     const usage = response.usage && Number.isSafeInteger(response.usage.inputTokens) && response.usage.inputTokens >= 0
       && Number.isSafeInteger(response.usage.outputTokens) && response.usage.outputTokens >= 0
       ? response.usage : undefined;
@@ -220,10 +291,11 @@ export async function evaluateWithPhase5LLM(input: Phase5AnalysisInput,
   let verifier: VerifierEvidence = { status: "NOT_RUN", reason: "ANALYTICS_UNAVAILABLE" };
   let reason: Phase5DecisionReason | "PROCEED" = "INVALID_INPUT";
   let snapshot: MarketAnalyticsSnapshot | null = null, evidenceId: string | null = null;
+  let decisionOptionIds: readonly string[] | undefined;
   let capturedAnalytics: AnalyticsOutcome = analytics;
   let evaluatedAt = rawEvaluatedAt;
   const fresh = () => {
-    try { return snapshot !== null && isMarketAnalyticsFresh(snapshot, clock()); }
+    try { return snapshot !== null && isMarketAnalyticsFresh(snapshot, clock(), decisionOptionIds); }
     catch { return false; }
   };
   const finish = (): Phase5Decision => {
@@ -232,12 +304,17 @@ export async function evaluateWithPhase5LLM(input: Phase5AnalysisInput,
       reason = "MARKET_DATA_NOT_FRESH";
     }
     let strategyResult = evaluateStrategy({ analytics: capturedAnalytics, proposal,
-      config: strategyConfig, evaluatedAt, priorCandidateKeys });
-    if (strategyResult.action === "CANDIDATE" && snapshot?.dataMode === "KITE_REAL" && !fresh()) {
+      config: strategyConfig, evaluatedAt, priorCandidateKeys, decisionOptionIds });
+    let candidateFresh = true;
+    if (strategyResult.action === "CANDIDATE" && snapshot?.dataMode === "KITE_REAL") {
+      try { assertIssuedTradeCandidate(strategyResult.candidate, clock()); }
+      catch { candidateFresh = false; }
+    }
+    if (strategyResult.action === "CANDIDATE" && snapshot?.dataMode === "KITE_REAL" && (!fresh() || !candidateFresh)) {
       proposal = holdProposal;
       reason = "MARKET_DATA_NOT_FRESH";
       strategyResult = evaluateStrategy({ analytics: capturedAnalytics, proposal, config: strategyConfig,
-        evaluatedAt, priorCandidateKeys });
+        evaluatedAt, priorCandidateKeys, decisionOptionIds });
     }
     const decisionReason: Phase5DecisionReason = strategyResult.action === "CANDIDATE" ? "CANDIDATE"
       : reason === "PROCEED" ? strategyResult.reason : reason;
@@ -255,6 +332,8 @@ export async function evaluateWithPhase5LLM(input: Phase5AnalysisInput,
   catch { return finish(); }
   if (!analytics?.available) {
     primary = { status: "NOT_RUN", reason: "ANALYTICS_UNAVAILABLE" };
+    reason = analytics?.reason === "MARKET_DATA_NOT_FRESH" || analytics?.reason === "REAL_DATA_REQUIRED"
+      || analytics?.reason === "INSUFFICIENT_HISTORY" ? analytics.reason : "ANALYTICS_UNAVAILABLE";
     return finish();
   }
   try {
@@ -264,17 +343,19 @@ export async function evaluateWithPhase5LLM(input: Phase5AnalysisInput,
     evidenceId = analyticsEvidenceId(snapshot);
     capturedAnalytics = freeze({ available: true, snapshot });
   } catch { return finish(); }
+  const context = promptContext(snapshot, expiry, evidenceId);
+  decisionOptionIds = context.optionIds;
   if (snapshot.dataMode === "KITE_REAL" && !fresh()) {
     primary = { status: "NOT_RUN", reason: "MARKET_DATA_NOT_FRESH" };
     reason = "MARKET_DATA_NOT_FRESH";
     return finish();
   }
-  const context = promptContext(snapshot, expiry, evidenceId);
   const first = await complete(transport, { stage: "PRIMARY", model: c.primaryModel,
-    systemPrompt: primarySystem, userPrompt: JSON.stringify(context),
+    systemPrompt: primarySystem, userPrompt: JSON.stringify(context.summary),
     temperature: c.temperature, maxOutputTokens: c.maxOutputTokens }, c.timeoutMs, primarySchema, c.primaryPromptVersion);
   if (!first.ok) {
-    primary = { status: "FAILED", reason: first.reason };
+    primary = { status: "FAILED", reason: first.reason,
+      ...(first.diagnostic ? { diagnostic: first.diagnostic } : {}) };
     verifier = { status: "NOT_RUN", reason: "PRIMARY_FAILED" };
     reason = first.reason;
     return finish();
@@ -299,12 +380,13 @@ export async function evaluateWithPhase5LLM(input: Phase5AnalysisInput,
   }
   const second = await complete(transport, { stage: "VERIFIER", model: c.verifierModel,
     systemPrompt: verifierSystem,
-    userPrompt: JSON.stringify({ ...context, primary: {
+    userPrompt: JSON.stringify({ ...context.summary, primary: {
       direction: first.value.direction, confidence: first.value.confidence,
       reasonCode: first.value.reasonCode, riskFlags: first.value.riskFlags } }),
     temperature: c.temperature, maxOutputTokens: c.maxOutputTokens }, c.timeoutMs, verifierSchema, c.verifierPromptVersion);
   if (!second.ok) {
-    verifier = { status: "FAILED", reason: second.reason };
+    verifier = { status: "FAILED", reason: second.reason,
+      ...(second.diagnostic ? { diagnostic: second.diagnostic } : {}) };
     proposal = holdProposal;
     reason = second.reason;
     return finish();

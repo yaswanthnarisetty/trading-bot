@@ -18,7 +18,7 @@ import {
 import type { SRContext } from "../utils/indicators";
 import { logger } from "../utils/logger";
 import { PRIMARY_PROMPT_VERSION, VERIFIER_PROMPT_VERSION,
-  type Phase5LLMConfig, type Phase5LLMTransport } from "./Phase5LLMService";
+  phase5ResponseFormat, type Phase5LLMConfig, type Phase5LLMTransport } from "./Phase5LLMService";
 
 const PRIMARY_ANALYST_SYSTEM_PROMPT = `You are a quantitative options trading analyst for Indian equity markets (NSE/BSE).
 You specialize in NIFTY, BANKNIFTY, and FINNIFTY weekly options spreads.
@@ -510,6 +510,7 @@ export function phase5OpenAITransport(): Phase5LLMTransport {
     const started = performance.now();
     const completion = await client.chat.completions.create({
       model: request.model, temperature: request.temperature, max_tokens: request.maxOutputTokens,
+      response_format: phase5ResponseFormat(request.stage),
       messages: [{ role: "system", content: request.systemPrompt },
         { role: "user", content: request.userPrompt }],
     }, { signal: request.signal });

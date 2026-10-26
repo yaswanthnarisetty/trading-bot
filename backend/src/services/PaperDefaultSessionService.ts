@@ -66,7 +66,7 @@ export interface PaperReadinessDependencies {
   mode(): string;
   entryConfig(config: PaperMonitoringConfig): Promise<PaperSessionConfig>;
   accountGate(accountId: string): Promise<void>;
-  assertReady(config: PaperSessionConfig): Promise<void>;
+  assertReady(config: PaperSessionConfig): Promise<unknown>;
   recover(config: PaperMonitoringConfig): Promise<{status: string}>;
   market(config: PaperSessionConfig, prepare: boolean): Promise<void>;
   calendar?(now: Date): NseCalendarEvidence;

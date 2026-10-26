@@ -23,7 +23,10 @@ export async function fencePaperSession(connection: Connection, session: ClientS
   if (!cycle || !["DECIDED", "ENTRY", "ATTENTION"].includes(cycle.outcome) || cycle.decision?.strategyResult?.action !== "CANDIDATE")
     throw new Error("DECISION_CONFLICT");
   const active = await connection.db!.collection("monitoring_sessions").updateOne({ sessionId: ref.sessionId,
-    accountId, executionMode: "PAPER", startupId: ref.startupId, status: "RUNNING", configFingerprint: cycle.configFingerprint },
+    accountId, executionMode: "PAPER", startupId: ref.startupId, status: "RUNNING",
+    // A monitoring session captures its original config. The cycle also stores
+    // completed server-owned calendar/Greeks metadata, so those hashes differ.
+    configFingerprint: cycle.sessionConfigFingerprint },
     { $inc: { cycleFence: 1 } }, { session });
   if (active.matchedCount !== 1) throw new Error("SESSION_STOPPED");
   return cycle;

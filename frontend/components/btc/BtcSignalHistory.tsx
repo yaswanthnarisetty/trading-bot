@@ -93,7 +93,7 @@ export default function BtcSignalHistory({
             ? remaining === 0
               ? "First signal imminent…"
               : `First signal in ${formatCountdown(remaining)}`
-            : "Signals appear here once the session starts"}
+            : "Old intraday signals are paused. Daily Demo trial status is above."}
         </div>
       </div>
     );
